@@ -111,3 +111,16 @@ test('queued latest saves settle and final state wins',async()=>{
   const reopened=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
   assert.equal(reopened.initial.body,'version 11');
 });
+
+test('temporary SQLite API failure is not mistaken for corrupted data',async()=>{
+  const unavailable={db:{executeSql:async()=>{throw Error('temporary SQLite bridge timeout');}}};
+  const fallback=fakeIdb(),out=[];
+  const store=await openStore(unavailable,message=>out.push(message),{idbFactory:fallback.factory});
+  assert.equal(store.corrupt,false);
+  assert.equal(store.readOnly,false);
+  assert.equal(store.mode(),'IndexedDB（退避）');
+  const s=freshState();s.body='一時エラー中の編集';
+  await store.save(s);
+  const reopened=await openStore(unavailable,()=>{},{idbFactory:fallback.factory});
+  assert.equal(reopened.initial.body,s.body);
+});
