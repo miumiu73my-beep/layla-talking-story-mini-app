@@ -97,10 +97,10 @@ function showMain(){
   window.scrollTo(0,0);
 }
 function showSettings(){
-  if(!ready||busy||saveBlocked)return;
+  if(!ready||busy)return;
   el('screen-main').hidden=true;el('screen-settings').hidden=false;
   el('nav-main').classList.remove('primary');el('nav-settings').classList.add('primary');
-  rebuildSettings();window.scrollTo(0,0);
+  rebuildSettings();lockUI();window.scrollTo(0,0);
 }
 function inputField(parent,key,label,kind,hint){
   const id='field-'+key,l=node('label','',label),control=node(kind==='text'?'input':'textarea');
