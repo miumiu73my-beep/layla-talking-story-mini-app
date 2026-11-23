@@ -24,3 +24,11 @@ test('invalid files and sampler limits are rejected',()=>{
  assert.throws(()=>parseImport('backup.json','{}',freshState()));
  assert.throws(()=>samplerParams({temperature:7}));assert.throws(()=>cleanState({body:6}));
 });
+
+test('TXT and Markdown exports round-trip without header pollution',()=>{
+ const s=freshState();s.title='時計の物語';s.body='扉の前に立った。\n次の行動を選ぶ。';
+ for(const ext of ['txt','md']) {
+   const loaded=parseImport('story.'+ext,readableText(s,ext),freshState());
+   assert.equal(loaded.state.title,s.title);assert.equal(loaded.state.body,s.body);
+ }
+});

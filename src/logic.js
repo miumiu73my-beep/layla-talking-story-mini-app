@@ -87,7 +87,11 @@ export function parseImport(filename,content,current){
     return {state:cleanState(raw),full:true};
   }
   if(ext!=='txt'&&ext!=='md')throw Error('JSON、TXT、MDのみ対応します。');
-  const next=cleanState(current),text=String(content).replace(/^\uFEFF/,'').replace(/\r\n?/g,'\n');
+  const next=cleanState(current);
+  let text=String(content).replace(/^\uFEFF/,'').replace(/\r\n?/g,'\n');
+  const header=ext==='md'?/^# ([^\n]{1,120})\n\n/:/^作品：([^\n]{1,120})\n\n/;
+  const matched=header.exec(text);
+  if(matched){next.title=matched[1];text=text.slice(matched[0].length);}
   if(text.length>1500000)throw Error('本文が長すぎます。');
   next.body=text;next.turns=[];
   return {state:next,full:false};
