@@ -1,0 +1,31 @@
+name: Build Layla Talking Story Mini-App
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install
+        run: npm install --no-audit --no-fund
+      - name: Tests
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Verify package
+        run: npm run verify
+      - name: Upload importable files
+        uses: actions/upload-artifact@v4
+        with:
+          name: layla-talking-story-mini-app
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

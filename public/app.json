@@ -1,0 +1,6 @@
+{
+  "title": "Talking Story｜会話で進む物語",
+  "tagline": "キャラクターと話して物語を紡ぐ",
+  "description": "LaylaのローカルLLMでキャラクターと会話しながら創作する個人用ストーリーMini-App。自由記憶、人物設定、禁止事項、JSON/TXT/Markdownバックアップ対応。",
+  "iconUri": "icon.jpg"
+}

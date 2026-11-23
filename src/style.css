@@ -1,0 +1,26 @@
+:root{font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif;color:#443e32;background:#f6f8f0;font-size:15px;font-synthesis:none}
+*{box-sizing:border-box}body{margin:0}button,input,textarea,select{font:inherit}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}
+button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:3px solid #98b85f;outline-offset:2px}
+header{position:sticky;top:0;z-index:4;background:#f7f9f1ef;backdrop-filter:blur(12px);border-bottom:1px solid #dce4c9}
+.bar{max-width:740px;margin:auto;padding:11px 15px;display:flex;align-items:center;gap:12px}
+.logo{width:44px;height:44px;object-fit:cover;border-radius:12px}.titles{min-width:0;flex:1}.subtitle{font-size:11px;color:#788068}.brand{font-weight:800;font-size:19px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+main{max-width:740px;margin:auto;padding:16px 16px calc(110px + env(safe-area-inset-bottom))}
+button{background:#dbe9ba;color:#39492b;border:1px solid #bed296;border-radius:11px;padding:10px 14px;font-weight:650}
+button.primary{background:#86b24f;border-color:#79a344;color:#fff}button.ghost{background:#fff;border-color:#dce4cf}button.warn{background:#fff0ed;border-color:#ecc3bc;color:#a0473f}
+input,textarea,select{width:100%;border:1px solid #d6ddca;background:#fff;color:#373b2f;border-radius:11px;padding:10px 11px}
+textarea{resize:vertical;line-height:1.8;min-height:110px}.long{min-height:180px}
+button.small{padding:7px 10px;font-size:12px}.split{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.split>*{flex-shrink:0}
+section.panel{background:#fff;border:1px solid #e0e5d4;border-radius:19px;padding:16px;margin:0 0 17px;box-shadow:0 3px 10px #8596730d}
+h1,h2,h3{margin:0 0 12px}h2{font-size:17px}h3{font-size:15px}.hint{font-size:12px;color:#7b816e;line-height:1.65}
+.story{white-space:pre-wrap;word-break:break-word;line-height:2;min-height:140px;font-family:inherit}
+.story.empty{color:#aaa99e;font-style:italic}.story-preview{background:#f2f7e8;border:1px solid #d7e5bd;border-radius:13px;padding:12px;margin:12px 0;white-space:pre-wrap;line-height:1.9}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:11px}.actions button{flex:1;min-width:85px}
+label{display:block;font-size:13px;font-weight:700;margin:18px 0 6px}label:first-child{margin-top:4px}
+.status{min-height:20px;font-size:12px;color:#6f7c5e}.error{color:#b13b35}.chatlog{max-height:240px;overflow:auto;border:1px solid #e5e8dc;border-radius:12px;padding:10px}
+.turn{border-bottom:1px solid #edf0e8;padding:9px 2px}.turn:last-child{border:0}.tag{display:inline-block;background:#eaf0df;border-radius:6px;padding:2px 7px;font-size:11px;margin-bottom:4px}
+.nav{position:fixed;bottom:0;left:0;right:0;background:#f8fbf5f2;backdrop-filter:blur(14px);border-top:1px solid #dae5cf;padding:10px 12px calc(10px + env(safe-area-inset-bottom));display:flex;justify-content:center;gap:8px;z-index:5}
+.nav button{min-width:110px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.formgrid label{margin:0 0 6px}.formgrid>div{min-width:0}
+details{background:#fff;border:1px solid #dce4d5;border-radius:13px;padding:11px 13px;margin-bottom:12px}
+summary{font-weight:700;cursor:pointer;padding:3px 0}
+.mini{font-size:11px;color:#888}.separator{height:1px;background:#e5e9de;margin:16px 0}.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;background:#e3edd2}
+@media(max-width:500px){main{padding:12px 11px 120px}section.panel{padding:13px}.formgrid{grid-template-columns:1fr}.brand{font-size:16px}}
