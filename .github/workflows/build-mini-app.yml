@@ -29,3 +29,12 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
+      - name: Export complete review source as UTF-8 TXT
+        run: python scripts/export-review.py
+      - name: Upload review text
+        uses: actions/upload-artifact@v4
+        with:
+          name: layla-talking-story-source-review-txt
+          path: review/layla-talking-story-source-review.txt
+          if-no-files-found: error
+          retention-days: 14
