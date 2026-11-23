@@ -48,7 +48,7 @@ function validate(raw,validator){
   try{return {value:validator(raw),error:null};}catch(e){return {value:null,error:e};}
 }
 export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,validator=cleanState}={}){
-  let idb=null,fallback=null,sqlAvailable=false,sqlProblem='',rawEvidence=null;
+  let idb=null,fallback=null,sqlAvailable=false,sqlProblem='',rawEvidence=null,sqliteCorrupt=false;
   let sqlSnapshot=null,manifest=null,readOnly=false,recoveryRequired=false;
   let preferred=null,mode='保存不可',seq=0,checkpointCache=[];
   const sql=host?.db?.executeSql;
@@ -82,8 +82,11 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       }
     }catch(e){
       sqlProblem=String(e.message||e);
-      readOnly=true;sqlAvailable=false;
-      notify('SQLiteの読み取りに失敗しました。上書き停止: '+sqlProblem);
+      // If the API/table itself fails before a manifest is read, this can be
+      // transient unavailability, NOT corrupted saved data. Allow IDB fallback.
+      sqliteCorrupt=rawEvidence!==null||manifest!==null;
+      readOnly=sqliteCorrupt;sqlAvailable=false;
+      notify(sqliteCorrupt?'SQLite保存を検証できません。上書きを停止しました: '+sqlProblem:'SQLiteを一時的に利用できません。IndexedDBへ退避を試します: '+sqlProblem);
     }
   }
   let idbValid=null;
@@ -105,7 +108,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }else if(fallback?.state&&idbValid?.error&&!sqlSnapshot){
     readOnly=true;
   }
-  if(sqlProblem&&sqlProblem!=='SQLite API非対応（通常ブラウザ等）')readOnly=true;
+  if(sqliteCorrupt)readOnly=true;
   if(!sqlAvailable&&!idb)mode='保存不可';
   else if(sqlAvailable)mode='SQLite';
   else mode=idb?'IndexedDB（退避）':'保存不可';
@@ -259,7 +262,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   const hasStorage=Boolean(sqlAvailable||idb);
   return {
     initial:preferred,sqlInitial:sqlSnapshot?.validated.value||null,
-    readOnly,corrupt:Boolean(sqlProblem&&sqlProblem!=='SQLite API非対応（通常ブラウザ等）'),
+    readOnly,corrupt:sqliteCorrupt,
     recoveryRequired,hasStorage,mode:()=>mode,problem:sqlProblem,
     save,checkpoint,checkpoints,chooseRecovery,allowImportRecovery,rawDump,
     flush:()=>Promise.resolve()

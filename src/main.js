@@ -175,13 +175,20 @@ function rebuildSettings(){
   pref.append(detail);
   const edit=el('edit-body');edit.value=state.body;edit.maxLength=BODY_LIMIT;
   const count=el('edit-count');count.textContent=state.body.length+' / '+BODY_LIMIT+'文字';
-  edit.oninput=()=>{
+  edit.oninput=async()=>{
     const text=edit.value;
     if(text.length<state.body.length*0.5&&state.body.length>500){
       el('edit-warning').hidden=false;
-      const previous={...state,body:state.body};
-      // Preserve an independent snapshot before a destructive edit.
-      void store?.checkpoint(previous).catch(e=>status('削除前の復元点を保存できません: '+e.message,true));
+      edit.disabled=true;
+      try{
+        // Do not commit the destructive edit until the prior text is safely saved.
+        await store.checkpoint({...state,body:state.body});
+      }catch(e){
+        edit.value=state.body;
+        status('削除前の復元点を作れなかったため、削除を中止しました: '+e.message,true);
+        edit.disabled=false;return;
+      }
+      edit.disabled=false;
     }
     state.body=text;state.undo=null;count.textContent=text.length+' / '+BODY_LIMIT+'文字';
     persist();
