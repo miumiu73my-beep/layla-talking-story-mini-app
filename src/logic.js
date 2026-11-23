@@ -1,98 +1,234 @@
-export const FORMAT = 'layla-talking-story-backup';
-export const VERSION = 1;
-export const FIELDS = [
+// Pure data validation, prompt budgeting and reversible story state transitions.
+export const FORMAT='layla-talking-story-backup',VERSION=1;
+export const BODY_LIMIT=1500000,TRANSFER_MAX_BYTES=50000000;
+export const LIMITS=Object.freeze({
+  title:120,synopsis:12000,characters:30000,world:25000,memory:25000,
+  avoidPlot:15000,avoidWords:10000,player:10000,goal:15000,rules:15000,modelNote:120
+});
+export const FIELDS=[
   ['title','今回の作品のタイトル','text','例：雨の日の約束'],
   ['synopsis','今回の作品のあらすじ','textarea','最初の状況、これまでの経緯'],
-  ['characters','メインキャラ・人物設定','textarea','通常の文章、[海:名称≡<虎田海>] のような記法、両方使用できます。'],
+  ['characters','メインキャラ・人物設定','textarea','通常の文章、[海:名称≡<虎田海>] 形式を併用できます。'],
   ['world','世界観・その他キャラ設定','textarea','時代、場所、用語、ルールなど'],
-  ['memory','覚えておいてほしい内容（自由記載）','textarea','章区切りは不要。確定した出来事、関係性、伏線などを書き足してください。'],
-  ['avoidPlot','禁止する展開','textarea','避けたい物語の方向性を指定します。'],
-  ['avoidWords','禁止ワード','textarea','読点、改行などで区切ってください。'],
-  ['player','ユーザーの役割・呼び名','textarea','例：ユーザーは「海」。発言・選択は本人が決める。'],
-  ['goal','作品のゴール','textarea','終着点、目指したい関係、未解決の目的など'],
-  ['rules','固定指示・文体・注意事項','textarea','視点、語り口、絶対に守る設定など'],
-  ['modelNote','利用モデルのメモ（表示用）','text','GGUFの選択はLayla本体で行います。'],
+  ['memory','覚えておいてほしい内容（自由記載）','textarea','章分けなし。最新の内容も参照されるよう送信時に予算管理します。'],
+  ['avoidPlot','禁止する展開','textarea','避けたい展開'],
+  ['avoidWords','禁止ワード','textarea','改行、読点、カンマで区切る'],
+  ['player','ユーザーの役割・呼び名','textarea','例：ユーザーは海。発言や行動は本人が決める。'],
+  ['goal','作品のゴール','textarea','物語の目標'],
+  ['rules','固定指示・文体・注意事項','textarea','視点、口調、絶対に守ること'],
+  ['modelNote','利用モデルのメモ（表示用）','text','モデル選択はLayla本体で行います。']
 ];
-export function freshState() {
-  return {schema:FORMAT,version:VERSION,updatedAt:new Date().toISOString(),title:'新しい物語',synopsis:'',characters:'',world:'',memory:'',avoidPlot:'',avoidWords:'',player:'',goal:'',rules:'',modelNote:'',body:'',turns:[],
-    prefs:{targetChars:300,contextChars:3600,pace:'普通',pov:'二人称寄り',temperature:'',top_p:'',top_k:'',min_p:'',repeat_penalty:'',repeat_last_n:'',repeat_penalty_slope:'',frequency_penalty:'',presence_penalty:'',max_tokens:768}};
+const own=(obj,key)=>Object.prototype.hasOwnProperty.call(obj,key);
+function checksum(src){let h=2166136261;for(let i=0;i<src.length;i++)h=Math.imul((h^src.charCodeAt(i)),16777619);return(h>>>0).toString(16);}
+const bound=(x,lo,hi,defaultValue)=>Number.isFinite(+x)&&x!==''?Math.max(lo,Math.min(hi,+x)):defaultValue;
+export function freshState(){
+  return {schema:FORMAT,version:VERSION,updatedAt:new Date().toISOString(),
+    title:'新しい物語',synopsis:'',characters:'',world:'',memory:'',
+    avoidPlot:'',avoidWords:'',player:'',goal:'',rules:'',modelNote:'',
+    body:'',turns:[],draft:'',pendingCandidate:null,undo:null,
+    prefs:{targetChars:300,contextChars:3600,contextTokens:8192,pace:'普通',
+      pov:'ユーザー視点（二人称寄り）',autoAdopt:false,includeInput:true,
+      temperature:'',top_p:'',top_k:'',min_p:'',repeat_penalty:'',
+      repeat_last_n:'',repeat_penalty_slope:'',frequency_penalty:'',
+      presence_penalty:'',max_tokens:''}};
 }
-const limits={title:120,synopsis:12000,characters:30000,world:25000,memory:25000,avoidPlot:15000,avoidWords:10000,player:10000,goal:15000,rules:15000,modelNote:120};
-const clamp=(n,min,max)=>Math.max(min,Math.min(max,n));
-export function cleanState(raw) {
-  if(!raw || typeof raw!=='object'||Array.isArray(raw))throw Error('作品データの形式が不正です。');
-  const out=freshState();
-  for(const [key,max] of Object.entries(limits))if(raw[key]!==undefined) {
-    if(typeof raw[key]!=='string')throw Error(key+'が文字列ではありません。');
-    out[key]=raw[key].slice(0,max);
+export function cleanState(raw){
+  if(!raw||typeof raw!=='object'||Array.isArray(raw))throw Error('作品の形式が不正です。');
+  if(raw.schema!==undefined&&raw.schema!==FORMAT)throw Error('別の形式のバックアップです。');
+  if(raw.version!==undefined&&raw.version!==VERSION)throw Error('対応していないバックアップのバージョンです。');
+  const d=freshState();
+  for(const key of Object.keys(LIMITS)){
+    if(!own(raw,key)||raw[key]===null)continue;
+    if(typeof raw[key]!=='string')throw Error('設定 '+key+' の形式が不正です。');
+    d[key]=raw[key]; // Do NOT truncate already-saved data.
   }
-  if(raw.body!==undefined){if(typeof raw.body!=='string'||raw.body.length>1500000)throw Error('本文が長すぎるか不正です。');out.body=raw.body;}
-  if(raw.prefs&&typeof raw.prefs==='object'&&!Array.isArray(raw.prefs)){
-    for(const key of Object.keys(out.prefs))if(Object.hasOwn(raw.prefs,key)){
-      const v=raw.prefs[key]; if(typeof v==='string'||typeof v==='number')out.prefs[key]=v;
+  for(const key of ['body','draft']){
+    if(!own(raw,key)||raw[key]===null)continue;
+    if(typeof raw[key]!=='string')throw Error(key+' の形式が不正です。');
+    d[key]=raw[key]; // Oversized legacy data must remain exportable.
+  }
+  if(raw.turns!==undefined){
+    if(!Array.isArray(raw.turns)||raw.turns.length>20000)throw Error('履歴の形式が不正です。');
+    d.turns=raw.turns.map(t=>{
+      if(!t||typeof t!=='object'||typeof t.user!=='string')throw Error('履歴が壊れています。');
+      const u={user:t.user,at:typeof t.at==='string'?t.at:''};
+      if(typeof t.reply==='string')u.reply=t.reply; // v1 backwards compatibility.
+      if(typeof t.preview==='string')u.preview=t.preview;
+      if(Number.isSafeInteger(t.bodyStart))u.bodyStart=t.bodyStart;
+      if(Number.isSafeInteger(t.bodyEnd))u.bodyEnd=t.bodyEnd;
+      return u;
+    });
+  }
+  if(raw.pendingCandidate!==undefined&&raw.pendingCandidate!==null){
+    const c=raw.pendingCandidate;
+    if(!c||typeof c!=='object'||typeof c.user!=='string'||typeof c.text!=='string')throw Error('未採用候補が不正です。');
+    d.pendingCandidate={user:c.user,text:c.text,sourceDraft:typeof c.sourceDraft==='string'?c.sourceDraft:'',baseBody:typeof c.baseBody==='string'?c.baseBody:'',note:typeof c.note==='string'?c.note:''};
+  }
+  if(raw.undo!==undefined&&raw.undo!==null){
+    const u=raw.undo;
+    if(!u||typeof u!=='object'||!Number.isInteger(u.beforeTurns))throw Error('取消履歴が不正です。');
+    if(typeof u.beforeBody==='string'&&typeof u.afterBody==='string'){
+      d.undo={beforeLength:u.beforeBody.length,added:u.afterBody.slice(u.beforeBody.length),afterHash:checksum(u.afterBody),beforeTurns:u.beforeTurns,input:typeof u.input==='string'?u.input:''};
+    }else if(Number.isSafeInteger(u.beforeLength)&&typeof u.added==='string'&&typeof u.afterHash==='string'){
+      d.undo={beforeLength:u.beforeLength,added:u.added,afterHash:u.afterHash,beforeTurns:u.beforeTurns,input:typeof u.input==='string'?u.input:''};
+    }else throw Error('取消履歴が不正です。');
+  }
+  if(raw.prefs!==undefined){
+    if(!raw.prefs||typeof raw.prefs!=='object'||Array.isArray(raw.prefs))throw Error('生成設定が不正です。');
+    for(const key of Object.keys(d.prefs)){
+      if(!own(raw.prefs,key))continue;
+      const value=raw.prefs[key];
+      if(typeof value==='string'||typeof value==='number'||typeof value==='boolean')d.prefs[key]=value;
     }
   }
-  out.prefs.targetChars=clamp(Number(out.prefs.targetChars)||300,100,1000);
-  out.prefs.contextChars=clamp(Number(out.prefs.contextChars)||3600,500,12000);
-  out.prefs.pace=String(out.prefs.pace).slice(0,50);
-  out.prefs.pov=String(out.prefs.pov).slice(0,50);
-  if(raw.turns!==undefined){
-    if(!Array.isArray(raw.turns)||raw.turns.length>15000)throw Error('履歴の形式が不正です。');
-    out.turns=raw.turns.map(t=>({user:String(t?.user||'').slice(0,15000),reply:String(t?.reply||'').slice(0,15000),at:String(t?.at||'').slice(0,40)}));
+  d.prefs.targetChars=bound(d.prefs.targetChars,100,1000,300);
+  d.prefs.contextChars=bound(d.prefs.contextChars,500,12000,3600);
+  d.prefs.contextTokens=bound(d.prefs.contextTokens,2048,65536,8192);
+  d.prefs.autoAdopt=d.prefs.autoAdopt===true;
+  d.prefs.includeInput=d.prefs.includeInput!==false;
+  if(!['ゆっくり','普通','速め'].includes(d.prefs.pace))d.prefs.pace='普通';
+  const views=['ユーザー視点（二人称寄り）','相手キャラの一人称','三人称（客観）'];
+  const oldView={'二人称寄り':views[0],'一人称':views[1],'三人称':views[2]};
+  d.prefs.pov=oldView[d.prefs.pov]|| (views.includes(d.prefs.pov)?d.prefs.pov:views[0]);
+  d.updatedAt=typeof raw.updatedAt==='string'?raw.updatedAt:d.updatedAt;
+  return d;
+}
+export function warningsForState(data){
+  const d=cleanState(data),warnings=[];
+  for(const [key,max] of Object.entries(LIMITS)){
+    if(d[key].length>max)warnings.push(key+'：推奨入力上限を超過（既存データは保持）');
   }
-  out.updatedAt=typeof raw.updatedAt==='string'?raw.updatedAt:out.updatedAt;
+  if(d.body.length>BODY_LIMIT)warnings.push('本文が150万字を超過しています。削除せず読み込みました。外部JSONへバックアップしてください。');
+  return warnings;
+}
+function safeTail(input,n){
+  const s=String(input||'');
+  let pos=Math.max(0,s.length-n);
+  if(pos>0){const c=s.charCodeAt(pos);if(c>=0xdc00&&c<=0xdfff)pos++;}
+  let tail=s.slice(pos);
+  if(pos>0){
+    const prefix=tail.slice(0,100);
+    const hit=prefix.search(/[。\n]/);
+    if(hit>=0&&hit<tail.length-30)tail=tail.slice(hit+1);
+  }
+  return tail;
+}
+export function samplerParams(prefs){
+  const ranges={temperature:[0,2],top_p:[0,1],top_k:[1,200],min_p:[0,1],repeat_penalty:[0.5,3],
+    repeat_last_n:[0,2048],repeat_penalty_slope:[0,2],frequency_penalty:[-2,2],presence_penalty:[-2,2],max_tokens:[1,8192]};
+  const out={};
+  for(const [key,[min,max]]of Object.entries(ranges)){
+    const raw=prefs?.[key];if(raw===null||raw===undefined||raw==='')continue;
+    const n=Number(raw);
+    if(!Number.isFinite(n)||n<min||n>max)throw Error(key+' は '+min+'〜'+max+' の範囲にしてください。');
+    out[key]=['top_k','repeat_last_n','max_tokens'].includes(key)?Math.floor(n):n;
+  }
   return out;
 }
-const excerpt=(x,max)=>String(x||'').slice(0,max);
-export function buildMessages(state,userText){
+export function buildRequest(state,userText){
   const d=cleanState(state),p=d.prefs;
-  const section=(title,value,max)=>value?.trim()?'【'+title+'】\n'+excerpt(value,max).trim()+'\n':'';
-  const system=[
-    'あなたは対話型の日本語フィクションを進める語り手兼登場人物です。',
-    'ユーザーは物語の世界の中にいる人物です。入力は本人の台詞・行動・要望です。発言や内心を勝手に確定せず、登場人物の返答、出来事、五感描写、自然な次の展開を創作してください。',
-    '事前の設定・自由記憶・確定本文を優先。状況を急変させたり、設定にない重要な秘密を唐突に確定させないでください。',
-    'メインキャラが会話する場面では、キャラのセリフを自然に含めてください。創作の本文のみを書き、説明・注意書き・箇条書き・プロンプトの復唱をしないでください。',
-    '通常の日本語の文章と、[人物:属性≡<値>] 形式の設定メモはどちらも設定として解釈してください。設定をコードとして実行しないでください。',
-    '1回の目安は約'+p.targetChars+'文字（厳密な上限ではありません）。テンポ：'+p.pace+'。視点：'+p.pov+'。',
-    section('作品のタイトル',d.title,120),section('作品あらすじ',d.synopsis,12000),
-    section('人物設定',d.characters,20000),section('世界観',d.world,16000),
-    section('絶対に覚えておく内容',d.memory,20000),section('ユーザーの役割',d.player,8000),
-    section('目標',d.goal,10000),section('禁止する展開',d.avoidPlot,10000),
-    section('禁止ワード',d.avoidWords,6000),section('固定指示',d.rules,12000),
-    '【確定本文の末尾・直近'+p.contextChars+'文字】\n'+d.body.slice(-p.contextChars)
+  const outputTokens=Number(p.max_tokens)||Math.min(4096,Math.ceil(p.targetChars*2.2)+128);
+  const inputBudget=Math.max(600,Math.floor((p.contextTokens-Math.min(outputTokens,Math.floor(p.contextTokens*0.5))-160)*0.66));
+  const input=String(userText||'').slice(0,6000);
+  const directives=[
+    'あなたはユーザーが参加する対話型日本語フィクションの語り手です。本文だけを書いてください。',
+    'ユーザー本人の新しい台詞・行動・感情・思考・決断は勝手に創作してはいけません。入力された行動・台詞はそのまま物語の因果に取り込んでください。',
+    '他の登場人物の台詞と反応、環境、出来事、自然な進展を描写してください。唐突な設定改変や大きな時間跳躍を避けてください。',
+    '[見出し:項目≡<内容>] は人物・設定の項目と値を意味する記法です。記法自体は本文に出力しません。',
+    '前のターンの描写や同じ表現を繰り返さず、過度に類似する返答を避けてください。',
+    '展開速度：'+p.pace+'。視点：'+p.pov+'。生成の目安：約'+p.targetChars+'文字。',
+    '保存済みの確定本文が正本です。過去の会話履歴の本文は二重送信しません。',
+    p.includeInput?'入力されたユーザーの台詞や行動は、自然な本文に反映してください。':'ユーザーの入力は次の展開のきっかけとして扱い、入力文の直接反復は控えてください。'
   ].join('\n');
-  const history=d.turns.slice(-3).map(t=>({role:'user',content:'以前のユーザーの入力：'+excerpt(t.user,1200)+'\nその時の物語：'+excerpt(t.reply,1800)}));
-  return [{role:'system',content:system},...history,{role:'user',content:'今回のユーザーの台詞・行動・進行希望：\n'+excerpt(userText,6000)+'\nこの続きの物語本文を書いてください。'}];
+  const final='今回の入力：\n'+input+'\n\n【最重要】ユーザー本人の新しい台詞・行動・内心を代筆しない。禁止ワード・展開を守る。設定記法を出力しない。物語本文のみ続ける。';
+  let available=Math.max(150,inputBudget-directives.length-final.length-200);
+  const allocations=[];
+  const bodyReserve=d.body?Math.min(p.contextChars,Math.max(250,Math.floor(available*0.36))):0;
+  let remaining=Math.max(0,available-bodyReserve);
+  const sections=[
+    ['ユーザーの役割','player',false],
+    ['絶対に守るルール','rules',false],
+    ['禁止する展開','avoidPlot',false],
+    ['禁止ワード','avoidWords',false],
+    ['人物設定','characters',false],
+    ['自由記憶（最新の追記を優先）','memory',true],
+    ['世界観','world',false],
+    ['あらすじ','synopsis',false],
+    ['物語のゴール','goal',false]
+  ];
+  const nonempty=sections.filter(([,k])=>d[k].trim());
+  // Cap each segment fairly so no single enormous character-book crowds out memory.
+  for(const [name,key,latest] of nonempty){
+    const share=Math.floor(remaining/Math.max(1,nonempty.length-allocations.length));
+    const quota=Math.min(remaining,Math.max(0,share));
+    let value=latest?safeTail(d[key],quota):d[key].slice(0,quota);
+    if(value.length>d[key].length)value=d[key];
+    if(d[key].length>value.length)allocations.push({key,omitted:d[key].length-value.length});
+    else allocations.push({key,omitted:0});
+    remaining-=value.length;
+    allocations[allocations.length-1].text=value;
+    allocations[allocations.length-1].title=name;
+  }
+  let body=safeTail(d.body,bodyReserve+remaining);
+  const parts=allocations.filter(a=>a.text).map(a=>'【'+a.title+'】\n'+a.text);
+  if(body)parts.push('【確定本文の末尾】\n'+body);
+  else parts.push('【開始場面】\nまだ本文がありません。今回の入力と設定に合った物語の導入を描写してください。');
+  const system=directives+'\n\n'+parts.join('\n\n');
+  return {
+    messages:[{role:'system',content:system},{role:'user',content:final}],
+    meta:{characters:system.length+final.length,estimatedTokens:Math.ceil((system.length+final.length)/0.66),
+      contextTokens:p.contextTokens,outputTokens,omitted:allocations.filter(a=>a.omitted>0),
+      bodyOmitted:Math.max(0,d.body.length-body.length),
+      overBudget:system.length+final.length>inputBudget}
+  };
 }
-export function samplerParams(prefs) {
-  const ranges={temperature:[0,2],top_p:[0,1],top_k:[1,200],min_p:[0,1],repeat_penalty:[0.5,3],repeat_last_n:[0,2048],repeat_penalty_slope:[0,2],frequency_penalty:[-2,2],presence_penalty:[-2,2],max_tokens:[1,8192]};
-  const out={};
-  for(const [key,[lo,hi]]of Object.entries(ranges)){
-    const raw=prefs?.[key];if(raw===undefined||raw===null||raw==='')continue;
-    const num=Number(raw);if(!Number.isFinite(num)||num<lo||num>hi)throw Error(key+'は '+lo+'〜'+hi+' にしてください。');
-    out[key]=['top_k','repeat_last_n','max_tokens'].includes(key)?Math.floor(num):num;
-  }return out;
+export function buildMessages(state,userText){return buildRequest(state,userText).messages;}
+export function acceptTurn(state,candidate){
+  const d=cleanState(state),text=String(candidate?.text||'').trim();
+  if(!text)throw Error('候補が空です。');
+  const input=String(candidate.user||'');
+  const prefix=d.body?'\n\n':'';
+  if(d.body.length+prefix.length+text.length>BODY_LIMIT)throw Error('本文の入力上限を超えています。先にJSONを保存してください。');
+  const before=d.body, beforeTurns=d.turns.length;
+  d.body+=prefix+text;
+  d.turns.push({user:input,preview:text.slice(0,240),at:new Date().toISOString(),bodyStart:before.length+prefix.length,bodyEnd:d.body.length});
+  d.undo={beforeLength:before.length,added:prefix+text,afterHash:checksum(d.body),beforeTurns,input};
+  d.pendingCandidate=null;
+  d.draft=d.draft===candidate.sourceDraft?'':d.draft;
+  return d;
 }
-export function readableText(s,format){
-  if(format==='txt')return '作品：'+s.title+'\n\n'+s.body;
-  if(format==='md')return '# '+s.title.replace(/\n/g,' ')+'\n\n'+s.body;
-  throw Error('形式が不明です');
+export function undoTurn(state){
+  const d=cleanState(state),u=d.undo;
+  if(!u||d.body.length!==u.beforeLength+u.added.length||!d.body.endsWith(u.added)||checksum(d.body)!==u.afterHash||d.turns.length!==u.beforeTurns+1)throw Error('本文が編集されているため安全に取り消せません。');
+  d.body=d.body.slice(0,u.beforeLength);d.turns=d.turns.slice(0,u.beforeTurns);
+  if(!d.draft)d.draft=u.input;
+  d.undo=null;return d;
+}
+export function readableText(state,format){
+  const d=cleanState(state),title=(d.title.trim()||'無題の作品').replace(/[\r\n]/g,' ');
+  if(format==='txt')return 'TALKING_STORY_TXT_V2\n作品：'+title+'\n\n'+d.body;
+  if(format==='md')return '<!-- TALKING_STORY_MD_V2 -->\n# '+title+'\n\n'+d.body;
+  throw Error('未対応の形式です。');
 }
 export function parseImport(filename,content,current){
-  const ext=String(filename).split('.').pop().toLowerCase();
-  if(new TextEncoder().encode(content).length>8000000)throw Error('8MBを超えるファイルは読み込めません。');
+  const src=String(content||'');
+  if(new TextEncoder().encode(src).length>TRANSFER_MAX_BYTES)throw Error('ファイル容量が50MBを超えています。');
+  const ext=String(filename||'').split('.').pop().toLowerCase();
   if(ext==='json'){
-    let raw;try{raw=JSON.parse(content);}catch{throw Error('JSONの解析に失敗しました。');}
-    if(raw?.schema!==FORMAT||raw?.version!==VERSION)throw Error('このアプリのv1バックアップではありません。');
+    let raw;try{raw=JSON.parse(src.replace(/^\uFEFF/,''));}catch{throw Error('JSONを解析できません。');}
+    if(raw?.schema!==FORMAT||raw?.version!==VERSION)throw Error('対応しているv1バックアップではありません。');
     return {state:cleanState(raw),full:true};
   }
-  if(ext!=='txt'&&ext!=='md')throw Error('JSON、TXT、MDのみ対応します。');
-  const next=cleanState(current);
-  let text=String(content).replace(/^\uFEFF/,'').replace(/\r\n?/g,'\n');
-  const header=ext==='md'?/^# ([^\n]{1,120})\n\n/:/^作品：([^\n]{1,120})\n\n/;
-  const matched=header.exec(text);
-  if(matched){next.title=matched[1];text=text.slice(matched[0].length);}
-  if(text.length>1500000)throw Error('本文が長すぎます。');
-  next.body=text;next.turns=[];
-  return {state:next,full:false};
+  if(!['txt','md'].includes(ext))throw Error('JSON、TXT、MDのみ読み込めます。');
+  const d=cleanState(current);
+  let text=src.replace(/^\uFEFF/,'').replace(/\r\n?/g,'\n');
+  const marker=ext==='md'?'<!-- TALKING_STORY_MD_V2 -->\n':'TALKING_STORY_TXT_V2\n';
+  if(text.startsWith(marker)){
+    text=text.slice(marker.length);
+    const header=ext==='md'?/^# ([^\n]*)\n\n/:/^作品：([^\n]*)\n\n/;
+    const match=header.exec(text);
+    if(match){d.title=match[1]||'無題の作品';text=text.slice(match[0].length);}
+  }
+  d.body=text;d.turns=[];d.undo=null;d.pendingCandidate=null;
+  return {state:d,full:false};
 }
