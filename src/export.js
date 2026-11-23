@@ -1,7 +1,7 @@
 // Explicit user-operated export: do not claim success without checking iOS Files.
 export function filename(title,ext,date=new Date()){
   const pad=x=>String(x).padStart(2,'0');
-  const stamp=''+date.getFullYear()+pad(date.getMonth()+1)+pad(date.getDate())+'-'+pad(date.getHours())+pad(date.getMinutes())+pad(date.getSeconds());
+  const stamp=''+date.getFullYear()+pad(date.getMonth()+1)+pad(date.getDate())+'-'+pad(date.getHours())+pad(date.getMinutes())+pad(date.getSeconds())+String(date.getMilliseconds()).padStart(3,'0');
   const clean=(String(title||'').trim()||'story').replace(/[\\/:*?"<>|\u0000-\u001f]/g,'_').slice(0,45);
   return clean+'_'+stamp+'.'+ext;
 }

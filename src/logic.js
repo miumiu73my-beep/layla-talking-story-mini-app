@@ -20,6 +20,7 @@ export const FIELDS=[
 ];
 const own=(obj,key)=>Object.prototype.hasOwnProperty.call(obj,key);
 function checksum(src){let h=2166136261;for(let i=0;i<src.length;i++)h=Math.imul((h^src.charCodeAt(i)),16777619);return(h>>>0).toString(16);}
+export function bodyFingerprint(value){const s=String(value||'');return s.length+':'+checksum(s);}
 const bound=(x,lo,hi,defaultValue)=>Number.isFinite(+x)&&x!==''?Math.max(lo,Math.min(hi,+x)):defaultValue;
 export function freshState(){
   return {schema:FORMAT,version:VERSION,updatedAt:new Date().toISOString(),
@@ -62,7 +63,7 @@ export function cleanState(raw){
   if(raw.pendingCandidate!==undefined&&raw.pendingCandidate!==null){
     const c=raw.pendingCandidate;
     if(!c||typeof c!=='object'||typeof c.user!=='string'||typeof c.text!=='string')throw Error('未採用候補が不正です。');
-    d.pendingCandidate={user:c.user,text:c.text,sourceDraft:typeof c.sourceDraft==='string'?c.sourceDraft:'',baseBody:typeof c.baseBody==='string'?c.baseBody:'',note:typeof c.note==='string'?c.note:''};
+    d.pendingCandidate={user:c.user,text:c.text,sourceDraft:typeof c.sourceDraft==='string'?c.sourceDraft:'',baseFingerprint:typeof c.baseFingerprint==='string'?c.baseFingerprint:bodyFingerprint(c.baseBody||''),note:typeof c.note==='string'?c.note:''};
   }
   if(raw.undo!==undefined&&raw.undo!==null){
     const u=raw.undo;
@@ -223,8 +224,9 @@ export function parseImport(filename,content,current){
   const d=cleanState(current);
   let text=src.replace(/^\uFEFF/,'').replace(/\r\n?/g,'\n');
   const marker=ext==='md'?'<!-- TALKING_STORY_MD_V2 -->\n':'TALKING_STORY_TXT_V2\n';
-  if(text.startsWith(marker)){
-    text=text.slice(marker.length);
+  const legacyName=/_\d{4}-\d{2}-\d{2}\.(txt|md)$/i.test(String(filename));
+  if(text.startsWith(marker)||legacyName){
+    if(text.startsWith(marker))text=text.slice(marker.length);
     const header=ext==='md'?/^# ([^\n]*)\n\n/:/^作品：([^\n]*)\n\n/;
     const match=header.exec(text);
     if(match){d.title=match[1]||'無題の作品';text=text.slice(match[0].length);}

@@ -1,5 +1,5 @@
 import {makeRuntime} from './runtime.js';
-import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,acceptTurn,undoTurn} from './logic.js';
+import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,acceptTurn,undoTurn,bodyFingerprint} from './logic.js';
 import {openStore} from './persistence.js';
 import {writeFile,filename} from './export.js';
 import './style.css';
@@ -207,7 +207,7 @@ function modal(question,choices=[['yes','続行'],['no','キャンセル']]){
 }
 async function useCandidate(){
   if(!candidate?.text?.trim()||busy||saveBlocked)return false;
-  if(candidate.baseBody!==state.body){status('候補生成後に本文が変わっています。上書きせず、候補をJSONにバックアップしてください。',true);return false;}
+  if(candidate.baseFingerprint!==bodyFingerprint(state.body)){status('候補生成後に本文が変わっています。上書きせず、候補をJSONにバックアップしてください。',true);return false;}
   try{
     state=acceptTurn(state,candidate);candidate=null;paint();persist(0);
     const saved=await saveNow();
@@ -222,10 +222,10 @@ async function startGeneration({retry=false,inputOverride=null}={}){
     if(choice!=='yes')return;
   }
   const requestInput=inputOverride??promptDraft();
-  const old=candidate,baseBody=state.body;
+  const old=candidate,baseFingerprint=bodyFingerprint(state.body);
   const thisId=++activeId;
   busy=true;stream=null;
-  candidate={user:requestInput,text:'',sourceDraft:state.draft,baseBody,note:'生成中…'};
+  candidate={user:requestInput,text:'',sourceDraft:retry&&old?old.sourceDraft:state.draft,baseFingerprint,note:'生成中…'};
   state.pendingCandidate=candidate;persist(0);showCandidate('生成中…');lockUI();
   let finished=false,stopResolver=null;
   const aborted=new Promise(resolve=>{stopResolver=resolve;});
@@ -253,7 +253,7 @@ async function startGeneration({retry=false,inputOverride=null}={}){
       const forbidden=state.avoidWords.split(/[,、，\n]/).map(t=>t.trim()).filter(Boolean);
       const hit=forbidden.find(t=>candidate.text.includes(t));
       candidate.note=hit?'禁止ワード「'+hit+'」が含まれています。内容を確認してください。':'生成が完了しました。編集・再生成・採用を選べます。';
-      if(state.prefs.autoAdopt&&!hit&&state.body===baseBody){
+      if(state.prefs.autoAdopt&&!hit&&bodyFingerprint(state.body)===baseFingerprint){
         finished=true;busy=false;await useCandidate();return;
       }
     }

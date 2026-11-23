@@ -68,3 +68,9 @@ test('invalid import does not modify existing state',()=>{
   assert.throws(()=>parseImport('bad.json','{}',s));
   assert.equal(s.memory,'重要メモ');
 });
+
+test('legacy unmarked TXT produced by previous version still imports',()=>{
+  const s=freshState();
+  const result=parseImport('old_2026-11-23.txt','作品：旧作\n\n旧本文',s);
+  assert.equal(result.state.title,'旧作');assert.equal(result.state.body,'旧本文');
+});
