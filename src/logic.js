@@ -143,7 +143,7 @@ export function buildRequest(state,userText){
   const final='今回の入力：\n'+input+'\n\n【最重要】ユーザー本人の新しい台詞・行動・内心を代筆しない。禁止ワード・展開を守る。設定記法を出力しない。物語本文のみ続ける。';
   let available=Math.max(150,inputBudget-directives.length-final.length-200);
   const allocations=[];
-  const bodyReserve=d.body?Math.min(p.contextChars,Math.max(250,Math.floor(available*0.36))):0;
+  const bodyReserve=d.body?Math.min(p.contextChars,Math.floor(available*0.30)):0;
   let remaining=Math.max(0,available-bodyReserve);
   const sections=[
     ['ユーザーの役割','player',false],

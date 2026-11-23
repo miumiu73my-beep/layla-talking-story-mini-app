@@ -237,7 +237,9 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const selected=which==='idb'?idbValid?.value:which==='sqlite'?sqlSnapshot?.validated.value:null;
     if(!selected)throw Error('復旧元が見つかりません。');
     readOnly=false;recoveryRequired=false;
-    // Explicit decision: the selected state is NOT promoted until save() succeeds.
+    // Keep a separate rescue copy of the version NOT chosen by the user.
+    const other=which==='idb'?sqlSnapshot?.validated.value:idbValid?.value;
+    if(other)await checkpoint(other);
     await checkpoint(selected);
     await save(selected);
     return selected;
