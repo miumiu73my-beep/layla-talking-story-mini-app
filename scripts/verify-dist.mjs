@@ -1,8 +1,13 @@
 import {existsSync,readFileSync} from 'node:fs';
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 for(const path of ['dist/index.html','dist/app.json','dist/icon.jpg'])assert.ok(existsSync(path),path+' missing');
 const html=readFileSync('dist/index.html','utf8');
 assert.ok(html.includes('Talking Story'));
 assert.ok(!/src="\/src\/main.js"/.test(html),'unbundled script');
 const app=JSON.parse(readFileSync('dist/app.json','utf8'));
-assert.equal(app.iconUri,'icon.jpg');console.log('Layla package verified');
+assert.equal(app.iconUri,'icon.jpg');
+const originalImageHash='b31088cc03a0027aa6aabdc37e5d31d5485ba05d510bd9ac11b7336c1b54a18a';
+const actualImageHash=createHash('sha256').update(readFileSync('dist/icon.jpg')).digest('hex');
+assert.equal(actualImageHash,originalImageHash,'App icon differs from the user supplied JPEG');
+console.log('Layla package verified');
