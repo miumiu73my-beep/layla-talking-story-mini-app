@@ -196,3 +196,30 @@ test('legacy single-row checkpoints remain readable after migration',async()=>{
   const all=await store.checkpoints();
   assert.ok(all.some(x=>x.data===JSON.stringify(s)));
 });
+
+test('unrecognized SQL rows format throws instead of silently opening blank story',()=>{
+  assert.throws(()=>sqlRows({unexpected:[]}),/想定外/);
+  assert.throws(()=>sqlRows({rows:[['v']]}),/名前付き/);
+});
+test('corrupt archived branch leaves active text rescue visible in read-only mode',async()=>{
+  const sql=fakeSql(),s=freshState();s.body='大切な本編';
+  s.branches=[{id:'bad',name:'壊れた分岐',body:34}];
+  seed(sql,s);
+  const st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  assert.equal(st.initial.body,'大切な本編');
+  assert.equal(st.initial.branches.length,0);
+  assert.equal(st.readOnly,true);
+  await assert.rejects(st.save(st.initial));
+});
+test('corrupt ACTIVE can be preserved and explicitly replaced using imported v1 JSON',async()=>{
+  const sql=fakeSql(),db=fakeIdb();sql.map.set('active','INVALID');
+  const st=await openStore({db:sql},()=>{},{idbFactory:db.factory});
+  assert.equal(st.readOnly,true);
+  await st.allowImportRecovery();
+  const valid=freshState();valid.body='復旧した原稿';
+  await st.save(valid);
+  assert.ok([...sql.map.keys()].some(k=>k.startsWith('corrupt-backup/')));
+  const again=await openStore({db:sql},()=>{},{idbFactory:db.factory});
+  assert.equal(again.initial.body,valid.body);
+  assert.equal(again.readOnly,false);
+});

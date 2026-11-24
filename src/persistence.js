@@ -23,11 +23,17 @@ export function checksum(src){
 }
 export function sqlRows(result){
   const rows=result?.rows;
-  if(Array.isArray(rows))return rows;
-  if(rows&&typeof rows.item==='function'&&typeof rows.length==='number')
-    return Array.from({length:rows.length},(_,i)=>rows.item(i));
-  if(rows&&typeof rows.length==='number')return Array.from(rows);
-  return [];
+  if(rows===undefined||rows===null)
+    throw Error('Layla SQLiteのSELECT結果が想定外の形式です。上書きを停止します。');
+  let entries=null;
+  if(Array.isArray(rows))entries=rows;
+  else if(typeof rows.item==='function'&&typeof rows.length==='number')
+    entries=Array.from({length:rows.length},(_,i)=>rows.item(i));
+  else if(typeof rows.length==='number')entries=Array.from(rows);
+  if(!entries)throw Error('Layla SQLiteの行データ形式が不明です。');
+  if(entries.some(row=>!row||typeof row!=='object'||Array.isArray(row)))
+    throw Error('SQLiteの行が名前付きフィールドを含みません。');
+  return entries;
 }
 function browserIdb(){
   return new Promise((resolve,reject)=>{
@@ -45,7 +51,24 @@ function browserIdb(){
   });
 }
 function validate(raw,validator){
-  try{return {value:validator(raw),error:null};}catch(e){return {value:null,error:e};}
+  try{return {value:validator(raw),error:null};}
+  catch(e){
+    if(raw&&Array.isArray(raw.branches)&&raw.branches.length){
+      try{
+        const base=validator({...raw,branches:[]}),valid=[];
+        for(const b of raw.branches){
+          try{
+            const candidate=validator({...raw,branches:[b]});
+            if(candidate.branches[0]&&!valid.some(v=>v.id===candidate.branches[0].id))
+              valid.push(candidate.branches[0]);
+          }catch{/* Unreadable fork stays in raw evidence, not in the rescue view. */}
+        }
+        return {value:{...base,branches:valid},error:e,rescued:true,
+          lost:raw.branches.length-valid.length};
+      }catch{}
+    }
+    return {value:null,error:e};
+  }
 }
 export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,validator=cleanState}={}){
   let idb=null,fallback=null,sqlAvailable=false,sqlProblem='',rawEvidence=null,sqliteCorrupt=false;
@@ -70,7 +93,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         const raw=JSON.stringify(loaded);
         sqlSnapshot={state:loaded,validated:validate(loaded,validator),raw,rev:Number(manifest.rev)||0};
         seq=Math.max(seq,sqlSnapshot.rev);
-        if(sqlSnapshot.validated.error)throw Error('SQLite保存内容の検証失敗: '+sqlSnapshot.validated.error.message);
+        if(sqlSnapshot.validated.error)throw Error('SQLite保存内容の検証失敗: '+sqlSnapshot.validated.error.message+
+          (sqlSnapshot.validated.rescued?'。正常な本文と分岐を読取専用で救出しました。':'') );
         rawEvidence=null;
       }
     }catch(e){
@@ -85,7 +109,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   let idbValid=null;
   if(fallback?.state){
     idbValid=validate(fallback.state,validator);
-    if(idbValid.error)notify('IndexedDBの退避データが不正です。SQLiteへ自動復旧しません: '+idbValid.error.message);
+    if(idbValid.error)notify('IndexedDBの退避データが不正です。SQLiteへ自動復旧しません: '+idbValid.error.message,true);
     else seq=Math.max(seq,Number(fallback.rev)||0);
   }
   const different=Boolean(idbValid?.value&&sqlSnapshot?.validated.value&&
@@ -97,6 +121,10 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     preferred=idbValid.value; // Display but do NOT write until explicit choice.
     notify('SQLiteとIndexedDBの未同期編集が異なります。復旧元を選ぶまで保存を停止します。');
   }else if(safeFastForward){
+    preferred=idbValid.value;
+  }else if(sqlSnapshot?.validated.value&&!sqlSnapshot.validated.error){
+    preferred=sqlSnapshot.validated.value;
+  }else if(idbValid?.value&&!idbValid.error){
     preferred=idbValid.value;
   }else if(sqlSnapshot?.validated.value){
     preferred=sqlSnapshot.validated.value;

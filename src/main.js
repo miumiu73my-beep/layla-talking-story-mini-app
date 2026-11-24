@@ -9,7 +9,7 @@ const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getE
 const node=(tag,cls,value)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=value;return e;};
 let state=freshState(),store=null,ready=false,saveBlocked=true,busy=false,stream=null,activeId=0;
 let candidate=null,saveTimer=null,fullBody=false,saveError='',notice='',lastAcceptedMessage='';
-let historyOffset=0,branchBusy=false,editRev=0,savedRev=0,stopUntil=0,retryFallback=null;
+let historyOffset=0,branchBusy=false,bodyBackupBusy=false,editRev=0,savedRev=0,stopUntil=0,retryFallback=null;
 const HISTORY_PAGE_SIZE=30;
 const promptDraft=()=>state.draft.trim()||'この場面を自然に続きを進める';
 function status(text,error=false){
@@ -25,16 +25,17 @@ function safety(text=''){
   n.className='safety'+(problem?' error':'');
 }
 function lockUI(){
-  const disabled=!ready||busy||branchBusy||saveBlocked;
+  const disabled=!ready||busy||branchBusy||bodyBackupBusy||saveBlocked;
   const cooling=Date.now()<stopUntil;
   for(const id of ['generate','new-story','restore','user-input'])
     if(el(id))el(id).disabled=disabled||(id==='generate'&&cooling);
-  el('nav-settings').disabled=!ready||busy||branchBusy;
-  el('nav-main').disabled=!ready||branchBusy;
-  el('import').disabled=!ready||busy||branchBusy||Boolean(store?.recoveryRequired);
+  el('nav-settings').disabled=!ready||busy||branchBusy||bodyBackupBusy;
+  el('nav-main').disabled=!ready||branchBusy||bodyBackupBusy;
+  el('import').disabled=!ready||busy||branchBusy||bodyBackupBusy||Boolean(store?.recoveryRequired);
   if(el('recover'))el('recover').disabled=!ready||!store?.recoveryRequired;
   if(el('recover-now')){el('recover-now').hidden=!store?.recoveryRequired;el('recover-now').disabled=!ready||busy;}
   if(el('raw-backup'))el('raw-backup').disabled=!ready;
+  if(el('reset-history'))el('reset-history').disabled=disabled;
   for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy;
   el('stop').disabled=!busy;
   for(const id of ['accept','retry','discard','candidate-edit'])if(el(id))
@@ -265,6 +266,7 @@ function rebuildSettings(){
     if(desired.length<state.body.length*0.5&&state.body.length>500){
       el('edit-warning').hidden=false;
       if(!preDeletePromise){
+        bodyBackupBusy=true;lockUI();
         // Keep the keyboard focused; guard navigation and saving while a rescue
         // checkpoint for the pre-deletion state is being written.
         el('nav-main').disabled=true;
@@ -275,9 +277,9 @@ function rebuildSettings(){
       catch(e){
         edit.value=state.body;
         status('削除前の復元点を作れなかったため変更を取り消しました: '+e.message,true);
-        preDeletePromise=null;el('nav-main').disabled=false;return;
+        preDeletePromise=null;bodyBackupBusy=false;lockUI();return;
       }
-      preDeletePromise=null;el('nav-main').disabled=false;
+      preDeletePromise=null;bodyBackupBusy=false;lockUI();
     }
     const text=edit.value;
     try{
@@ -325,7 +327,7 @@ async function useCandidate(){
   }catch(e){status('採用できません: '+String(e.message||e),true);return false;}
 }
 async function startGeneration({retry=false,inputOverride=null}={}){
-  if(busy||saveBlocked||!ready)return;
+  if(busy||bodyBackupBusy||saveBlocked||!ready)return;
   if(Date.now()<stopUntil){status('前の生成の停止処理中です。数秒後にもう一度操作してください。',true);return;}
   if(candidate&&retry&&candidate.text?.trim()){
     if(await modal('今の候補は保存されていません。破棄してもう一度生成しますか？')!=='yes')return;
@@ -433,7 +435,7 @@ async function beforeDestructive(action,{checkpoint=true}={}){
   }
 }
 async function handleImport(file){
-  if(!file||!ready||busy)return;
+  if(!file||!ready||busy||bodyBackupBusy)return;
   try{
     if(file.size>TRANSFER_MAX_BYTES)throw Error('50MB以下のファイルを選んでください。');
     const parsed=parseImport(file.name,await file.text(),state);
@@ -451,13 +453,13 @@ async function handleImport(file){
   }catch(e){status('読み込みに失敗しました: '+String(e.message||e),true);}
 }
 async function resetStory(){
-  if(!ready||busy||saveBlocked)return;
+  if(!ready||busy||bodyBackupBusy||saveBlocked)return;
   if(await modal('新しい作品にすると本文・設定・保存済みのすべての分岐が置き換わります。事前にJSONを外部保存してください。')!=='yes')return;
   if(!await beforeDestructive('reset'))return;
   state=freshState();candidate=null;paint();rebuildSettings();editRev++;await saveNow(true);
 }
 async function restoreCheckpoint(){
-  if(!ready||saveBlocked||busy)return;
+  if(!ready||saveBlocked||busy||bodyBackupBusy)return;
   try{
     const versions=await store.checkpoints();
     if(!versions.length){status('復元できる以前の保存点はありません。');return;}
@@ -545,7 +547,7 @@ function textModal(question,initial,{max=15000,multiline=true,options=[['save','
   });
 }
 async function applyStoryChange(transform,note,{destructive=false}={}){
-  if(!ready||busy||branchBusy||saveBlocked)return false;
+  if(!ready||busy||branchBusy||bodyBackupBusy||saveBlocked)return false;
   branchBusy=true;lockUI();
   const original=state,oldCandidate=candidate;
   try{
