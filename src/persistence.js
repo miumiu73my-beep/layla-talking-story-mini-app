@@ -50,7 +50,7 @@ function validate(raw,validator){
 export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,validator=cleanState}={}){
   let idb=null,fallback=null,sqlAvailable=false,sqlProblem='',rawEvidence=null,sqliteCorrupt=false;
   let sqlSnapshot=null,manifest=null,readOnly=false,recoveryRequired=false;
-  let preferred=null,mode='保存不可',seq=0,backupWarning='';
+  let preferred=null,mode='保存不可',seq=0,backupWarning='',nextSqlRetry=0,skipCleanupOnce=false;
   const sql=host?.db?.executeSql;
   const run=async(q,args=[])=>host.db.executeSql(q,args);
   try{idb=await idbFactory();fallback=await idb.get('latest');}
@@ -66,15 +66,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         manifest=JSON.parse(String(rawEvidence));
         if(manifest.version!==1||!Array.isArray(manifest.parts)||manifest.parts.length>1200)
           throw Error('ACTIVEマニフェストの形式が不正');
-        let raw='';
-        for(const key of manifest.parts){
-          const part=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]));
-          if(typeof part[0]?.v!=='string')throw Error('保存チャンク欠落: '+key);
-          raw+=part[0].v;
-        }
-        if(manifest.hash&&checksum(raw)!==manifest.hash)throw Error('チェックサムが不一致');
-        if(manifest.size!==undefined&&manifest.size!==raw.length)throw Error('保存文字数が不一致');
-        const loaded=JSON.parse(raw);
+        const loaded=await decodeGeneration(manifest);
+        const raw=JSON.stringify(loaded);
         sqlSnapshot={state:loaded,validated:validate(loaded,validator),raw,rev:Number(manifest.rev)||0};
         seq=Math.max(seq,sqlSnapshot.rev);
         if(sqlSnapshot.validated.error)throw Error('SQLite保存内容の検証失敗: '+sqlSnapshot.validated.error.message);
@@ -97,10 +90,14 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   const different=Boolean(idbValid?.value&&sqlSnapshot?.validated.value&&
     JSON.stringify(idbValid.value)!==JSON.stringify(sqlSnapshot.validated.value));
-  if(fallback?.pending&&idbValid?.value&&different&&sqlAvailable){
+  const safeFastForward=Boolean(fallback?.pending&&different&&sqlAvailable&&
+    Number.isSafeInteger(fallback.baseRev)&&fallback.baseRev===sqlSnapshot?.rev);
+  if(fallback?.pending&&idbValid?.value&&different&&sqlAvailable&&!safeFastForward){
     recoveryRequired=true;readOnly=true;
     preferred=idbValid.value; // Display but do NOT write until explicit choice.
     notify('SQLiteとIndexedDBの未同期編集が異なります。復旧元を選ぶまで保存を停止します。');
+  }else if(safeFastForward){
+    preferred=idbValid.value;
   }else if(sqlSnapshot?.validated.value){
     preferred=sqlSnapshot.validated.value;
   }else if(idbValid?.value){
@@ -113,52 +110,99 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   else if(sqlAvailable)mode='SQLite';
   else mode=idb?'IndexedDB（退避）':'保存不可';
 
-  async function readGeneration(m){
-    if(!m||!Array.isArray(m.parts))throw Error('保存世代の情報がありません。');
-    let raw='';
-    for(const key of m.parts){
-      const rows=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]));
-      if(typeof rows[0]?.v!=='string')throw Error('世代の保存チャンクがありません。');
-      raw+=rows[0].v;
+  async function readParts(parts,expectedHash,expectedSize){
+    if(!Array.isArray(parts)||parts.length>1500)throw Error('保存部品数が不正です。');
+    const chunks=[];
+    for(const key of parts){
+      const record=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]));
+      if(typeof record[0]?.v!=='string')throw Error('保存チャンク欠落: '+key);
+      chunks.push(record[0].v);
     }
-    if(m.hash&&checksum(raw)!==m.hash)throw Error('世代チェックサムエラー');
-    return validator(JSON.parse(raw));
+    const raw=chunks.join('');
+    if(expectedHash&&checksum(raw)!==expectedHash)throw Error('チェックサムが不一致');
+    if(expectedSize!==undefined&&raw.length!==expectedSize)throw Error('保存文字数が不一致');
+    return raw;
   }
-  async function writeSql(raw){
-    const chunks=splitChunks(raw);
-    if(chunks.length>1000)throw Error('SQLiteの容量上限（約4000万文字）を超えました。JSON保存を推奨します。');
+  async function decodeGeneration(m){
+    if(!m||!Array.isArray(m.parts))throw Error('保存世代の情報がありません。');
+    const root=JSON.parse(await readParts(m.parts,m.hash,m.size));
+    // Old v1 manifest contains ALL branches inside root; new v1 stores immutable
+    // archived branch blobs independently to avoid rewriting them on every edit.
+    if(Array.isArray(m.branchParts)){
+      const branches=[];
+      for(const b of m.branchParts){
+        const data=await readParts(b.parts,b.hash,b.size);
+        const branch=JSON.parse(data);
+        if(branch.id!==b.id)throw Error('分岐IDが一致しません。');
+        branches.push(branch);
+      }
+      root.branches=branches;
+    }
+    return root;
+  }
+  async function readGeneration(m){return validator(await decodeGeneration(m));}
+  async function writeSql(state){
     const generation='g'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
+    const rootState={...state,branches:[]},rootJson=JSON.stringify(rootState);
+    const chunks=splitChunks(rootJson);
+    if(chunks.length>1000)throw Error('SQLiteの容量上限（約4000万文字）を超えました。JSON保存を推奨します。');
     const keys=[];
     for(let i=0;i<chunks.length;i++){
-      const key=generation+'/'+i;keys.push(key);
+      const key=generation+'/root/'+i;keys.push(key);
       await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[key,chunks[i]]);
+    }
+    const previousBranches=new Map((manifest?.branchParts||[]).map(b=>[b.id,b]));
+    const branchParts=[];
+    for(const b of state.branches||[]){
+      const json=JSON.stringify(b),hash=checksum(json),old=previousBranches.get(b.id);
+      if(old&&old.hash===hash&&old.size===json.length){
+        branchParts.push(old);continue; // Immutable archived branch: no writes.
+      }
+      const parts=splitChunks(json),bkeys=[];
+      for(let i=0;i<parts.length;i++){
+        const key=generation+'/branch/'+b.id+'/'+i;bkeys.push(key);
+        await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[key,parts[i]]);
+      }
+      branchParts.push({id:b.id,parts:bkeys,hash,size:json.length});
     }
     const previous=manifest?{
       version:1,parts:manifest.parts,at:manifest.at,
       ...(manifest.hash?{hash:manifest.hash}:{}),
-      ...(manifest.size!==undefined?{size:manifest.size}:{}),rev:manifest.rev||0
+      ...(manifest.size!==undefined?{size:manifest.size}:{}),
+      ...(manifest.branchParts?{branchParts:manifest.branchParts}:{}),
+      rev:manifest.rev||0
     }:null;
-    const next={version:1,parts:keys,at:Date.now(),rev:++seq,hash:checksum(raw),size:raw.length,previous};
+    const next={version:1,parts:keys,branchParts,at:Date.now(),rev:++seq,
+      hash:checksum(rootJson),size:rootJson.length,previous};
     await run('INSERT OR REPLACE INTO '+TABLE+' (k,v) VALUES (?,?)',[ACTIVE,JSON.stringify(next)]);
     manifest=next;rawEvidence=null;
-    // Retain the previous snapshot and cleanup orphan chunks after commit.
+    // Retain active and previous immutable branches. GC only unreferenced
+    // generations; never remove checkpoint chunks.
     try{
-      const keep=new Set([ACTIVE,...keys,...(previous?.parts||[])]);
+      if(skipCleanupOnce){skipCleanupOnce=false;return;}
+      const retain=new Set([ACTIVE,...keys,...(previous?.parts||[])]);
+      for(const b of [...branchParts,...(previous?.branchParts||[])])for(const key of b.parts)retain.add(key);
       const all=sqlRows(await run('SELECT k FROM '+TABLE));
       for(const row of all){
         const key=row.k;
-        if(typeof key==='string'&&key.startsWith('g')&&!keep.has(key))
+        if(typeof key==='string'&&key.startsWith('g')&&!retain.has(key))
           await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
       }
-    }catch(e){notify('古い保存チャンクの整理を次回へ延期しました。');}
+    }catch(e){notify('保存世代の整理を次回へ延期しました: '+e.message,true);}
   }
   async function commit(raw){
     if(readOnly)throw Error('読み取り専用です。復旧元を確認するかJSONバックアップを利用してください。');
     const state=validator(JSON.parse(raw));
-    const saved={state,rev:seq+1,at:Date.now(),pending:true};
+    const saved={state,rev:seq+1,at:Date.now(),baseRev:manifest?.rev||0,pending:true};
+    if(!sqlAvailable&&!sqliteCorrupt&&typeof sql==='function'&&Date.now()>=nextSqlRetry){
+      try{
+        await run('SELECT v FROM '+TABLE+' WHERE k=?',[ACTIVE]);
+        sqlAvailable=true;
+      }catch(e){nextSqlRetry=Date.now()+20000;sqlProblem=String(e.message||e);}
+    }
     if(sqlAvailable){
       try{
-        await writeSql(raw);
+        await writeSql(state);
         mode='SQLite';
         let mirrorFailed=false;
         if(idb)await idb.put('latest',{...saved,rev:seq,pending:false}).catch(()=>{mirrorFailed=true;});
@@ -168,8 +212,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       }catch(e){
         const message=String(e.message||e);
         if(message.includes('容量上限')){notify(message);throw e;}
-        sqlAvailable=false;sqlProblem=message;
-        notify('SQLite書込失敗（IndexedDBへ退避）: '+message);
+        sqlAvailable=false;sqlProblem=message;nextSqlRetry=Date.now()+20000;
+        notify('SQLite書込失敗（IndexedDBへ退避）: '+message,true);
       }
     }
     if(idb){
@@ -307,10 +351,23 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       throw e;
     }
   }
-  function allowImportRecovery(){
+  async function allowImportRecovery(){
     if(recoveryRequired)throw Error('まずSQLite/IndexedDBの復旧元を選択してください。');
-    // Only for explicit user-confirmed external JSON recovery.
     if(!sqlAvailable&&!idb)throw Error('保存先がありません。JSONは閲覧できますが端末へ保存できません。');
+    // User-confirmed recovery: preserve the corrupt ACTIVE manifest under a new
+    // key before replacing it. Do not GC unknown orphan chunks on this write.
+    if(sqliteCorrupt&&typeof sql==='function'){
+      try{
+        const recoveredManifest=rawEvidence||JSON.stringify(manifest||{});
+        await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[
+          'corrupt-backup/'+Date.now(),recoveredManifest
+        ]);
+        manifest=null;sqlAvailable=true;skipCleanupOnce=true;
+        sqliteCorrupt=false;sqlProblem='';
+      }catch(e){
+        notify('SQLite復旧準備に失敗しました。IndexedDBへ退避します: '+e.message,true);
+      }
+    }
     readOnly=false;
     if(!sqlAvailable&&idb)mode='IndexedDB（退避）';
     return true;
@@ -320,7 +377,19 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       activeManifest:manifest,notice:'巨大なSQLite全行を読み込むとアプリが停止するため、生ダンプはマニフェストと障害情報のみを含みます。'};
     return JSON.stringify(evidence);
   }
-  const hasStorage=Boolean(sqlAvailable||idb);
+  if(safeFastForward&&idbValid?.value){
+    try{
+      // No concurrent SQLite edits: advance the pending IDB changes safely.
+      await checkpoint(sqlSnapshot.validated.value,'IndexedDB自動復旧前のSQLite');
+      await save(idbValid.value);
+      if(mode!=='SQLite')throw Error('SQLiteへ同期できませんでした。');
+      preferred=idbValid.value;
+      notify('未同期IndexedDBデータをSQLiteへ安全に反映しました。');
+    }catch(e){
+      recoveryRequired=true;readOnly=true;
+      notify('自動同期に失敗しました。保存元を手動で選択してください: '+e.message,true);
+    }
+  }
   return {
     initial:preferred,sqlInitial:sqlSnapshot?.validated.value||null,
     get readOnly(){return readOnly;},corrupt:sqliteCorrupt,
