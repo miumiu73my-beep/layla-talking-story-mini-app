@@ -258,14 +258,52 @@ export function readableText(state,format){
   if(format==='md')return '<!-- TALKING_STORY_MD_V2 -->\n# '+title+'\n\n'+d.body;
   throw Error('未対応の形式です。');
 }
+
+// Optional smaller JSON backup: keep v1 full backup available, while the v2
+// variant shares long common body prefixes across archived branches.
+// The normal app state and SQLite layout remain the original v1 schema.
+export function compactBackup(state){
+  const d=cleanState(state);
+  const bodies=[d.body,...d.branches.map(b=>b.body)];
+  const base=bodies.reduce((a,b)=>b.length>a.length?b:a,'');
+  const pack=body=>{
+    let common=0;
+    while(common<body.length&&common<base.length&&body.charCodeAt(common)===base.charCodeAt(common))common++;
+    if(common>0&&common<body.length&&common<base.length){
+      const code=body.charCodeAt(common);
+      if(code>=0xdc00&&code<=0xdfff)common--;
+    }
+    return {prefix:common,suffix:body.slice(common)};
+  };
+  const payload={...d,body:pack(d.body),
+    branches:d.branches.map(b=>({...b,body:pack(b.body)}))};
+  return JSON.stringify({schema:FORMAT,version:2,kind:'shared-prefix',baseBody:base,payload});
+}
+export function expandCompactBackup(value){
+  if(value?.schema!==FORMAT||value?.version!==2||value.kind!=='shared-prefix'||
+    typeof value.baseBody!=='string'||!value.payload||typeof value.payload!=='object')
+    throw Error('軽量JSONバックアップの形式が正しくありません。');
+  const unpack=entry=>{
+    if(!entry||!Number.isSafeInteger(entry.prefix)||entry.prefix<0||
+       entry.prefix>value.baseBody.length||typeof entry.suffix!=='string')
+      throw Error('共有本文の参照位置が不正です。');
+    return value.baseBody.slice(0,entry.prefix)+entry.suffix;
+  };
+  const raw=value.payload;
+  if(!Array.isArray(raw.branches)||raw.branches.length>30)
+    throw Error('軽量JSONの分岐数が不正です。');
+  return cleanState({...raw,body:unpack(raw.body),
+    branches:raw.branches.map(b=>({...b,body:unpack(b.body)}))});
+}
+
 export function parseImport(filename,content,current){
   const src=String(content||'');
   if(new TextEncoder().encode(src).length>TRANSFER_MAX_BYTES)throw Error('ファイル容量が50MBを超えています。');
   const ext=String(filename||'').split('.').pop().toLowerCase();
   if(ext==='json'){
     let raw;try{raw=JSON.parse(src.replace(/^\uFEFF/,''));}catch{throw Error('JSONを解析できません。');}
-    if(raw?.schema!==FORMAT||raw?.version!==VERSION)throw Error('対応しているv1バックアップではありません。');
-    return {state:cleanState(raw),full:true};
+    if(raw?.schema!==FORMAT||![1,2].includes(raw?.version))throw Error('対応しているv1/v2バックアップではありません。');
+    return {state:raw.version===2?expandCompactBackup(raw):cleanState(raw),full:true};
   }
   if(!['txt','md'].includes(ext))throw Error('JSON、TXT、MDのみ読み込めます。');
   const d=cleanState(current);

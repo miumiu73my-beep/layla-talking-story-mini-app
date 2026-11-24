@@ -145,7 +145,7 @@ export function deleteInactiveBranch(state,id){
 // Only resync when the change is confined to one reply or to material outside
 // replies; multi-turn replacements must go through explicit history reset.
 export function reconcileBodyEdit(state,nextBody){
-  const d=cleanState(state),newBody=String(nextBody);
+  const d=cleanState({...state,branches:[]}),newBody=String(nextBody);
   const positions=timeline(d),oldBody=d.body;
   let left=0,right=0;
   while(left<oldBody.length&&left<newBody.length&&oldBody[left]===newBody[left])left++;
@@ -178,6 +178,7 @@ export function reconcileBodyEdit(state,nextBody){
   });
   d.undo=null;
   timeline(d);
+  d.branches=state.branches||[];
   return d;
 }
 export function clearHistoryAgainstBody(state){

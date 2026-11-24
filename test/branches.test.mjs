@@ -138,3 +138,26 @@ test('old v1 backups have deterministic branch metadata for recovery comparison'
   assert.deepEqual(first,second);
   assert.equal(first.activeBranch.createdAt,'legacy-v1');
 });
+
+test('direct edit inside earlier reply updates all following offsets safely',async()=>{
+  const {reconcileBodyEdit}=await import('../src/branches.js');
+  const s=story(),old=timeline(s);
+  const replaced=s.body.replace('一歌が笑った。','一歌は嬉しそうに笑った。');
+  const next=reconcileBodyEdit(s,replaced);
+  const positions=timeline(next);
+  assert.equal(positions.length,3);
+  assert.equal(positions[0].reply,'一歌は嬉しそうに笑った。');
+  assert.equal(positions[2].reply,old[2].reply);
+  assert.ok(positions[2].start>old[2].start);
+  assert.equal(next.branches.length,s.branches.length);
+});
+test('switching story forks keeps sampler preferences global',()=>{
+  const s=story();
+  const fork=rewindBefore(s,2);
+  fork.prefs.contextTokens=32768;fork.prefs.temperature='0.5';
+  const back=switchBranch(fork,'main');
+  assert.equal(back.prefs.contextTokens,32768);
+  assert.equal(back.prefs.temperature,'0.5');
+  const inherited=switchBranch(fork,'main',{inheritLore:true});
+  assert.equal(inherited.memory,fork.memory);
+});

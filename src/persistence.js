@@ -343,7 +343,10 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       const other=which==='idb'?sqlSnapshot?.validated.value:idbValid?.value;
       if(other)await checkpoint(other,'選ばなかった復旧元');
       await checkpoint(selected,'復旧前に選択した保存元');
+      nextSqlRetry=0; // An explicit user recovery always retries SQLite immediately.
       await save(selected);
+      if(sqlSnapshot?.validated.value&&mode!=='SQLite')
+        throw Error('SQLiteへの復旧書き込みが完了していません。再試行できます。');
       recoveryRequired=false;
       return selected;
     }catch(e){

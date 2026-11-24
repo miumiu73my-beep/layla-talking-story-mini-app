@@ -124,3 +124,75 @@ test('temporary SQLite API failure is not mistaken for corrupted data',async()=>
   const reopened=await openStore(unavailable,()=>{},{idbFactory:fallback.factory});
   assert.equal(reopened.initial.body,s.body);
 });
+
+test('checkpoints use small SQL rows and restore complete long manuscripts',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),store=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  const s=freshState();s.body='長'.repeat(150000);
+  await store.save(s);await store.checkpoint(s,'本文大幅削除前');
+  const keys=[...sql.map.keys()].filter(k=>k.startsWith('checkpoint/')&&k.includes('/part/'));
+  assert.ok(keys.length>=4);
+  assert.ok(keys.every(k=>sql.map.get(k).length<=40000));
+  const versions=await store.checkpoints();
+  assert.equal(versions.find(v=>v.reason==='本文大幅削除前').data,JSON.stringify(s));
+});
+test('unchanged archived branches are not rewritten on each active edit',async()=>{
+  const {rewindAfter}=await import('../src/branches.js');
+  const sql=fakeSql(),idb=fakeIdb(),store=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  let s=freshState();s.body='A'.repeat(100000);
+  s.turns=[{user:'hello',reply:s.body,bodyStart:0,bodyEnd:s.body.length}];
+  s=rewindAfter(s,0); // Archives full original.
+  await store.save(s);
+  const count=()=>[...sql.map.keys()].filter(k=>k.includes('/branch/')).length;
+  const before=count();assert.ok(before>0);
+  await store.save({...s,draft:'編集された下書き'});
+  assert.equal(count(),before);
+  const reopened=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  assert.equal(reopened.initial.branches[0].body.length,100000);
+});
+test('pending IDB with same SQLite base revision fast-forwards safely',async()=>{
+  const sql=fakeSql(),s=freshState();s.body='旧版';
+  seed(sql,s,{rev:3});
+  const newer={...s,body:'保存失敗中に書いた新版'};
+  const idb=fakeIdb({latest:{state:newer,rev:4,baseRev:3,pending:true,at:10}});
+  const st=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  assert.equal(st.recoveryRequired,false);
+  assert.equal(st.mode(),'SQLite');
+  assert.equal(st.initial.body,newer.body);
+  const again=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  assert.equal(again.initial.body,newer.body);
+});
+test('a failed recovery checkpoint preserves retryable recovery selection',async()=>{
+  const sql=fakeSql(),s=freshState();s.body='SQL';seed(sql,s,{rev:2});
+  const newer={...s,body:'IDB'};
+  let fail=true;
+  const data=new Map([['latest',{state:newer,rev:3,pending:true,at:10}]]);
+  const idbFactory=async()=>({
+    get:async key=>data.get(key)||null,
+    put:async(key,val)=>{if(fail)throw Error('No room for checkpoint');data.set(key,val);}
+  });
+  const st=await openStore({db:sql},()=>{},{idbFactory});
+  sql.setFailWrite(true);
+  await assert.rejects(st.chooseRecovery('idb'));
+  assert.equal(st.recoveryRequired,true);
+  fail=false;sql.setFailWrite(false);
+  const recovered=await st.chooseRecovery('idb');
+  assert.equal(recovered.body,'IDB');
+  assert.equal(st.recoveryRequired,false);
+});
+test('flush waits for in-flight save completion',async()=>{
+  const sql=fakeSql(),original=sql.executeSql.bind(sql);
+  sql.executeSql=async(...args)=>{await new Promise(r=>setTimeout(r,2));return original(...args);};
+  const store=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  const s=freshState();s.body='待機';
+  const pending=store.save(s);
+  await store.flush();await pending;
+  const read=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  assert.equal(read.initial.body,'待機');
+});
+test('legacy single-row checkpoints remain readable after migration',async()=>{
+  const sql=fakeSql(),store=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  const s=freshState();s.body='古い復元';
+  sql.map.set('checkpoint/legacy',{...s} && JSON.stringify({at:1234,title:s.title,chars:s.body.length,data:JSON.stringify(s)}));
+  const all=await store.checkpoints();
+  assert.ok(all.some(x=>x.data===JSON.stringify(s)));
+});

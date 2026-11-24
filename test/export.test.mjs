@@ -23,3 +23,9 @@ test('native export failure exposes a copyable text fallback',async()=>{
   assert.equal(response.kind,'manual');
   assert.equal(response.text,'大切な本文');
 });
+
+test('native saveFile exception exposes copyable fallback',async()=>{
+  const host={utils:{saveFile:async()=>{throw Error('Native bridge is absent');}}};
+  const result=await writeFile(host,'backup.json','{"safe":true}','application/json');
+  assert.equal(result.kind,'manual');assert.equal(result.text,'{"safe":true}');
+});

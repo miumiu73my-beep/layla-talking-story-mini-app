@@ -1,5 +1,5 @@
 import {makeRuntime} from './runtime.js';
-import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,acceptTurn,bodyFingerprint} from './logic.js';
+import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,undoTurn,bodyFingerprint} from './logic.js';
 import {openStore} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,rewindBefore,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,MAX_ARCHIVED_BRANCHES} from './branches.js';
 import {writeFile,filename,browserDownload} from './export.js';
@@ -44,7 +44,7 @@ function lockUI(){
     button.disabled=disabled||button.dataset.invalidAction==='1';
   for(const id of ['turn-go','turn-start'])if(el(id))el(id).disabled=disabled||!state.turns.length;
   for(const id of ['turn-older','turn-newer'])if(el(id))el(id).disabled=disabled||el(id).dataset.pageDisabled==='1';
-  for(const id of ['export-json','export-txt','export-md','quick-backup'])
+  for(const id of ['export-json','export-light-json','export-txt','export-md','quick-backup'])
     if(el(id))el(id).disabled=!ready; // Export is allowed even in read-only recovery.
 }
 function persist(delay=600){
@@ -303,12 +303,15 @@ function updatePromptMeta(){
 function modal(question,choices=[['yes','続行'],['no','キャンセル']]){
   return new Promise(resolve=>{
     const overlay=el('modal'),body=el('modal-content'),buttons=el('modal-buttons');
+    overlay.querySelector('.modal-editor')?.remove();overlay.querySelector('.modal-validation')?.remove();
     body.textContent=question;buttons.replaceChildren();overlay.hidden=false;
     function close(value){overlay.hidden=true;resolve(value);}
+    overlay.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();close('no');}};
     for(const [val,label] of choices){
       const b=node('button',val==='yes'?'primary':'ghost',label);
       b.onclick=()=>close(val);buttons.append(b);
     }
+    buttons.querySelector('button')?.focus();
   });
 }
 async function useCandidate(){
@@ -401,11 +404,12 @@ function stopGeneration(){
 async function exportAs(ext){
   if(!ready)return;
   try{
-    const content=ext==='json'?JSON.stringify(state):readableText(state,ext);
-    if(ext==='json'&&new TextEncoder().encode(content).length>TRANSFER_MAX_BYTES)
-      status('このJSONは50MBを超えています。通常の読み込みは不可です。分岐を整理してください。',true);
-    const name=filename(state.title,ext);
-    const mime=ext==='json'?'application/json':ext==='md'?'text/markdown':'text/plain';
+    const light=ext==='compact-json';
+    const content=light?compactBackup(state):ext==='json'?JSON.stringify(state):readableText(state,ext);
+    if((ext==='json'||light)&&new TextEncoder().encode(content).length>TRANSFER_MAX_BYTES)
+      status('このJSONは50MBを超えています。分岐を整理してから外部保存してください。',true);
+    const name=filename(state.title+(light?'_軽量分岐':''),light?'json':ext);
+    const mime=(ext==='json'||light)?'application/json':ext==='md'?'text/markdown':'text/plain';
     const result=await writeFile(host,name,content,mime);
     status(result.message,result.kind==='manual');
     if(result.kind==='manual'){
@@ -438,7 +442,7 @@ async function handleImport(file){
     if(saveBlocked){
       if(store?.recoveryRequired)throw Error('先に復旧元を選択してください。');
       if(await modal('現在の保存先は読み取り専用です。既存の異常データが残る場合があります。外部バックアップを確認した上で復旧を許可しますか？')!=='yes')return;
-      store.allowImportRecovery();saveBlocked=false;
+      await store.allowImportRecovery();saveBlocked=false;
     }else if(!await beforeDestructive('import'))return;
     state=parsed.state;state.updatedAt=new Date().toISOString();
     candidate=state.pendingCandidate;fullBody=false;paint();rebuildSettings();
@@ -526,14 +530,18 @@ function textModal(question,initial,{max=15000,multiline=true,options=[['save','
       const button=node('button',value==='save'||value==='generate'?'primary':'ghost',label);
       button.onclick=()=>{
         if(value!=='cancel'&&!editor.value.trim()){
-          status('入力内容が空です。',true);editor.focus();return;
+          let warning=overlay.querySelector('.modal-validation');
+          if(!warning){warning=node('p','modal-validation safety error');editor.after(warning);}
+          warning.textContent='入力内容が空です。';editor.focus();return;
         }
         overlay.hidden=true;editor.remove();
         resolve(value==='cancel'?null:{action:value,text:editor.value});
       };
       buttons.append(button);
     }
-    overlay.hidden=false;editor.focus();
+    overlay.hidden=false;
+    overlay.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();overlay.hidden=true;editor.remove();resolve(null);}};
+    editor.focus();
   });
 }
 async function applyStoryChange(transform,note,{destructive=false}={}){
@@ -597,6 +605,15 @@ async function actOnTurn(index,action){
     }
     return;
   }
+  if(action==='undo'&&state.branches.length>=MAX_ARCHIVED_BRANCHES){
+    if(await modal('分岐が上限30件です。元の展開を復元点へ退避して直前ターンを取り消します。復元点は古いものから順に整理される場合があります。')!=='yes')return;
+    if(!await beforeDestructive('分岐上限でのUndo'))return;
+    try{
+      state=undoTurn(state);candidate=null;editRev++;paint();
+      if(await saveNow(true))status('直前のターンを取り消しました。分岐ではなく復元点に退避しました。');
+    }catch(e){status('取り消せません: '+String(e.message||e),true);}
+    return;
+  }
   if(action==='rewind'||action==='undo'||action==='restart'){
     const label=action==='restart'?'第1ターンの前':'第'+(index+1)+'ターン'+(action==='rewind'?'終了時':'開始前');
     if(await modal(label+'に戻りますか？\n以降の展開は削除せず、元の分岐として保存します。')!=='yes')return;
@@ -636,7 +653,7 @@ function setup(){
     '<div id="screen-settings" hidden><section class="panel"><h2>作品設定</h2><p class="hint">日本語の文章と [海:名称≡&lt;虎田海&gt;] 形式は混在できます。</p><div id="settings-fields"></div></section>'+
     '<section class="panel"><h2>生成設定</h2><div id="preference-fields"></div><p class="hint" id="prompt-meta"></p></section>'+
     '<section class="panel"><h2>確定本文の編集</h2><p class="hint">ここが正本です。長編の場合は編集前にJSONをバックアップしてください。</p><p id="edit-count" class="hint"></p><p id="edit-warning" class="safety" hidden>本文を大きく削除しました。誤操作であれば、直ちに「直前の状態を復元」を利用してください。</p><textarea id="edit-body" class="long" rows="12"></textarea></section>'+
-    '<section class="panel"><h2>バックアップ・復元</h2><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-backup">保存生データの救出</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
+    '<section class="panel"><h2>バックアップ・復元</h2><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-backup">保存生データの救出</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
     '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p class="hint">コピーするか、通常ブラウザではダウンロードを選択してください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="copy-manual">テキストをコピー</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
     '</main><nav class="nav"><button class="primary" id="nav-main">本文へ戻る</button><button id="nav-settings">設定</button><button id="quick-backup">JSON保存</button></nav>'+
     '<div id="modal" class="overlay" hidden role="dialog" aria-modal="true"><div class="modal-card"><p id="modal-content"></p><div id="modal-buttons" class="actions"></div></div></div>';
@@ -664,6 +681,7 @@ function setup(){
   el('view-full').onclick=()=>{fullBody=!fullBody;paint();};
   el('jump-bottom').onclick=()=>el('prompt-section').scrollIntoView({block:'start'});
   el('export-json').onclick=()=>void exportAs('json');
+  el('export-light-json').onclick=()=>void exportAs('compact-json');
   el('export-txt').onclick=()=>void exportAs('txt');
   el('export-md').onclick=()=>void exportAs('md');
   el('import').onclick=()=>el('file-picker').click();
@@ -714,7 +732,7 @@ async function init(){
     }
     ready=true;saveBlocked=store.readOnly||!store.hasStorage;
     if(store.recoveryRequired){
-      saveError='SQLiteとIndexedDBの編集が衝突しています。復旧元の選択が必要です。';
+      saveError='SQLiteとIndexedDBの編集が衝突しています。上部の「復旧元を選択」から保存元を選んでください。';
       status(saveError,true);
       paint();el('recover').disabled=false;el('nav-settings').disabled=false;
     }else{
