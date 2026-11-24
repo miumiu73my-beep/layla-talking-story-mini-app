@@ -2,7 +2,7 @@ import {makeRuntime} from './runtime.js';
 import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,acceptTurn,bodyFingerprint} from './logic.js';
 import {openStore} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,rewindBefore,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,MAX_ARCHIVED_BRANCHES} from './branches.js';
-import {writeFile,filename} from './export.js';
+import {writeFile,filename,browserDownload} from './export.js';
 import './style.css';
 
 const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getElementById(id);
@@ -101,9 +101,11 @@ function showHistory(){
   let positions=null,problem='';
   try{positions=timeline(state);}catch(e){problem=String(e.message||e);}
   if(problem){
-    const warning=node('p','safety error','本文と履歴の位置が一致しないため、過去のメッセージ操作を停止しています。旧データは削除されません。 '+problem);
+    const warning=node('p','safety error','本文と履歴の位置が一致しないため、過去のメッセージ操作を停止しています。上の「履歴だけ再設定」を選べます。 '+problem);
     root.append(warning);
   }
+  if(positions?.length&&positions[positions.length-1].end<state.body.length)
+    root.append(node('p','hint','最終ターンの後に、本文へ直接追記されたテキストがあります。'));
   for(let i=end-1;i>=start;i--){
     const t=state.turns[i],p=positions?.[i],box=node('details','turn-history');
     const label=node('summary','turn-summary','第'+(i+1)+'ターン　'+t.user.slice(0,42).replace(/\n/g,' ') +(t.user.length>42?'…':''));
@@ -408,7 +410,9 @@ async function exportAs(ext){
     status(result.message,result.kind==='manual');
     if(result.kind==='manual'){
       el('manual-export').hidden=false;el('manual-name').textContent=name;
-      el('manual-text').value=result.text;el('manual-export').scrollIntoView({block:'nearest'});
+      el('manual-text').value=result.text;el('download-manual').dataset.name=name;
+      el('download-manual').dataset.mime=mime;
+      el('manual-export').scrollIntoView({block:'nearest'});
     }
     if(editRev!==savedRev)void saveNow(); // Never overwrite an identical saved generation.
   }catch(e){status('書き出しに失敗しました: '+String(e.message||e),true);}
@@ -498,8 +502,11 @@ async function exportRaw(){
     status(result.message,result.kind==='manual');
     if(result.kind==='manual'){
       el('manual-export').hidden=false;
-      el('manual-name').textContent='生データ救出_'+new Date().toLocaleString('ja-JP')+'.json';
+      const name=filename('talking-story-raw-recovery','json');
+      el('manual-name').textContent=name;
       el('manual-text').value=result.text;
+      el('download-manual').dataset.name=name;
+      el('download-manual').dataset.mime='application/json';
       el('manual-export').scrollIntoView({block:'nearest'});
     }
   }catch(e){status('生データを書き出せません: '+String(e.message||e),true);}
@@ -605,8 +612,10 @@ async function branchAction(action,id){
   const found=id===state.activeBranch?.id?state.activeBranch:state.branches.find(b=>b.id===id);
   if(!found){status('分岐が見つかりません。',true);return;}
   if(action==='switch'){
-    if(await modal('「'+found.name+'」に切り替えますか？\n現在の本文・設定・下書きも現在の分岐に保存します。')!=='yes')return;
-    if(await applyStoryChange(s=>switchBranch(s,id),'分岐を切り替えました'))showMain();
+    const selection=await modal('「'+found.name+'」に切り替えます。人物設定・世界観・自由記憶・ユーザー設定はどうしますか？\n生成パラメータは常に現在の値を引き継ぎます。',
+      [['branch','切替先分岐の設定を使用'],['inherit','現在の設定を引き継ぐ'],['cancel','キャンセル']]);
+    if(selection==='cancel')return;
+    if(await applyStoryChange(s=>switchBranch(s,id,{inheritLore:selection==='inherit'}),'分岐を切り替えました'))showMain();
   }else if(action==='rename'){
     const result=await textModal('分岐の名前を編集します。',found.name,{max:90,multiline:false});
     if(result)await applyStoryChange(s=>renameBranch(s,id,result.text),'分岐名を変更しました');
@@ -619,16 +628,16 @@ async function branchAction(action,id){
 function setup(){
   app.innerHTML=
     '<header><div class="bar"><img class="logo" src="./icon.jpg" alt="緑の時計"><div class="titles"><div class="subtitle">LAYLA MINI-APP · LOCAL STORY</div><div class="brand" id="title-view">新しい物語</div></div><span class="badge">物語</span></div>'+
-    '<div id="status" class="status" role="status" aria-live="polite">データ読み込み中…</div><div id="safety" class="safety error" role="alert">初期化中</div></header>'+
+    '<div id="status" class="status" role="status" aria-live="polite">データ読み込み中…</div><button id="recover-now" hidden class="small warn">復旧元を選択</button></header><div id="safety" class="safety error" role="alert">初期化中</div>'+
     '<main><div id="screen-main">'+
     '<section class="panel"><div class="split" style="justify-content:space-between"><h2>確定した物語</h2><span class="mini" id="counter"></span></div><p id="meta" class="hint"></p><div class="story" id="body-view"></div><div class="actions"><button id="view-full">全文を表示</button><button id="jump-bottom">入力欄へ移動</button><button id="undo">直前のターンを分岐して取り消す</button></div></section>'+
     '<section class="panel" id="prompt-section"><h2>あなたの台詞・行動</h2><p class="hint">本人が話す台詞・取る行動、次の場面の希望を記入してください。</p><textarea id="user-input" rows="5" maxlength="15000" placeholder="例：『おはよう』と笑って、隣に座る。"></textarea><div class="actions"><button id="generate" class="primary">続きを生成</button><button id="stop" class="warn" disabled>生成停止</button></div><div id="candidate-box" hidden><label for="candidate-edit">未採用の候補（編集可能）</label><textarea id="candidate-edit" rows="9"></textarea><p id="candidate-status" class="hint"></p><div class="actions"><button id="accept" class="primary">この文章を採用</button><button id="retry">もう一度生成</button><button id="discard" class="warn">破棄</button></div></div></section>'+
-    '<section class="panel" id="history-section"><details><summary>会話履歴を編集・再生成・巻き戻す</summary><p class="hint">過去の入力や返信を編集すると、元の展開を別分岐に保存します。本文を直接編集して履歴との位置がずれた場合は操作を停止します。</p><div class="history-toolbar"><button id="turn-older" class="small ghost">前の30件</button><span id="turn-range" class="hint"></span><button id="turn-newer" class="small ghost">次の30件</button></div><div class="history-toolbar"><label for="turn-number">ターン番号</label><input id="turn-number" type="number" inputmode="numeric" min="1" placeholder="番号"><button id="turn-go" class="small ghost">移動</button><button id="turn-start" class="small warn">第1ターンの前に戻す</button></div><div id="turn-log" class="history-log"></div></details></section><section class="panel" id="branches-section"><h2>ストーリー分岐</h2><p class="hint">元の展開はここからいつでも開けます。分岐ごとの本文・設定・記憶・下書きを保存します。</p><strong id="branch-current"></strong><p id="branch-count" class="hint"></p><div id="branch-list"></div></section></div>'+
+    '<section class="panel" id="history-section"><details><summary>会話履歴を編集・再生成・巻き戻す</summary><p class="hint">本文の軽い手直しでは履歴位置を自動補正します。複数ターンを一度に書き換えた場合は、復元点作成後に履歴をリセットできます。</p><button id="reset-history" class="small warn">本文を保持して履歴だけ再設定</button><div class="history-toolbar"><button id="turn-older" class="small ghost">前の30件</button><span id="turn-range" class="hint"></span><button id="turn-newer" class="small ghost">次の30件</button></div><div class="history-toolbar"><label for="turn-number">ターン番号</label><input id="turn-number" type="number" inputmode="numeric" min="1" placeholder="番号"><button id="turn-go" class="small ghost">移動</button><button id="turn-start" class="small warn">第1ターンの前に戻す</button></div><div id="turn-log" class="history-log"></div></details></section><section class="panel" id="branches-section"><h2>ストーリー分岐</h2><p class="hint">元の展開はここからいつでも開けます。分岐ごとの本文・設定・記憶・下書きを保存します。</p><strong id="branch-current"></strong><p id="branch-count" class="hint"></p><div id="branch-list"></div></section></div>'+
     '<div id="screen-settings" hidden><section class="panel"><h2>作品設定</h2><p class="hint">日本語の文章と [海:名称≡&lt;虎田海&gt;] 形式は混在できます。</p><div id="settings-fields"></div></section>'+
     '<section class="panel"><h2>生成設定</h2><div id="preference-fields"></div><p class="hint" id="prompt-meta"></p></section>'+
     '<section class="panel"><h2>確定本文の編集</h2><p class="hint">ここが正本です。長編の場合は編集前にJSONをバックアップしてください。</p><p id="edit-count" class="hint"></p><p id="edit-warning" class="safety" hidden>本文を大きく削除しました。誤操作であれば、直ちに「直前の状態を復元」を利用してください。</p><textarea id="edit-body" class="long" rows="12"></textarea></section>'+
     '<section class="panel"><h2>バックアップ・復元</h2><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-backup">保存生データの救出</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
-    '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p class="hint">下のテキストをすべてコピーして、iOS「ファイル」へ保存してください。</p><textarea id="manual-text" rows="6" readonly></textarea><button id="copy-manual">テキストをコピー</button></section>'+
+    '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p class="hint">コピーするか、通常ブラウザではダウンロードを選択してください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="copy-manual">テキストをコピー</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
     '</main><nav class="nav"><button class="primary" id="nav-main">本文へ戻る</button><button id="nav-settings">設定</button><button id="quick-backup">JSON保存</button></nav>'+
     '<div id="modal" class="overlay" hidden role="dialog" aria-modal="true"><div class="modal-card"><p id="modal-content"></p><div id="modal-buttons" class="actions"></div></div></div>';
   el('nav-main').onclick=showMain;el('nav-settings').onclick=showSettings;
@@ -662,7 +671,23 @@ function setup(){
   el('new-story').onclick=()=>void resetStory();
   el('restore').onclick=()=>void restoreCheckpoint();
   el('recover').onclick=()=>void recoverChoice();
+  el('recover-now').onclick=()=>void recoverChoice();
+  el('reset-history').onclick=async()=>{
+    if(!state.turns.length)return;
+    if(await modal('現在の本文は保持し、送信履歴だけ削除します。元の履歴は復元点に保存します。続行しますか？')!=='yes')return;
+    if(!await beforeDestructive('履歴をリセットする前'))return;
+    state=clearHistoryAgainstBody(state);editRev++;paint();rebuildSettings();
+    if(!await saveNow(true))status('履歴を保存できませんでした。外部JSONに退避してください。',true);
+  };
   el('raw-backup').onclick=()=>void exportRaw();
+  el('close-manual').onclick=()=>{el('manual-text').value='';el('manual-export').hidden=true;};
+  el('download-manual').onclick=()=>{
+    const name=el('download-manual').dataset.name||'story.txt';
+    const mime=el('download-manual').dataset.mime||'text/plain';
+    const blob=new Blob([el('manual-text').value],{type:mime+';charset=utf-8'});
+    if(browserDownload(name,blob))status('ブラウザにダウンロードを指示しました。実際の保存を確認してください。');
+    else status('この環境ではダウンロードできません。コピーで救出してください。',true);
+  };
   el('copy-manual').onclick=async()=>{
     const area=el('manual-text');area.focus();area.select();
     try{await navigator.clipboard.writeText(area.value);status('コピーしました。ファイルに保存してください。');}

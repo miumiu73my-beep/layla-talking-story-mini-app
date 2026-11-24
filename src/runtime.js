@@ -1,6 +1,7 @@
 // Single boundary for Layla-specific SDK calls. Can be swapped for a future LLM host.
 import {LaylaSDK} from '@layla-network/sdk';
-export function makeRuntime({sdk=new LaylaSDK()}={}){
+export function makeRuntime({sdk}={}){
+  if(sdk===undefined){try{sdk=new LaylaSDK();}catch{sdk=null;}}
   return {
     sdk,
     db:sdk.db,
