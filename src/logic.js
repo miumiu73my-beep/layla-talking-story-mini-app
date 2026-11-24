@@ -19,7 +19,7 @@ export const FIELDS=[
   ['modelNote','利用モデルのメモ（表示用）','text','モデル選択はLayla本体で行います。']
 ];
 const own=(obj,key)=>Object.prototype.hasOwnProperty.call(obj,key);
-function checksum(src){let h=2166136261;for(let i=0;i<src.length;i++)h=Math.imul((h^src.charCodeAt(i)),16777619);return(h>>>0).toString(16);}
+export function checksum(src){let h=2166136261;for(let i=0;i<src.length;i++)h=Math.imul((h^src.charCodeAt(i)),16777619);return(h>>>0).toString(16);}
 export function bodyFingerprint(value){const s=String(value||'');return s.length+':'+checksum(s);}
 const bound=(x,lo,hi,defaultValue)=>Number.isFinite(+x)&&x!==''?Math.max(lo,Math.min(hi,+x)):defaultValue;
 export function freshState(){

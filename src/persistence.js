@@ -2,7 +2,7 @@
 // Compatible with the legacy talking_story_data_v1 ACTIVE {version:1,parts,at} format.
 // Immutable chunks -> single manifest switch; retain the previous generation.
 // Never auto-overwrite healthy SQLite with unvalidated/different pending IDB data.
-import {cleanState} from './logic.js';
+import {cleanState,checksum} from './logic.js';
 
 const TABLE='talking_story_data_v1',ACTIVE='active',DBNAME='talking-story-fallback-v1';
 export function splitChunks(src,limit=40000){
@@ -16,11 +16,7 @@ export function splitChunks(src,limit=40000){
   }
   return chunks.length?chunks:[''];
 }
-export function checksum(src){
-  let h=2166136261;
-  for(let i=0;i<src.length;i++)h=Math.imul((h^src.charCodeAt(i)),16777619);
-  return (h>>>0).toString(16);
-}
+export {checksum} from './logic.js';
 export function sqlRows(result){
   const rows=result?.rows;
   if(rows===undefined||rows===null)
