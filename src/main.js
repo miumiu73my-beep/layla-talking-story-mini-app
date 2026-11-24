@@ -1,14 +1,15 @@
 import {makeRuntime} from './runtime.js';
-import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,undoTurn,bodyFingerprint} from './logic.js';
+import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint} from './logic.js';
 import {openStore} from './persistence.js';
-import {timeline,timelineAt,forkAt,rewindAfter,rewindBefore,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,MAX_ARCHIVED_BRANCHES} from './branches.js';
+import {timeline,timelineAt,forkAt,rewindAfter,rewindBefore,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES} from './branches.js';
 import {writeFile,filename,browserDownload} from './export.js';
 import './style.css';
 
 const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getElementById(id);
 const node=(tag,cls,value)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=value;return e;};
 let state=freshState(),store=null,ready=false,saveBlocked=true,busy=false,stream=null,activeId=0;
-let candidate=null,saveTimer=null,fullBody=false,saveError='',notice='',lastAcceptedMessage='';
+let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning='',notice='',lastAcceptedMessage='';
+let lastExport=null,pendingBodyEdit=null,bodyEditTimer=null;
 let historyOffset=0,branchBusy=false,bodyBackupBusy=false,editRev=0,savedRev=0,stopUntil=0,retryFallback=null;
 const HISTORY_PAGE_SIZE=30;
 const promptDraft=()=>state.draft.trim()||'この場面を自然に続きを進める';
@@ -18,7 +19,7 @@ function status(text,error=false){
 }
 function safety(text=''){
   const warnings=ready?warningsForState(state):[];
-  const problem=text||saveError||(saveBlocked?'保存停止中。JSON書き出しで現状を退避し、復旧元を確認してください。':'');
+  const problem=[text,saveError,backupSizeWarning,saveBlocked?'保存停止中。JSON書き出しで現状を退避し、復旧元を確認してください。':''].filter(Boolean).join('／');
   const n=el('safety');
   n.hidden=!problem&&!warnings.length;
   n.textContent=[problem,...warnings].filter(Boolean).join('／');
@@ -60,6 +61,7 @@ function persist(delay=600){
   status('編集中… 自動保存待機');
 }
 async function saveNow(force=false){
+  commitPendingBodyEdit();
   clearTimeout(saveTimer);saveTimer=null;
   if(!store||saveBlocked){safety();return false;}
   if(!force&&editRev===savedRev)return true;
@@ -172,7 +174,8 @@ function showCandidate(message){
   lockUI();
 }
 function showMain(){
-  if(!ready||branchBusy)return;
+  if(!ready||branchBusy||bodyBackupBusy)return;
+  commitPendingBodyEdit();
   el('screen-main').hidden=false;el('screen-settings').hidden=true;
   el('nav-main').classList.add('primary');el('nav-settings').classList.remove('primary');
   paint();if(editRev!==savedRev)void saveNow();
@@ -257,44 +260,55 @@ function rebuildSettings(){
   detail.append(grid,node('p','hint','詳細パラメータが原因でエラーになる場合は空欄に戻してください。'));
   pref.append(detail);
   const edit=el('edit-body');edit.value=state.body;edit.maxLength=BODY_LIMIT;
+  pendingBodyEdit=null;clearTimeout(bodyEditTimer);bodyEditTimer=null;
   el('edit-warning').hidden=true;
   el('edit-warning').textContent='本文を大幅変更しました。元の本文は復元点に保存されています。';
   const count=el('edit-count');count.textContent=state.body.length+' / '+BODY_LIMIT+'文字';
-  let preDeletePromise=null;
+  let preDeletePromise=null,lastProtectedBody=null,inputSerial=0;
   edit.oninput=async()=>{
-    const desired=edit.value;
-    if(desired.length<state.body.length*0.5&&state.body.length>500){
-      el('edit-warning').hidden=false;
-      if(!preDeletePromise){
-        bodyBackupBusy=true;lockUI();
-        // Keep the keyboard focused; guard navigation and saving while a rescue
-        // checkpoint for the pre-deletion state is being written.
-        el('nav-main').disabled=true;
-        const before=state;
-        preDeletePromise=store.checkpoint(before,'本文を大きく削除する前');
-      }
-      try{await preDeletePromise;}
-      catch(e){
-        edit.value=state.body;
-        status('削除前の復元点を作れなかったため変更を取り消しました: '+e.message,true);
-        preDeletePromise=null;bodyBackupBusy=false;lockUI();return;
-      }
-      preDeletePromise=null;bodyBackupBusy=false;lockUI();
-    }
+    const serial=++inputSerial;
     const text=edit.value;
-    try{
-      state=reconcileBodyEdit(state,text);
-      el('edit-warning').hidden=true;
-    }catch(e){
-      // Preserve manuscript even when multiple turn boundaries were edited.
-      state.body=text;state.undo=null;
+    const bigDeletion=text.length<state.body.length*0.5&&state.body.length>500;
+    if(bigDeletion){
       el('edit-warning').hidden=false;
-      el('edit-warning').textContent='本文を保存しましたが、履歴の位置が一致しません。履歴をリセットするかJSONバックアップを利用してください。 '+e.message;
+      if(lastProtectedBody!==state.body&&!preDeletePromise){
+        bodyBackupBusy=true;lockUI();
+        preDeletePromise=store.checkpoint(state,'本文を大きく削除する前');
+      }
+      if(preDeletePromise){
+        try{
+          await preDeletePromise;lastProtectedBody=state.body;
+        }catch(e){
+          edit.value=state.body;pendingBodyEdit=null;
+          status('削除前の復元点を作れなかったため変更を取り消しました: '+e.message,true);
+          bodyBackupBusy=false;preDeletePromise=null;lockUI();return;
+        }
+        bodyBackupBusy=false;preDeletePromise=null;lockUI();
+      }
     }
-    count.textContent=state.body.length+' / '+BODY_LIMIT+'文字';
-    persist();
+    if(serial!==inputSerial)return; // an older async input must not overwrite a newer keystroke
+    pendingBodyEdit=edit.value;
+    count.textContent=pendingBodyEdit.length+' / '+BODY_LIMIT+'文字';
+    clearTimeout(bodyEditTimer);
+    bodyEditTimer=setTimeout(commitPendingBodyEdit,330);
   };
+  edit.onblur=()=>{if(!bodyBackupBusy)commitPendingBodyEdit();};
   updatePromptMeta();
+}
+function commitPendingBodyEdit(){
+  clearTimeout(bodyEditTimer);bodyEditTimer=null;
+  if(pendingBodyEdit===null)return;
+  const text=pendingBodyEdit;pendingBodyEdit=null;
+  try{
+    state=reconcileBodyEdit(state,text);
+    // A successful history reconciliation must not hide a deletion warning.
+  }catch(e){
+    state.body=text;state.undo=null;
+    el('edit-warning').hidden=false;
+    el('edit-warning').textContent='本文は保持しましたが履歴の再設定が必要です。 '+e.message;
+  }
+  if(el('edit-count'))el('edit-count').textContent=state.body.length+' / '+BODY_LIMIT+'文字';
+  persist();
 }
 function updatePromptMeta(){
   const m=buildRequest(state,promptDraft()).meta;
@@ -308,7 +322,10 @@ function modal(question,choices=[['yes','続行'],['no','キャンセル']]){
     overlay.querySelector('.modal-editor')?.remove();overlay.querySelector('.modal-validation')?.remove();
     body.textContent=question;buttons.replaceChildren();overlay.hidden=false;
     function close(value){overlay.hidden=true;resolve(value);}
-    overlay.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();close('no');}};
+    overlay.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();
+      const cancel=choices.some(([v])=>v==='cancel')?'cancel':choices.some(([v])=>v==='no')?'no':null;
+      close(cancel);
+    }};
     for(const [val,label] of choices){
       const b=node('button',val==='yes'?'primary':'ghost',label);
       b.onclick=()=>close(val);buttons.append(b);
@@ -396,9 +413,16 @@ function stopGeneration(){
   setTimeout(()=>lockUI(),1850);
   activeId++; // Ignore late stream callbacks from the cancelled generation.
   busy=false;stream=null;lockUI();
-  if(!candidate?.text?.trim())candidate=retryFallback?.text?.trim()?retryFallback:null;
+  let retryFallbackWasUsed=false;
+  if(!candidate?.text?.trim()){
+    retryFallbackWasUsed=Boolean(retryFallback?.text?.trim());
+    candidate=retryFallbackWasUsed?retryFallback:null;
+  }
   retryFallback=null;
-  if(candidate){candidate.note='停止しました。途中までの文章を採用するか編集できます。';}
+  if(candidate){
+    if(retryFallbackWasUsed)candidate.note=(candidate.note||'')+'／再生成を停止して前の候補に戻しました。';
+    else candidate.note='停止しました。途中までの文章を採用するか編集できます。';
+  }
   state.pendingCandidate=candidate;showCandidate();persist(0);
   if(typeof activeStop==='function'){const cancel=activeStop;activeStop=null;cancel();}
   status('停止しました。');
@@ -408,12 +432,15 @@ async function exportAs(ext){
   try{
     const light=ext==='compact-json';
     const content=light?compactBackup(state):ext==='json'?JSON.stringify(state):readableText(state,ext);
-    if((ext==='json'||light)&&new TextEncoder().encode(content).length>TRANSFER_MAX_BYTES)
-      status('このJSONは50MBを超えています。分岐を整理してから外部保存してください。',true);
+    const tooLarge=(ext==='json'||light)&&new TextEncoder().encode(content).length>TRANSFER_MAX_BYTES;
+    backupSizeWarning=tooLarge?'このJSONは50MB超で再読み込みできません。軽量JSONや分岐整理後の再保存が必要です。':'';
+    safety();
     const name=filename(state.title+(light?'_軽量分岐':''),light?'json':ext);
     const mime=(ext==='json'||light)?'application/json':ext==='md'?'text/markdown':'text/plain';
     const result=await writeFile(host,name,content,mime);
-    status(result.message,result.kind==='manual');
+    lastExport={name,text:content,mime};
+    el('open-export-manual').hidden=false;
+    status((backupSizeWarning?backupSizeWarning+'／':'')+result.message,tooLarge||result.kind==='manual');
     if(result.kind==='manual'){
       el('manual-export').hidden=false;el('manual-name').textContent=name;
       el('manual-text').value=result.text;el('download-manual').dataset.name=name;
@@ -461,16 +488,16 @@ async function resetStory(){
 async function restoreCheckpoint(){
   if(!ready||saveBlocked||busy||bodyBackupBusy)return;
   try{
-    const versions=await store.checkpoints();
+    const versions=await store.checkpointList();
     if(!versions.length){status('復元できる以前の保存点はありません。');return;}
     const choices=versions.map((v,i)=>[String(i),String(i+1)+'：'+
-      new Date(v.at).toLocaleString('ja-JP')+'／'+(v.reason||'保存点')+'／'+v.chars+'文字']);
+      new Date(v.at).toLocaleString('ja-JP')+'／'+(v.reason||'保存点')+'／'+(v.chars??'不明')+'文字']);
     choices.push(['cancel','キャンセル']);
     const selection=await modal('復元する時点を選んでください。復元前の現在の状態も保存点に退避します。',choices);
     if(selection==='cancel')return;
     const n=Number(selection);
     if(!Number.isSafeInteger(n)||n<0||n>=versions.length)return;
-    const selected=cleanState(JSON.parse(versions[n].data));
+    const selected=await store.loadCheckpoint(versions[n].id);
     if(!await beforeDestructive('選択した復元点を開く'))return;
     state=selected;candidate=state.pendingCandidate;fullBody=false;
     editRev++;paint();rebuildSettings();
@@ -486,7 +513,7 @@ async function recoverChoice(){
     describe('SQLite',info.sqlite)+'\n'+describe('IndexedDB',info.idb)+
     '\n選ばなかった側も復元点へ保存します。決められない場合は保留してJSONを書き出してください。',
     [['idb','IndexedDBの退避を使う'],['sqlite','SQLiteの保存を使う'],['cancel','保留する']]);
-  if(choice==='cancel')return;
+  if(choice!=='idb'&&choice!=='sqlite')return;
   try{
     const recovered=await store.chooseRecovery(choice);
     state=cleanState(recovered);candidate=state.pendingCandidate;
@@ -505,6 +532,8 @@ async function exportRaw(){
   try{
     const raw=await store.rawDump();
     const result=await writeFile(host,filename('talking-story-raw-recovery','json'),raw,'application/json');
+    lastExport={name:filename('talking-story-raw-recovery','json'),text:raw,mime:'application/json'};
+    el('open-export-manual').hidden=false;
     status(result.message,result.kind==='manual');
     if(result.kind==='manual'){
       el('manual-export').hidden=false;
@@ -521,7 +550,7 @@ async function exportRaw(){
 function textModal(question,initial,{max=15000,multiline=true,options=[['save','保存'],['cancel','キャンセル']]}={}){
   return new Promise(resolve=>{
     const overlay=el('modal'),body=el('modal-content'),buttons=el('modal-buttons');
-    overlay.querySelector('.modal-editor')?.remove();
+    overlay.querySelector('.modal-editor')?.remove();overlay.querySelector('.modal-validation')?.remove();
     body.textContent=question;buttons.replaceChildren();
     const editor=node(multiline?'textarea':'input','modal-editor');
     if(!multiline)editor.type='text';
@@ -536,13 +565,14 @@ function textModal(question,initial,{max=15000,multiline=true,options=[['save','
           if(!warning){warning=node('p','modal-validation safety error');editor.after(warning);}
           warning.textContent='入力内容が空です。';editor.focus();return;
         }
-        overlay.hidden=true;editor.remove();
+        overlay.hidden=true;editor.remove();overlay.querySelector('.modal-validation')?.remove();
         resolve(value==='cancel'?null:{action:value,text:editor.value});
       };
       buttons.append(button);
     }
     overlay.hidden=false;
-    overlay.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();overlay.hidden=true;editor.remove();resolve(null);}};
+    overlay.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();overlay.hidden=true;editor.remove();
+      overlay.querySelector('.modal-validation')?.remove();resolve(null);}};
     editor.focus();
   });
 }
@@ -608,12 +638,9 @@ async function actOnTurn(index,action){
     return;
   }
   if(action==='undo'&&state.branches.length>=MAX_ARCHIVED_BRANCHES){
-    if(await modal('分岐が上限30件です。元の展開を復元点へ退避して直前ターンを取り消します。復元点は古いものから順に整理される場合があります。')!=='yes')return;
-    if(!await beforeDestructive('分岐上限でのUndo'))return;
-    try{
-      state=undoTurn(state);candidate=null;editRev++;paint();
-      if(await saveNow(true))status('直前のターンを取り消しました。分岐ではなく復元点に退避しました。');
-    }catch(e){status('取り消せません: '+String(e.message||e),true);}
+    if(await modal('分岐30件の上限です。元の状態を復元点へ保存して直前のターンを取り消しますか？')!=='yes')return;
+    const succeeded=await applyStoryChange(s=>rewindLastWithoutFork(s),'直前のターンを取り消しました（元の展開は復元点に保管）。',{destructive:true});
+    if(succeeded)showMain();
     return;
   }
   if(action==='rewind'||action==='undo'||action==='restart'){
@@ -633,7 +660,7 @@ async function branchAction(action,id){
   if(action==='switch'){
     const selection=await modal('「'+found.name+'」に切り替えます。人物設定・世界観・自由記憶・ユーザー設定はどうしますか？\n生成パラメータは常に現在の値を引き継ぎます。',
       [['branch','切替先分岐の設定を使用'],['inherit','現在の設定を引き継ぐ'],['cancel','キャンセル']]);
-    if(selection==='cancel')return;
+    if(selection!=='branch'&&selection!=='inherit')return;
     if(await applyStoryChange(s=>switchBranch(s,id,{inheritLore:selection==='inherit'}),'分岐を切り替えました'))showMain();
   }else if(action==='rename'){
     const result=await textModal('分岐の名前を編集します。',found.name,{max:90,multiline:false});
@@ -647,7 +674,7 @@ async function branchAction(action,id){
 function setup(){
   app.innerHTML=
     '<header><div class="bar"><img class="logo" src="./icon.jpg" alt="緑の時計"><div class="titles"><div class="subtitle">LAYLA MINI-APP · LOCAL STORY</div><div class="brand" id="title-view">新しい物語</div></div><span class="badge">物語</span></div>'+
-    '<div id="status" class="status" role="status" aria-live="polite">データ読み込み中…</div><button id="recover-now" hidden class="small warn">復旧元を選択</button></header><div id="safety" class="safety error" role="alert">初期化中</div>'+
+    '<div id="status" class="status" role="status" aria-live="polite">データ読み込み中…</div><button id="recover-now" hidden class="small warn">復旧元を選択</button><button id="open-export-manual" hidden class="small ghost">共有できない場合：手動で救出</button></header><div id="safety" class="safety error" role="alert">初期化中</div>'+
     '<main><div id="screen-main">'+
     '<section class="panel"><div class="split" style="justify-content:space-between"><h2>確定した物語</h2><span class="mini" id="counter"></span></div><p id="meta" class="hint"></p><div class="story" id="body-view"></div><div class="actions"><button id="view-full">全文を表示</button><button id="jump-bottom">入力欄へ移動</button><button id="undo">直前のターンを分岐して取り消す</button></div></section>'+
     '<section class="panel" id="prompt-section"><h2>あなたの台詞・行動</h2><p class="hint">本人が話す台詞・取る行動、次の場面の希望を記入してください。</p><textarea id="user-input" rows="5" maxlength="15000" placeholder="例：『おはよう』と笑って、隣に座る。"></textarea><div class="actions"><button id="generate" class="primary">続きを生成</button><button id="stop" class="warn" disabled>生成停止</button></div><div id="candidate-box" hidden><label for="candidate-edit">未採用の候補（編集可能）</label><textarea id="candidate-edit" rows="9"></textarea><p id="candidate-status" class="hint"></p><div class="actions"><button id="accept" class="primary">この文章を採用</button><button id="retry">もう一度生成</button><button id="discard" class="warn">破棄</button></div></div></section>'+
@@ -695,12 +722,18 @@ function setup(){
   el('reset-history').onclick=async()=>{
     if(!state.turns.length)return;
     if(await modal('現在の本文は保持し、送信履歴だけ削除します。元の履歴は復元点に保存します。続行しますか？')!=='yes')return;
-    if(!await beforeDestructive('履歴をリセットする前'))return;
-    state=clearHistoryAgainstBody(state);editRev++;paint();rebuildSettings();
-    if(!await saveNow(true))status('履歴を保存できませんでした。外部JSONに退避してください。',true);
+    if(await applyStoryChange(s=>clearHistoryAgainstBody(s),'本文を保持して履歴をリセットしました。',{destructive:true}))rebuildSettings();
   };
   el('raw-backup').onclick=()=>void exportRaw();
   el('close-manual').onclick=()=>{el('manual-text').value='';el('manual-export').hidden=true;};
+  el('open-export-manual').onclick=()=>{
+    if(!lastExport)return;
+    el('manual-export').hidden=false;el('manual-name').textContent=lastExport.name;
+    el('manual-text').value=lastExport.text;
+    el('download-manual').dataset.name=lastExport.name;
+    el('download-manual').dataset.mime=lastExport.mime;
+    el('manual-export').scrollIntoView({block:'center'});
+  };
   el('download-manual').onclick=()=>{
     const name=el('download-manual').dataset.name||'story.txt';
     const mime=el('download-manual').dataset.mime||'text/plain';
@@ -722,7 +755,7 @@ function setup(){
 async function init(){
   setup();lockUI();
   try{
-    store=await openStore(host,message=>status(message,true),{validator:cleanState});
+    store=await openStore(host,(message,isError=false)=>status(message,isError),{validator:cleanState});
     if(store.initial){
       try{state=cleanState(store.initial);}
       catch(e){saveBlocked=true;saveError='データ読み込みエラー: '+e.message;ready=true;paint();safety();return;}

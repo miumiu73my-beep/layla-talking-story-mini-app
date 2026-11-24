@@ -145,39 +145,62 @@ export function deleteInactiveBranch(state,id){
 // Only resync when the change is confined to one reply or to material outside
 // replies; multi-turn replacements must go through explicit history reset.
 export function reconcileBodyEdit(state,nextBody){
+  // Validation and position discovery are limited to the active branch.
   const d=cleanState({...state,branches:[]}),newBody=String(nextBody);
+  if(newBody===d.body){d.branches=state.branches||[];return d;}
   const positions=timeline(d),oldBody=d.body;
   let left=0,right=0;
   while(left<oldBody.length&&left<newBody.length&&oldBody[left]===newBody[left])left++;
   while(right<oldBody.length-left&&right<newBody.length-left&&
     oldBody[oldBody.length-1-right]===newBody[newBody.length-1-right])right++;
-  const oldEnd=oldBody.length-right,newEnd=newBody.length-right;
+  const oldEnd=oldBody.length-right;
   const delta=newBody.length-oldBody.length;
-  const changed=positions.filter(p=>
-    (left===oldEnd ? left>p.start&&left<p.end : left<p.end&&oldEnd>p.start));
-  if(changed.length>1)throw Error('複数のターンにまたがる編集です。本文は保持しますが、履歴の再同期が必要です。');
+  const insertion=left===oldEnd;
+  // When inserting exactly at a reply boundary, attach new text to the
+  // previous reply at its end; at a reply's start attach it to that reply.
+  let changed=positions.filter(p=>insertion?
+    (left>p.start&&left<p.end):
+    (left<p.end&&oldEnd>p.start));
+  if(insertion&&changed.length===0){
+    const preceding=positions.filter(p=>p.end===left);
+    if(preceding.length)changed=[preceding[preceding.length-1]];
+    else changed=positions.filter(p=>p.start===left).slice(0,1);
+  }
+  if(changed.length>1)throw Error('複数ターンにまたがる本文編集です。履歴の再設定が必要です。');
   const change=changed[0]||null;
-  if(change&&(left<change.start||oldEnd>change.end))
-    throw Error('本文のターン境界にまたがる編集です。履歴の再同期が必要です。');
+  if(change&&!insertion&&(left<change.start||oldEnd>change.end))
+    throw Error('ターン境界を跨ぐ本文編集です。履歴の再設定が必要です。');
   d.body=newBody;
-  d.turns=d.turns.map((t,i)=>{
-    const original=positions[i],copyTurn={...t};
+  d.turns=d.turns.map((turn,i)=>{
+    const old=positions[i],t={...turn,bodyStart:old.start,bodyEnd:old.end};
+    if(change?.index===i)t.bodyEnd+=delta;
+    else if(old.start>=oldEnd){t.bodyStart+=delta;t.bodyEnd+=delta;}
     if(change?.index===i){
-      copyTurn.bodyEnd=original.end+delta;
-    }else if(original.start>=oldEnd){
-      copyTurn.bodyStart=original.start+delta;
-      copyTurn.bodyEnd=original.end+delta;
+      const reply=d.body.slice(t.bodyStart,t.bodyEnd);
+      t.preview=reply.slice(0,240);
+      t.replyHash=bodyFingerprint(reply);
+      if(typeof t.reply==='string')t.reply=reply; // legacy v1 backup
     }
-    const updated=d.body.slice(copyTurn.bodyStart,copyTurn.bodyEnd);
-    if(change?.index===i){
-      copyTurn.preview=updated.slice(0,240);
-      copyTurn.replyHash=bodyFingerprint(updated);
-      if(typeof copyTurn.reply==='string')copyTurn.reply=updated; // old v1 compatibility
-    }
-    return copyTurn;
+    return t;
   });
   d.undo=null;
-  timeline(d);
+  timeline(d); // reject unsafe reconciliation rather than silently shifting turns
+  d.branches=state.branches||[];
+  return d;
+}
+// A bounded-branch emergency undo: no full additional fork, only an explicit
+// checkpoint is needed before invoking this pure transformation.
+export function rewindLastWithoutFork(state){
+  const d=cleanState({...state,branches:[]});
+  const turns=timeline(d);
+  if(!turns.length)throw Error('取り消せるターンがありません。');
+  const last=turns[turns.length-1];
+  if(last.end!==d.body.length)
+    throw Error('最終ターンの後に直接追記があります。先に本文を確認してください。');
+  d.body=d.body.slice(0,prefixBefore(d.body,last.start));
+  d.turns.pop();
+  d.draft=last.user||d.draft;
+  d.undo=null;d.pendingCandidate=null;
   d.branches=state.branches||[];
   return d;
 }

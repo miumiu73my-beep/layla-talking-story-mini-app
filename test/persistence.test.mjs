@@ -223,3 +223,93 @@ test('corrupt ACTIVE can be preserved and explicitly replaced using imported v1 
   assert.equal(again.initial.body,valid.body);
   assert.equal(again.readOnly,false);
 });
+
+
+test('initial SQLite SELECT failure NEVER allows a blind SQLite reconnect and GC',async()=>{
+  const sql=fakeSql(),original=freshState();original.body='絶対に失ってはいけない原稿';
+  seed(sql,original,{rev:55});
+  const currentManifest=sql.map.get('active');
+  const originalKeys=[...sql.map.keys()];
+  const execute=sql.executeSql.bind(sql);
+  let failOnce=true;
+  sql.executeSql=async(query,args=[])=>{
+    if(failOnce&&query.startsWith('SELECT v FROM')&&args[0]==='active'){
+      failOnce=false;throw Error('Initial SQLite SELECT timeout');
+    }
+    return execute(query,args);
+  };
+  const idb=fakeIdb();
+  const st=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  const replacement=freshState();replacement.body='この内容で上書きしてはいけない';
+  await st.save(replacement);
+  assert.equal(st.mode(),'IndexedDB（未同期退避）');
+  assert.equal(sql.map.get('active'),currentManifest);
+  for(const key of originalKeys)assert.ok(sql.map.has(key),'lost key '+key);
+  assert.equal((await idb.data.get('latest')).state.body,replacement.body);
+});
+
+test('malformed pending IDB fork never fast-forwards healthy SQLite',async()=>{
+  const sql=fakeSql(),original=freshState();original.body='SQLite本編';
+  seed(sql,original,{rev:17});
+  const previous=sql.map.get('active');
+  const damaged={...original,body:'IDB変更版',branches:[{
+    id:'broken',name:'壊れたアーカイブ',body:42,turns:[],draft:'',prefs:original.prefs
+  }]};
+  const idb=fakeIdb({latest:{state:damaged,rev:18,baseRev:17,pending:true,at:200}});
+  const st=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  assert.equal(st.initial.body,'SQLite本編');
+  assert.equal(st.recoveryRequired,false);
+  assert.equal(sql.map.get('active'),previous);
+  await assert.rejects(st.chooseRecovery('idb'),/必要ありません/);
+});
+
+test('checkpoint list is metadata-only and a selected large entry is loaded lazily',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),host={db:sql};
+  const st=await openStore(host,()=>{},{idbFactory:idb.factory});
+  const s=freshState();s.body='お'.repeat(250000);
+  await st.checkpoint(s,'長編の編集中');
+  let partsRead=0;
+  const orig=sql.executeSql.bind(sql);
+  sql.executeSql=async(q,args=[])=>{
+    if(q.startsWith('SELECT v FROM')&&String(args[0]).includes('/part/'))partsRead++;
+    return orig(q,args);
+  };
+  const options=await st.checkpointList();
+  assert.equal(partsRead,0);
+  const selected=options.find(x=>x.reason==='長編の編集中');
+  assert.ok(selected);assert.equal(selected.data,undefined);
+  const restored=await st.loadCheckpoint(selected.id);
+  assert.equal(restored.body,s.body);
+  assert.ok(partsRead>=6);
+});
+
+test('checkpoint pruning deletes orphaned parts and uses metadata date order',async()=>{
+  const sql=fakeSql(),st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  sql.map.set('checkpoint/orphan/part/0','孤立行');
+  const s=freshState();s.body='記録';
+  await st.checkpoint(s,'ガベージ回収');
+  assert.equal(sql.map.has('checkpoint/orphan/part/0'),false);
+});
+
+test('SQLite corrupt manifest recovery works even without IndexedDB',async()=>{
+  const sql=fakeSql();sql.map.set('active','NOT_JSON');
+  const st=await openStore({db:sql},()=>{},{idbFactory:async()=>{throw Error('IDB disabled');}});
+  assert.equal(st.readOnly,true);
+  await st.allowImportRecovery();
+  const manuscript=freshState();manuscript.body='IDBなしで復旧した原稿';
+  await st.save(manuscript);
+  const reopened=await openStore({db:sql},()=>{},{idbFactory:async()=>{throw Error('IDB disabled');}});
+  assert.equal(reopened.initial.body,manuscript.body);
+});
+
+test('raw dump contains bounded raw active manuscript even when checksum fails',async()=>{
+  const sql=fakeSql(),s=freshState();s.body='救出すべき原稿';
+  seed(sql,s,{rev:4});
+  const active=JSON.parse(sql.map.get('active'));
+  active.hash='wrong_hash';sql.map.set('active',JSON.stringify(active));
+  const st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  assert.equal(st.readOnly,true);
+  const dump=JSON.parse(await st.rawDump());
+  assert.ok(dump.activeRootRawPrefix.includes('救出すべき原稿'));
+  assert.ok(dump.activeRootRawPrefix.length<=2000000);
+});

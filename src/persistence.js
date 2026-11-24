@@ -74,6 +74,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   let idb=null,fallback=null,sqlAvailable=false,sqlProblem='',rawEvidence=null,sqliteCorrupt=false;
   let sqlSnapshot=null,manifest=null,readOnly=false,recoveryRequired=false;
   let preferred=null,mode='保存不可',seq=0,backupWarning='',nextSqlRetry=0,skipCleanupOnce=false;
+  // A session must never overwrite SQLite it failed to fully read on startup.
+  let sqlInitialized=false,sqlRetryBlocked=false;
   const sql=host?.db?.executeSql;
   const run=async(q,args=[])=>host.db.executeSql(q,args);
   try{idb=await idbFactory();fallback=await idb.get('latest');}
@@ -97,12 +99,14 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
           (sqlSnapshot.validated.rescued?'。正常な本文と分岐を読取専用で救出しました。':'') );
         rawEvidence=null;
       }
+      sqlInitialized=true;
     }catch(e){
       sqlProblem=String(e.message||e);
       // If the API/table itself fails before a manifest is read, this can be
       // transient unavailability, NOT corrupted saved data. Allow IDB fallback.
       sqliteCorrupt=rawEvidence!==null||manifest!==null;
-      readOnly=sqliteCorrupt;sqlAvailable=false;
+      readOnly=sqliteCorrupt;sqlAvailable=false;nextSqlRetry=Date.now()+20000;
+      sqlRetryBlocked=!sqlInitialized;
       notify(sqliteCorrupt?'SQLite保存を検証できません。上書きを停止しました: '+sqlProblem:'SQLiteを一時的に利用できません。IndexedDBへ退避を試します: '+sqlProblem);
     }
   }
@@ -112,11 +116,12 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     if(idbValid.error)notify('IndexedDBの退避データが不正です。SQLiteへ自動復旧しません: '+idbValid.error.message,true);
     else seq=Math.max(seq,Number(fallback.rev)||0);
   }
-  const different=Boolean(idbValid?.value&&sqlSnapshot?.validated.value&&
+  const cleanIdb=Boolean(idbValid?.value&&!idbValid.error);
+  const different=Boolean(cleanIdb&&sqlSnapshot?.validated.value&&!sqlSnapshot.validated.error&&
     JSON.stringify(idbValid.value)!==JSON.stringify(sqlSnapshot.validated.value));
-  const safeFastForward=Boolean(fallback?.pending&&different&&sqlAvailable&&
+  const safeFastForward=Boolean(cleanIdb&&fallback?.pending&&different&&sqlAvailable&&
     Number.isSafeInteger(fallback.baseRev)&&fallback.baseRev===sqlSnapshot?.rev);
-  if(fallback?.pending&&idbValid?.value&&different&&sqlAvailable&&!safeFastForward){
+  if(fallback?.pending&&cleanIdb&&different&&sqlAvailable&&!safeFastForward){
     recoveryRequired=true;readOnly=true;
     preferred=idbValid.value; // Display but do NOT write until explicit choice.
     notify('SQLiteとIndexedDBの未同期編集が異なります。復旧元を選ぶまで保存を停止します。');
@@ -222,11 +227,28 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     if(readOnly)throw Error('読み取り専用です。復旧元を確認するかJSONバックアップを利用してください。');
     const state=validator(JSON.parse(raw));
     const saved={state,rev:seq+1,at:Date.now(),baseRev:manifest?.rev||0,pending:true};
-    if(!sqlAvailable&&!sqliteCorrupt&&typeof sql==='function'&&Date.now()>=nextSqlRetry){
+    if(!sqlAvailable&&!sqliteCorrupt&&sqlInitialized&&!sqlRetryBlocked&&
+       typeof sql==='function'&&Date.now()>=nextSqlRetry){
       try{
-        await run('SELECT v FROM '+TABLE+' WHERE k=?',[ACTIVE]);
+        await run('CREATE TABLE IF NOT EXISTS '+TABLE+' (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
+        const rows=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[ACTIVE]));
+        // The ACTIVE manifest must still be exactly the generation we read.
+        // Never write into an unknown or concurrently changed SQLite database.
+        if(rows.length){
+          const current=JSON.parse(String(rows[0].v));
+          if(!manifest||current.rev!==manifest.rev||
+             JSON.stringify(current.parts)!==JSON.stringify(manifest.parts)||
+             current.hash!==manifest.hash)
+            throw Error('SQLite保存世代が変化しています。自動上書きを禁止しました。');
+        }else if(manifest){
+          throw Error('SQLiteの既存ACTIVEが見つかりません。自動上書きを禁止しました。');
+        }
         sqlAvailable=true;
-      }catch(e){nextSqlRetry=Date.now()+20000;sqlProblem=String(e.message||e);}
+      }catch(e){
+        sqlRetryBlocked=/自動上書きを禁止/.test(String(e.message||e));
+        nextSqlRetry=Date.now()+20000;sqlProblem=String(e.message||e);
+        notify('SQLite自動復旧を中止しました。IndexedDBへ退避: '+sqlProblem,true);
+      }
     }
     if(sqlAvailable){
       try{
@@ -273,12 +295,13 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       if(!working)void processQueue();
     });
   }
-  // Preserve old single-row checkpoint records; new checkpoints use chunks.
+  // A checkpoint's parent key holds small metadata; its data is in chunks.
+  // Old single-row SQL and IDB checkpoints remain readable.
   async function checkpoint(state,reason='操作前'){
     if(readOnly)throw Error('復旧中のため復元点を作成できません。');
     const normalized=validator(state),raw=JSON.stringify(normalized);
     const id='checkpoint/'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8);
-    const entry={at:Date.now(),title:normalized.title,chars:normalized.body.length,reason,
+    const entry={id,at:Date.now(),title:normalized.title,chars:normalized.body.length,reason,
       hash:checksum(raw),size:raw.length};
     let sqlFailure=null;
     if(sqlAvailable){
@@ -291,78 +314,113 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
           names.push(key);
         }
         await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[id,JSON.stringify({...entry,parts:names})]);
-        await pruneSqlCheckpoints();
+        try{await pruneSqlCheckpoints();}catch(e){notify('古い復元点の整理は次回行います: '+e.message,true);}
         return;
       }catch(e){
         sqlFailure=e;
-        notify('SQLite復元点の作成に失敗しました。IndexedDBへの退避を試します: '+e.message,true);
+        notify('SQLite復元点の作成に失敗しました。IndexedDBへ退避を試します: '+e.message,true);
       }
     }
     if(idb){
-      const list=(await idb.get('checkpoints'))||[];
-      await idb.put('checkpoints',[{...entry,data:raw},...list].slice(0,8));
+      // Only index metadata is read to show the restore picker.
+      await idb.put('checkpoint-data/'+id,raw);
+      const list=(await idb.get('checkpoint-index'))||[];
+      await idb.put('checkpoint-index',[entry,...list].slice(0,8));
       return;
     }
     throw sqlFailure||Error('復元点を保存できません。');
   }
-  async function pruneSqlCheckpoints(){
+  async function sqlCheckpointParents(){
     const keys=sqlRows(await run('SELECT k FROM '+TABLE)).map(r=>r.k)
-      .filter(k=>typeof k==='string'&&/^checkpoint\/[^/]+$/.test(k)).sort().reverse();
-    // 8 safety checkpoints: avoid rapidly evicting a reset/import/deletion recovery.
-    for(const old of keys.slice(8)){
-      let info=null;
+      .filter(k=>typeof k==='string'&&/^checkpoint\/[^/]+$/.test(k));
+    const parents=[];
+    for(const key of keys){
       try{
-        const raw=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[old]))[0]?.v;
-        info=JSON.parse(raw);
-      }catch{}
-      if(info?.parts)for(const part of info.parts)await run('DELETE FROM '+TABLE+' WHERE k=?',[part]);
-      await run('DELETE FROM '+TABLE+' WHERE k=?',[old]);
+        const row=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]))[0]?.v;
+        if(typeof row!=='string')continue;
+        const entry=JSON.parse(row);
+        parents.push({key,entry});
+      }catch(e){notify('旧復元点のメタ情報を読めません: '+e.message,true);}
     }
+    return parents;
   }
-  async function checkpoints(){
+  async function pruneSqlCheckpoints(){
+    const parents=await sqlCheckpointParents();
+    parents.sort((a,b)=>(Number(b.entry.at)||0)-(Number(a.entry.at)||0));
+    const keep=parents.slice(0,8),drop=parents.slice(8);
+    // Include every committed parent part in the keep-set. Remove uncommitted
+    // orphan /part rows as well as parts of evicted snapshots.
+    const keptParts=new Set(keep.flatMap(p=>p.entry.parts||[]));
+    const keys=sqlRows(await run('SELECT k FROM '+TABLE)).map(r=>r.k);
+    for(const key of keys){
+      if(typeof key==='string'&&key.startsWith('checkpoint/')&&key.includes('/part/')&&!keptParts.has(key))
+        await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
+    }
+    for(const p of drop)await run('DELETE FROM '+TABLE+' WHERE k=?',[p.key]);
+  }
+  async function checkpointList(){
     const all=[];
     if(sqlAvailable){
-      const keys=sqlRows(await run('SELECT k FROM '+TABLE)).map(r=>r.k)
-        .filter(k=>typeof k==='string'&&/^checkpoint\/[^/]+$/.test(k));
-      for(const k of keys){
-        try{
-          const raw=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[k]))[0]?.v;
-          const entry=JSON.parse(raw);
-          let data=entry.data;
-          if(!data&&Array.isArray(entry.parts)){
-            const chunks=[];
-            for(const key of entry.parts){
-              const part=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]))[0]?.v;
-              if(typeof part!=='string')throw Error('復元点チャンク欠落');
-              chunks.push(part);
-            }
-            data=chunks.join('');
-          }
-          if(typeof data!=='string')continue;
-          if(entry.hash&&checksum(data)!==entry.hash)throw Error('復元点の検証失敗');
-          all.push({id:k,...entry,data,reason:entry.reason||'旧復元点'});
-        }catch(e){notify('一部の復元点を検証できません: '+e.message,true);}
-      }
-      if(manifest?.previous){
-        try{
-          const prev=await readGeneration(manifest.previous);
-          all.push({id:'previous',at:manifest.previous.at||0,data:JSON.stringify(prev),
-            title:prev.title,chars:prev.body.length,reason:'直前の保存世代'});
-        }catch{}
-      }
+      const parents=await sqlCheckpointParents();
+      for(const {key,entry} of parents)
+        all.push({id:key,at:Number(entry.at)||0,title:entry.title,chars:entry.chars,reason:entry.reason||'旧復元点'});
+      if(manifest?.previous)all.push({id:'previous',at:manifest.previous.at||0,
+        title:'直前の保存世代',chars:null,reason:'直前の保存世代'});
     }
     if(idb)try{
-      const entries=await idb.get('checkpoints');
-      for(const entry of entries||[]){
-        if(typeof entry.data==='string'&&(!entry.hash||checksum(entry.data)===entry.hash))
-          all.push({id:'idb/'+entry.at,...entry,reason:entry.reason||'IndexedDB復元点'});
+      const indexed=await idb.get('checkpoint-index');
+      for(const entry of indexed||[])all.push({id:'idb/'+entry.id,at:entry.at,title:entry.title,chars:entry.chars,
+        reason:entry.reason||'IndexedDB復元点'});
+      // Legacy backup is stored in one IDB array; read it only if newer index
+      // is absent. It cannot be indexed without accessing that legacy value.
+      if(!indexed?.length){
+        const legacy=await idb.get('checkpoints');
+        for(let i=0;i<(legacy||[]).length;i++){
+          const entry=legacy[i];
+          all.push({id:'legacy-idb/'+i,at:entry.at,title:entry.title,chars:entry.chars,
+            reason:entry.reason||'旧IndexedDB復元点'});
+        }
       }
-    }catch{}
+    }catch(e){notify('IndexedDB復元点の一覧を読み込めません: '+e.message,true);}
     return all.sort((a,b)=>b.at-a.at).slice(0,12);
+  }
+  async function loadCheckpoint(id){
+    let raw=null;
+    if(id==='previous'){
+      if(!manifest?.previous)throw Error('直前の保存世代がありません。');
+      return readGeneration(manifest.previous);
+    }
+    if(id.startsWith('idb/')){
+      if(!idb)throw Error('IndexedDBが利用できません。');
+      raw=await idb.get('checkpoint-data/'+id.slice(4));
+    }else if(id.startsWith('legacy-idb/')){
+      const n=Number(id.slice('legacy-idb/'.length));
+      const legacy=await idb?.get('checkpoints');
+      raw=legacy?.[n]?.data;
+    }else if(/^checkpoint\/[^/]+$/.test(id)){
+      const entryText=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[id]))[0]?.v;
+      if(typeof entryText!=='string')throw Error('復元点の情報がありません。');
+      const entry=JSON.parse(entryText);
+      raw=entry.data??await readParts(entry.parts,entry.hash,entry.size);
+      if(entry.hash&&checksum(raw)!==entry.hash)throw Error('復元点のチェックサムが一致しません。');
+    }
+    if(typeof raw!=='string')throw Error('復元点を読み込めません。');
+    return validator(JSON.parse(raw));
+  }
+  // Backward-compatible eager API for existing callers/tests. The UI uses
+  // checkpointList + loadCheckpoint to avoid loading 12 huge documents at once.
+  async function checkpoints(){
+    const list=await checkpointList();
+    const out=[];
+    for(const entry of list)try{
+      const data=JSON.stringify(await loadCheckpoint(entry.id));
+      out.push({...entry,data});
+    }catch(e){notify('復元点が破損しています: '+e.message,true);}
+    return out;
   }
   async function chooseRecovery(which){
     if(!recoveryRequired)throw Error('復旧元の選択は必要ありません。');
-    const selected=which==='idb'?idbValid?.value:which==='sqlite'?sqlSnapshot?.validated.value:null;
+    const selected=which==='idb'?(idbValid&&!idbValid.error?idbValid.value:null):which==='sqlite'?sqlSnapshot?.validated.value:null;
     if(!selected)throw Error('復旧元が見つかりません。');
     const wasReadOnly=readOnly,wasRequired=recoveryRequired;
     try{
@@ -384,7 +442,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   async function allowImportRecovery(){
     if(recoveryRequired)throw Error('まずSQLite/IndexedDBの復旧元を選択してください。');
-    if(!sqlAvailable&&!idb)throw Error('保存先がありません。JSONは閲覧できますが端末へ保存できません。');
+    if(!sqlAvailable&&!idb&&!(sqliteCorrupt&&typeof sql==='function'))throw Error('保存先がありません。JSONは閲覧できますが端末へ保存できません。');
     // User-confirmed recovery: preserve the corrupt ACTIVE manifest under a new
     // key before replacing it. Do not GC unknown orphan chunks on this write.
     if(sqliteCorrupt&&typeof sql==='function'){
@@ -393,22 +451,45 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[
           'corrupt-backup/'+Date.now(),recoveredManifest
         ]);
-        manifest=null;sqlAvailable=true;skipCleanupOnce=true;
+        manifest=null;sqlAvailable=true;sqlInitialized=true;sqlRetryBlocked=false;skipCleanupOnce=true;
         sqliteCorrupt=false;sqlProblem='';
       }catch(e){
         notify('SQLite復旧準備に失敗しました。IndexedDBへ退避します: '+e.message,true);
       }
     }
+    if(!sqlAvailable&&!idb)throw Error('SQLite復旧にも失敗し保存先がありません。読み取り専用を維持します。');
     readOnly=false;
     if(!sqlAvailable&&idb)mode='IndexedDB（退避）';
     return true;
   }
   async function rawDump(){
-    const evidence={schema:'layla-talking-story-recovery-raw',sqliteError:sqlProblem,rawManifest:rawEvidence,failedIdb:fallback,
-      activeManifest:manifest,notice:'巨大なSQLite全行を読み込むとアプリが停止するため、生ダンプはマニフェストと障害情報のみを含みます。'};
+    const LIMIT=2_000_000;
+    const evidence={schema:'layla-talking-story-recovery-raw',sqliteError:sqlProblem,
+      rawManifest:rawEvidence,activeManifest:manifest,limitChars:LIMIT,
+      notice:'救出時のメモリ保護のため、現在の本文JSONチャンクを先頭から最大200万文字だけ含めます。欠落・破損したチャンクは除外せず理由を記録します。'};
+    if(fallback?.state){
+      evidence.indexedDbStatus={pending:fallback.pending,at:fallback.at,rev:fallback.rev};
+      try{evidence.indexedDbRawPrefix=JSON.stringify(fallback.state).slice(0,100_000);}
+      catch(e){evidence.indexedDbError=String(e.message||e);}
+    }
+    const current=manifest||(()=>{try{return JSON.parse(rawEvidence);}catch{return null;}})();
+    if(Array.isArray(current?.parts)&&typeof sql==='function'){
+      const found=[],errors=[];let total=0;
+      for(const key of current.parts){
+        if(total>=LIMIT)break;
+        try{
+          const part=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]))[0]?.v;
+          if(typeof part!=='string')throw Error('チャンクが欠落しています');
+          found.push(part.slice(0,LIMIT-total));total+=Math.min(part.length,LIMIT-total);
+        }catch(e){errors.push({key,error:String(e.message||e)});}
+      }
+      evidence.activeRootRawPrefix=found.join('');
+      evidence.activeRootTruncated=total>=LIMIT;
+      evidence.chunkErrors=errors;
+    }else evidence.notice+=' ACTIVEを解析できず本編チャンクを特定できません。';
     return JSON.stringify(evidence);
   }
-  if(safeFastForward&&idbValid?.value){
+  if(safeFastForward&&cleanIdb){
     try{
       // No concurrent SQLite edits: advance the pending IDB changes safely.
       await checkpoint(sqlSnapshot.validated.value,'IndexedDB自動復旧前のSQLite');
@@ -427,7 +508,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     get recoveryRequired(){return recoveryRequired;},get hasStorage(){return Boolean(sqlAvailable||idb);},
     mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},
     recoveryInfo:()=>({sqlite:sqlSnapshot?.validated.value?{title:sqlSnapshot.validated.value.title,chars:sqlSnapshot.validated.value.body.length,at:sqlSnapshot.validated.value.updatedAt,turns:sqlSnapshot.validated.value.turns.length}:null,idb:idbValid?.value?{title:idbValid.value.title,chars:idbValid.value.body.length,at:idbValid.value.updatedAt,turns:idbValid.value.turns.length}:null}),
-    save,checkpoint,checkpoints,chooseRecovery,allowImportRecovery,rawDump,
+    save,checkpoint,checkpoints,checkpointList,loadCheckpoint,chooseRecovery,allowImportRecovery,rawDump,
     flush:()=>new Promise((resolve,reject)=>{
       if(!working&&queued===null)return resolve();
       const wait=()=>{

@@ -161,3 +161,43 @@ test('switching story forks keeps sampler preferences global',()=>{
   const inherited=switchBranch(fork,'main',{inheritLore:true});
   assert.equal(inherited.memory,fork.memory);
 });
+
+
+test('legacy v1 turns without offsets are corrected before rebuilding hashes',async()=>{
+  const {reconcileBodyEdit}=await import('../src/branches.js');
+  const s=story(),original=timeline(s);
+  s.turns=s.turns.map((t,i)=>{
+    const v={...t,reply:original[i].reply};
+    delete v.bodyStart;delete v.bodyEnd;
+    return v;
+  });
+  const edited=reconcileBodyEdit(s,s.body.replace('ふたりは教室へ向かった。','ふたりはゆっくり教室へ向かった。'));
+  assert.equal(timeline(edited).length,3);
+  assert.ok(Number.isInteger(edited.turns[0].bodyStart));
+  assert.equal(timeline(edited)[1].reply,'ふたりはゆっくり教室へ向かった。');
+});
+
+test('inserting at reply start, end, and last end stays inside a turn',async()=>{
+  const {reconcileBodyEdit}=await import('../src/branches.js');
+  const s=story(),p=timeline(s);
+  const atEnd=reconcileBodyEdit(s,s.body.slice(0,p[0].end)+'追記'+s.body.slice(p[0].end));
+  assert.ok(timeline(atEnd)[0].reply.endsWith('追記'));
+  const atStart=reconcileBodyEdit(s,s.body.slice(0,p[1].start)+'冒頭'+s.body.slice(p[1].start));
+  assert.ok(timeline(atStart)[1].reply.startsWith('冒頭'));
+  const final=reconcileBodyEdit(s,s.body+'末尾を追加');
+  assert.ok(timeline(final)[2].reply.endsWith('末尾を追加'));
+});
+
+test('30 archived branches allow repeated safe undo without stale state.undo',async()=>{
+  const {rewindLastWithoutFork}=await import('../src/branches.js');
+  let s=story();
+  s.branches=Array.from({length:30},(_,i)=>({id:'arch'+i,name:'古い展開'+i}));
+  s.undo=null;
+  const first=rewindLastWithoutFork(s);
+  assert.equal(first.turns.length,2);
+  assert.equal(first.branches.length,30);
+  const second=rewindLastWithoutFork(first);
+  assert.equal(second.turns.length,1);
+  assert.equal(timeline(second).length,1);
+  assert.equal(s.turns.length,3);
+});

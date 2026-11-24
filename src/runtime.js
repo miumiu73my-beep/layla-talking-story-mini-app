@@ -4,8 +4,8 @@ export function makeRuntime({sdk}={}){
   if(sdk===undefined){try{sdk=new LaylaSDK();}catch{sdk=null;}}
   return {
     sdk,
-    db:sdk.db,
-    utils:sdk.utils,
+    db:sdk?.db??null,
+    utils:sdk?.utils??null,
     available:()=>Boolean(sdk?.chat?.completions?.stream),
     generate({messages,params,onText,onError}){
       if(typeof sdk?.chat?.completions?.stream!=='function')throw Error('LaylaのLLMブリッジを利用できません。');

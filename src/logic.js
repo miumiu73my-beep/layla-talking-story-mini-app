@@ -183,7 +183,7 @@ export function buildRequest(state,userText){
   let userHistory=recent.map((v,i)=>String(i+1)+'. '+v.slice(0,300)).join('\n');
   userHistory=safeTail(userHistory,Math.min(700,Math.floor(available*0.15)));
   available=Math.max(0,available-userHistory.length);
-  const bodyReserve=d.body?Math.min(p.contextChars,Math.floor(available*0.40)):0;
+  const bodyReserve=d.body?Math.min(d.body.length,p.contextChars,Math.floor(available*0.40)):0;
   let remaining=Math.max(0,available-bodyReserve);
   const sections=[
     ['ユーザーの役割','player',false],

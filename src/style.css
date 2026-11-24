@@ -70,3 +70,10 @@ input.modal-editor{min-height:0;height:45px}
 header .status{max-height:34px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 #modal .modal-validation{margin-top:8px}
 @media(max-width:500px){#safety{margin:4px 10px 10px;max-height:108px}}
+
+/* Keep full error details readable, but avoid using the entire keyboard viewport. */
+header .status.error{
+  white-space:normal;overflow-y:auto;text-overflow:clip;max-height:84px;
+  overflow-wrap:anywhere;
+}
+#open-export-manual{display:block;margin:2px auto 6px;max-width:calc(100% - 24px)}

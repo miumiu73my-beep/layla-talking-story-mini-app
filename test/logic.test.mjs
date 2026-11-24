@@ -122,3 +122,14 @@ test('compact shared-prefix JSON round trips with legacy format retained',async(
   assert.equal(reloaded.branches[3].body,s.branches[3].body);
   assert.equal(parseImport('old.json',full,freshState()).state.body,s.body);
 });
+
+
+test('short body never wastes 40 percent of budget on nonexistent prose',()=>{
+  const bare=freshState();bare.prefs.contextTokens=4096;
+  bare.characters='キ'.repeat(1800);bare.rules='ル'.repeat(900);
+  const without=buildRequest(bare,'続けて');
+  const withShort=buildRequest({...bare,body:'短'.repeat(100)},'続けて');
+  const omitted=m=>m.meta.omitted.reduce((n,v)=>n+v.omitted,0);
+  assert.ok(omitted(withShort)-omitted(without)<260);
+  assert.equal(withShort.meta.bodyOmitted,0);
+});
