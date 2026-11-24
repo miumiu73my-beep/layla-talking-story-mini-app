@@ -162,7 +162,8 @@ export function samplerParams(prefs){
 }
 export function buildRequest(state,userText){
   const d=cleanState({...state,branches:[]}),p=d.prefs;
-  const outputTokens=Number(p.max_tokens)||Math.min(4096,Math.ceil(p.targetChars*2.2)+128);
+  const desiredTokens=Number(p.max_tokens)||Math.min(4096,Math.ceil(p.targetChars*2.2)+128);
+  const outputTokens=Math.max(128,Math.min(desiredTokens,Math.floor(p.contextTokens/2)));
   const inputBudget=Math.max(600,Math.floor((p.contextTokens-Math.min(outputTokens,Math.floor(p.contextTokens*0.5))-160)*0.66));
   const input=String(userText||'').slice(0,6000);
   const directives=[
@@ -172,13 +173,17 @@ export function buildRequest(state,userText){
     '[見出し:項目≡<内容>] は人物・設定の項目と値を意味する記法です。記法自体は本文に出力しません。',
     '前のターンの描写や同じ表現を繰り返さず、過度に類似する返答を避けてください。',
     '展開速度：'+p.pace+'。視点：'+p.pov+'。生成の目安：約'+p.targetChars+'文字。',
-    '保存済みの確定本文が正本です。過去の会話履歴の本文は二重送信しません。',
-    p.includeInput?'入力されたユーザーの台詞や行動は、自然な本文に反映してください。':'ユーザーの入力は次の展開のきっかけとして扱い、入力文の直接反復は控えてください。'
+    p.includeInput?'今回の入力にあるユーザー自身の言葉や行動だけを必要に応じて本文へ自然に反映する。入力に無い新たなユーザーの発言・行動・内心は創作しない。':'ユーザーの入力内容は事実として引き継ぎ、直接の繰り返しを避けて反応と展開を書く。入力に無いユーザーの言葉や行動は創作しない。'
   ].join('\n');
   const final='今回の入力：\n'+input+'\n\n【最重要】ユーザー本人の新しい台詞・行動・内心を代筆しない。禁止ワード・展開を守る。設定記法を出力しない。物語本文のみ続ける。';
   let available=Math.max(150,inputBudget-directives.length-final.length-200);
-  const allocations=[];
-  const bodyReserve=d.body?Math.min(p.contextChars,Math.floor(available*0.30)):0;
+  // Keep previous USER intentions without re-sending assistant prose or stacking user roles.
+  // The root body is still the authoritative narrative.
+  const recent=d.turns.slice(-5).map(t=>t.user.trim()).filter(Boolean);
+  let userHistory=recent.map((v,i)=>String(i+1)+'. '+v.slice(0,300)).join('\n');
+  userHistory=safeTail(userHistory,Math.min(700,Math.floor(available*0.15)));
+  available=Math.max(0,available-userHistory.length);
+  const bodyReserve=d.body?Math.min(p.contextChars,Math.floor(available*0.40)):0;
   let remaining=Math.max(0,available-bodyReserve);
   const sections=[
     ['ユーザーの役割','player',false],
@@ -191,21 +196,27 @@ export function buildRequest(state,userText){
     ['あらすじ','synopsis',false],
     ['物語のゴール','goal',false]
   ];
-  const nonempty=sections.filter(([,k])=>d[k].trim());
-  // Cap each segment fairly so no single enormous character-book crowds out memory.
-  for(const [name,key,latest] of nonempty){
-    const share=Math.floor(remaining/Math.max(1,nonempty.length-allocations.length));
-    const quota=Math.min(remaining,Math.max(0,share));
-    let value=latest?safeTail(d[key],quota):d[key].slice(0,quota);
-    if(value.length>d[key].length)value=d[key];
-    if(d[key].length>value.length)allocations.push({key,omitted:d[key].length-value.length});
-    else allocations.push({key,omitted:0});
-    remaining-=value.length;
-    allocations[allocations.length-1].text=value;
-    allocations[allocations.length-1].title=name;
+  const entries=sections.filter(([,key])=>d[key].trim()).map(([title,key,latest])=>({
+    title,key,latest,quota:0,length:d[key].length
+  }));
+  // Water filling: short fields free their unused share for longer ones.
+  let active=entries.filter(e=>e.length);
+  while(remaining>0&&active.length){
+    const share=Math.max(1,Math.floor(remaining/active.length));
+    for(const item of active){
+      if(remaining===0)break;
+      const take=Math.min(remaining,share,item.length-item.quota);
+      item.quota+=take;remaining-=take;
+    }
+    active=active.filter(e=>e.quota<e.length);
   }
-  let body=safeTail(d.body,bodyReserve+remaining);
+  const allocations=entries.map(e=>({
+    title:e.title,key:e.key,omitted:e.length-e.quota,
+    text:e.latest?safeTail(d[e.key],e.quota):d[e.key].slice(0,e.quota)
+  }));
+  const body=safeTail(d.body,Math.min(p.contextChars,bodyReserve+remaining));
   const parts=allocations.filter(a=>a.text).map(a=>'【'+a.title+'】\n'+a.text);
+  if(userHistory)parts.push('【直近のユーザー入力・行動（すでに確定済み。返信本文は確定本文にあります）】\n'+userHistory);
   if(body)parts.push('【確定本文の末尾】\n'+body);
   else parts.push('【開始場面】\nまだ本文がありません。今回の入力と設定に合った物語の導入を描写してください。');
   const system=directives+'\n\n'+parts.join('\n\n');
@@ -221,6 +232,7 @@ export function buildMessages(state,userText){return buildRequest(state,userText
 export function acceptTurn(state,candidate){
   const d=cleanState({...state,branches:[]}),text=String(candidate?.text||'').trim();
   if(!text)throw Error('候補が空です。');
+  if(d.turns.length>=20000)throw Error('履歴が20,000ターンの上限に達しました。外部JSONへ保存して整理してください。');
   const input=String(candidate.user||'');
   const prefix=d.body?'\n\n':'';
   if(d.body.length+prefix.length+text.length>BODY_LIMIT)throw Error('本文の入力上限を超えています。先にJSONを保存してください。');

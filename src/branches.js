@@ -105,7 +105,7 @@ export function regenerateAt(state,index){
   next.draft=old.user;
   return next;
 }
-export function switchBranch(state,id){
+export function switchBranch(state,id,{inheritLore=false}={}){
   const s=cleanState(state);
   if(id===s.activeBranch.id)return s;
   const i=s.branches.findIndex(b=>b.id===id);
@@ -115,6 +115,9 @@ export function switchBranch(state,id){
   const next={...s,branches:[...s.branches.slice(0,i),...s.branches.slice(i+1),archivedCurrent],
     activeBranch:branchMeta(target)};
   for(const key of SNAPSHOT_FIELDS)next[key]=copy(target[key]);
+  // Sampler and model notes belong to the device/model, not one story fork.
+  next.prefs=copy(s.prefs);next.modelNote=s.modelNote;
+  if(inheritLore)for(const key of ['characters','world','memory','player'])next[key]=s[key];
   return cleanState(next);
 }
 export function renameBranch(state,id,name){
@@ -135,4 +138,50 @@ export function deleteInactiveBranch(state,id){
   if(!s.branches.some(b=>b.id===id))throw Error('分岐が見つかりません。');
   s.branches=s.branches.filter(b=>b.id!==id);
   return s;
+}
+
+
+// Reconcile a normal single-range direct text edit with per-turn offsets.
+// Only resync when the change is confined to one reply or to material outside
+// replies; multi-turn replacements must go through explicit history reset.
+export function reconcileBodyEdit(state,nextBody){
+  const d=cleanState(state),newBody=String(nextBody);
+  const positions=timeline(d),oldBody=d.body;
+  let left=0,right=0;
+  while(left<oldBody.length&&left<newBody.length&&oldBody[left]===newBody[left])left++;
+  while(right<oldBody.length-left&&right<newBody.length-left&&
+    oldBody[oldBody.length-1-right]===newBody[newBody.length-1-right])right++;
+  const oldEnd=oldBody.length-right,newEnd=newBody.length-right;
+  const delta=newBody.length-oldBody.length;
+  const changed=positions.filter(p=>
+    (left===oldEnd ? left>p.start&&left<p.end : left<p.end&&oldEnd>p.start));
+  if(changed.length>1)throw Error('複数のターンにまたがる編集です。本文は保持しますが、履歴の再同期が必要です。');
+  const change=changed[0]||null;
+  if(change&&(left<change.start||oldEnd>change.end))
+    throw Error('本文のターン境界にまたがる編集です。履歴の再同期が必要です。');
+  d.body=newBody;
+  d.turns=d.turns.map((t,i)=>{
+    const original=positions[i],copyTurn={...t};
+    if(change?.index===i){
+      copyTurn.bodyEnd=original.end+delta;
+    }else if(original.start>=oldEnd){
+      copyTurn.bodyStart=original.start+delta;
+      copyTurn.bodyEnd=original.end+delta;
+    }
+    const updated=d.body.slice(copyTurn.bodyStart,copyTurn.bodyEnd);
+    if(change?.index===i){
+      copyTurn.preview=updated.slice(0,240);
+      copyTurn.replyHash=bodyFingerprint(updated);
+      if(typeof copyTurn.reply==='string')copyTurn.reply=updated; // old v1 compatibility
+    }
+    return copyTurn;
+  });
+  d.undo=null;
+  timeline(d);
+  return d;
+}
+export function clearHistoryAgainstBody(state){
+  const d=cleanState(state);
+  d.turns=[];d.undo=null;d.pendingCandidate=null;
+  return d;
 }
