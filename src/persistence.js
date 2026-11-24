@@ -44,7 +44,8 @@ function browserIdb(){
       const db=req.result;
       resolve({
         get(key){return new Promise((ok,no)=>{const r=db.transaction('snapshots','readonly').objectStore('snapshots').get(key);r.onsuccess=()=>ok(r.result||null);r.onerror=()=>no(r.error);});},
-        put(key,val){return new Promise((ok,no)=>{const t=db.transaction('snapshots','readwrite');t.objectStore('snapshots').put(val,key);t.oncomplete=ok;t.onerror=()=>no(t.error);t.onabort=()=>no(t.error);});}
+        put(key,val){return new Promise((ok,no)=>{const t=db.transaction('snapshots','readwrite');t.objectStore('snapshots').put(val,key);t.oncomplete=ok;t.onerror=()=>no(t.error);t.onabort=()=>no(t.error);});},
+        delete(key){return new Promise((ok,no)=>{const t=db.transaction('snapshots','readwrite');t.objectStore('snapshots').delete(key);t.oncomplete=ok;t.onerror=()=>no(t.error);t.onabort=()=>no(t.error);});}
       });
     };
     req.onerror=()=>reject(req.error);
@@ -326,6 +327,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       await idb.put('checkpoint-data/'+id,raw);
       const list=(await idb.get('checkpoint-index'))||[];
       await idb.put('checkpoint-index',[entry,...list].slice(0,8));
+      for(const old of list.slice(7))if(typeof idb.delete==='function')
+        try{await idb.delete('checkpoint-data/'+old.id);}catch(e){notify('古いIndexedDB復元点の清掃を延期します: '+e.message,true);}
       return;
     }
     throw sqlFailure||Error('復元点を保存できません。');
@@ -373,13 +376,14 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         reason:entry.reason||'IndexedDB復元点'});
       // Legacy backup is stored in one IDB array; read it only if newer index
       // is absent. It cannot be indexed without accessing that legacy value.
-      if(!indexed?.length){
-        const legacy=await idb.get('checkpoints');
-        for(let i=0;i<(legacy||[]).length;i++){
-          const entry=legacy[i];
-          all.push({id:'legacy-idb/'+i,at:entry.at,title:entry.title,chars:entry.chars,
-            reason:entry.reason||'旧IndexedDB復元点'});
-        }
+      // Old IDB checkpoints must remain visible even after a newer checkpoint
+      // has created the lightweight metadata index. Legacy storage is read only
+      // here; new checkpoint bodies are never eagerly fetched.
+      const legacy=await idb.get('checkpoints');
+      for(let i=0;i<(legacy||[]).length;i++){
+        const entry=legacy[i];
+        all.push({id:'legacy-idb/'+i,at:entry.at,title:entry.title,chars:entry.chars,
+          reason:entry.reason||'旧IndexedDB復元点'});
       }
     }catch(e){notify('IndexedDB復元点の一覧を読み込めません: '+e.message,true);}
     return all.sort((a,b)=>b.at-a.at).slice(0,12);

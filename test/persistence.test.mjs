@@ -313,3 +313,17 @@ test('raw dump contains bounded raw active manuscript even when checksum fails',
   assert.ok(dump.activeRootRawPrefix.includes('救出すべき原稿'));
   assert.ok(dump.activeRootRawPrefix.length<=2000000);
 });
+
+test('legacy IndexedDB checkpoints remain selectable after new metadata index exists',async()=>{
+  const original=freshState();original.body='旧復元点に残った原稿';
+  const older={at:100,title:original.title,chars:original.body.length,data:JSON.stringify(original)};
+  const idb=fakeIdb({checkpoints:[older]});
+  const st=await openStore({},()=>{},{idbFactory:idb.factory});
+  const updated={...original,body:'現在の原稿'};
+  await st.checkpoint(updated,'新式チェックポイント');
+  const list=await st.checkpointList();
+  assert.ok(list.some(x=>x.id==='legacy-idb/0'));
+  assert.ok(list.some(x=>x.reason==='新式チェックポイント'));
+  const restored=await st.loadCheckpoint('legacy-idb/0');
+  assert.equal(restored.body,original.body);
+});
