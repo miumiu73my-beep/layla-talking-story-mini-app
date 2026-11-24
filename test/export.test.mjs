@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {filename,writeFile} from '../src/export.js';
+import {filename,writeFile,utf8ToBase64} from '../src/export.js';
 test('filename uses local date including milliseconds and excludes dangerous characters',()=>{
   const d=new Date(2026,10,24,0,4,5,678);
   assert.equal(filename('   ','json',d),'story_20261124-000405678.json');
@@ -48,4 +48,9 @@ test('native no-result cannot be reported as verified success',async()=>{
   const result=await writeFile(host,'story.json','{}','application/json');
   assert.equal(result.kind,'unconfirmed');
   assert.match(result.message,/保存結果が返っていません/);
+});
+
+test('UTF-8 Base64 conversion survives chunk boundaries and supplementary characters',()=>{
+  const text='🌸一歌海'.repeat(8000)+'終';
+  assert.equal(Buffer.from(utf8ToBase64(text),'base64').toString('utf8'),text);
 });

@@ -11,6 +11,7 @@ let state=freshState(),store=null,ready=false,saveBlocked=true,busy=false,stream
 let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning='',notice='',lastAcceptedMessage='';
 let lastExport=null,pendingBodyEdit=null,bodyEditTimer=null;
 let historyOffset=0,branchBusy=false,bodyBackupBusy=false,editRev=0,savedRev=0,stopUntil=0,retryFallback=null;
+let activeGenerationFinished=null,stopUnconfirmed=false;
 const HISTORY_PAGE_SIZE=30;
 const promptDraft=()=>state.draft.trim()||'この場面を自然に続きを進める';
 function status(text,error=false){
@@ -246,7 +247,7 @@ function rebuildSettings(){
   selectPref(basic,'pov','物語の視点',['ユーザー視点（二人称寄り）','相手キャラの一人称','三人称（客観）']);
   pref.append(basic);
   const checks=node('div','');
-  [['autoAdopt','正常生成時は自動採用する（既定OFF）'],['includeInput','ユーザーの入力を自然に物語へ反映させる'],['recordInputInBody','ユーザーの入力原文を確定本文にも併記する（既定OFF）']].forEach(([key,label])=>{
+  [['autoAdopt','正常生成時は自動採用する（既定OFF）'],['includeInput','生成AIにも入力内容を描写させる（本文併記OFF時）'],['recordInputInBody','ユーザーの入力原文を確定本文にも併記する（既定OFF）']].forEach(([key,label])=>{
     const wrap=node('label','checkline'),box=node('input');box.type='checkbox';box.checked=state.prefs[key]===true;
     box.onchange=()=>{state.prefs[key]=box.checked;persist();schedulePromptMeta();};wrap.append(box,document.createTextNode(label));checks.append(wrap);
   });checks.append(node('p','hint','「本文にも併記」をONにすると、採用時にあなたが書いた台詞・行動をそのまま本文へ追加します。生成済みの過去ターンは書き換えません。'));pref.append(checks);
@@ -348,7 +349,11 @@ async function useCandidate(){
 }
 async function startGeneration({retry=false,inputOverride=null}={}){
   if(busy||bodyBackupBusy||saveBlocked||!ready)return;
-  if(Date.now()<stopUntil){status('前の生成の停止処理中です。数秒後にもう一度操作してください。',true);return;}
+  if(Date.now()<stopUntil){status('前の生成が停止したことを確認中です。終了確認後に再生成できます。',true);return;}
+  if(stopUnconfirmed){
+    if(await modal('前の生成は停止指示を送りましたが、Laylaから停止完了の応答を確認できませんでした。モデルがまだ生成中の場合、再生成すると競合する可能性があります。続行しますか？')!=='yes')return;
+    stopUnconfirmed=false;
+  }
   if(candidate&&retry&&candidate.text?.trim()){
     if(await modal('今の候補は保存されていません。破棄してもう一度生成しますか？')!=='yes')return;
   }
@@ -378,7 +383,8 @@ async function startGeneration({retry=false,inputOverride=null}={}){
       },onError:error=>{if(canUpdate())status('生成エラー: '+String(error?.message||error),true);}
     });
     activeStop=()=>stopResolver({kind:'stopped'});
-    const result=await Promise.race([stream.final().then(value=>({kind:'done',value}),error=>({kind:'error',error})),aborted]);
+    activeGenerationFinished=Promise.resolve(stream.final()).then(value=>({kind:'done',value}),error=>({kind:'error',error}));
+    const result=await Promise.race([activeGenerationFinished,aborted]);
     if(!canUpdate())return;
     if(result.kind==='stopped'){
       candidate.note='停止しました。途中までの文章を確認して採用できます。';
@@ -405,16 +411,17 @@ async function startGeneration({retry=false,inputOverride=null}={}){
     }else candidate.note='生成エラーで途中停止しました。途中までの文章を確認してください。';
     status('生成に失敗しました: '+err+'。詳細生成設定を空欄に戻してお試しください。',true);persist(0);
   }finally{
-    if(thisId===activeId){finished=true;busy=false;stream=null;activeStop=null;lockUI();showCandidate();}
+    if(thisId===activeId){finished=true;busy=false;stream=null;activeStop=null;activeGenerationFinished=null;lockUI();showCandidate();}
   }
 }
 let activeStop=null;
 function stopGeneration(){
   if(!busy)return;
-  try{stream?.abort();}catch{}
-  stopUntil=Date.now()+1800;
-  setTimeout(()=>lockUI(),1850);
-  activeId++; // Ignore late stream callbacks from the cancelled generation.
+  const finalizing=activeGenerationFinished;
+  const requestedAt=Date.now();
+  const stopMarker=++activeId;
+  try{stream?.abort();}catch(e){status('停止指示のエラー: '+String(e.message||e),true);}
+  stopUntil=requestedAt+5000; // Ignore late stream callbacks and earlier stop confirmations.
   busy=false;stream=null;lockUI();
   let retryFallbackWasUsed=false;
   if(!candidate?.text?.trim()){
@@ -428,7 +435,19 @@ function stopGeneration(){
   }
   state.pendingCandidate=candidate;showCandidate();persist(0);
   if(typeof activeStop==='function'){const cancel=activeStop;activeStop=null;cancel();}
-  status('停止しました。');
+  status('停止指示を送信しました。Laylaの終了応答を確認中です。');
+  let released=false;
+  const release=confirmed=>{
+    if(released||stopMarker!==activeId)return;
+    released=true;stopUntil=0;activeGenerationFinished=null;
+    stopUnconfirmed=!confirmed;lockUI();
+    status(confirmed?'Laylaから生成終了の応答を確認しました。':
+      '停止完了を確認できませんでした。モデルが推論中の可能性があります。再生成には確認が必要です。',!confirmed);
+  };
+  if(finalizing){
+    Promise.resolve(finalizing).then(()=>setTimeout(()=>release(true),Math.max(0,requestedAt+750-Date.now())));
+  }
+  setTimeout(()=>release(false),5000);
 }
 async function exportAs(ext){
   if(!ready)return;
