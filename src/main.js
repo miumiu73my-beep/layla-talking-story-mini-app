@@ -246,10 +246,10 @@ function rebuildSettings(){
   selectPref(basic,'pov','物語の視点',['ユーザー視点（二人称寄り）','相手キャラの一人称','三人称（客観）']);
   pref.append(basic);
   const checks=node('div','');
-  [['autoAdopt','正常生成時は自動採用する（既定OFF）'],['includeInput','ユーザーの入力を自然に物語へ反映させる']].forEach(([key,label])=>{
+  [['autoAdopt','正常生成時は自動採用する（既定OFF）'],['includeInput','ユーザーの入力を自然に物語へ反映させる'],['recordInputInBody','ユーザーの入力原文を確定本文にも併記する（既定OFF）']].forEach(([key,label])=>{
     const wrap=node('label','checkline'),box=node('input');box.type='checkbox';box.checked=state.prefs[key]===true;
     box.onchange=()=>{state.prefs[key]=box.checked;persist();schedulePromptMeta();};wrap.append(box,document.createTextNode(label));checks.append(wrap);
-  });pref.append(checks);
+  });checks.append(node('p','hint','「本文にも併記」をONにすると、採用時にあなたが書いた台詞・行動をそのまま本文へ追加します。生成済みの過去ターンは書き換えません。'));pref.append(checks);
   const detail=node('details');detail.append(node('summary','','詳細な生成設定（対応はLayla本体によります）'));
   const grid=node('div','formgrid');
   [['temperature','temperature',0,2,.05],['top_p','top_p',0,1,.05],['top_k','top_k',1,200,1],
@@ -314,7 +314,10 @@ function updatePromptMeta(){
   const m=buildRequest(state,promptDraft()).meta;
   el('prompt-meta').textContent='送信予算の目安：約'+m.estimatedTokens+'トークン／設定コンテキスト'+m.contextTokens+
     '（出力予約'+m.outputTokens+'）。省略した項目：'+(m.omitted.length?m.omitted.map(x=>x.title).join('、'):'なし')+
-    '。本文の古い部分：'+m.bodyOmitted+'文字省略。※推定値であり実モデルのトークン化とは異なります。';
+    '。本文の古い部分：'+m.bodyOmitted+'文字省略。'+
+    (m.outputCapped?'指定max_tokensはコンテキスト長の半分以下へ制限します。':'')+
+    (m.outputTooShort?'生成の目安に対して出力トークン数が少なめです。文が途中で切れる場合は設定を見直してください。':'')+
+    '※推定値であり実モデルのトークン化とは異なります。';
 }
 function modal(question,choices=[['yes','続行'],['no','キャンセル']]){
   return new Promise(resolve=>{
@@ -440,7 +443,7 @@ async function exportAs(ext){
     const result=await writeFile(host,name,content,mime);
     lastExport={name,text:content,mime};
     el('open-export-manual').hidden=false;
-    status((backupSizeWarning?backupSizeWarning+'／':'')+result.message,tooLarge||result.kind==='manual');
+    status((backupSizeWarning?backupSizeWarning+'／':'')+result.message,tooLarge||result.kind==='manual'||result.kind==='unconfirmed');
     if(result.kind==='manual'){
       el('manual-export').hidden=false;el('manual-name').textContent=name;
       el('manual-text').value=result.text;el('download-manual').dataset.name=name;

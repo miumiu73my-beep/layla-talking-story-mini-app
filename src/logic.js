@@ -29,7 +29,7 @@ export function freshState(){
     body:'',turns:[],draft:'',pendingCandidate:null,undo:null,
     activeBranch:{id:'main',name:'本編',createdAt:new Date().toISOString(),parentId:null,forkTurn:null},branches:[],
     prefs:{targetChars:300,contextChars:3600,contextTokens:8192,pace:'普通',
-      pov:'ユーザー視点（二人称寄り）',autoAdopt:false,includeInput:true,
+      pov:'ユーザー視点（二人称寄り）',autoAdopt:false,includeInput:true,recordInputInBody:false,
       temperature:'',top_p:'',top_k:'',min_p:'',repeat_penalty:'',
       repeat_last_n:'',repeat_penalty_slope:'',frequency_penalty:'',
       presence_penalty:'',max_tokens:''}};
@@ -59,6 +59,7 @@ export function cleanState(raw){
       if(Number.isSafeInteger(t.bodyStart))u.bodyStart=t.bodyStart;
       if(Number.isSafeInteger(t.bodyEnd))u.bodyEnd=t.bodyEnd;
       if(typeof t.replyHash==='string')u.replyHash=t.replyHash;
+      if(typeof t.userPrelude==='string')u.userPrelude=t.userPrelude;
       return u;
     });
   }
@@ -89,6 +90,7 @@ export function cleanState(raw){
   d.prefs.contextTokens=bound(d.prefs.contextTokens,2048,65536,8192);
   d.prefs.autoAdopt=d.prefs.autoAdopt===true;
   d.prefs.includeInput=d.prefs.includeInput!==false;
+  d.prefs.recordInputInBody=d.prefs.recordInputInBody===true;
   if(!['ゆっくり','普通','速め'].includes(d.prefs.pace))d.prefs.pace='普通';
   const views=['ユーザー視点（二人称寄り）','相手キャラの一人称','三人称（客観）'];
   const oldView={'二人称寄り':views[0],'一人称':views[1],'三人称':views[2]};
@@ -163,7 +165,7 @@ export function samplerParams(prefs){
 export function buildRequest(state,userText){
   const d=cleanState({...state,branches:[]}),p=d.prefs;
   const desiredTokens=Number(p.max_tokens)||Math.min(4096,Math.ceil(p.targetChars*2.2)+128);
-  const outputTokens=Math.max(128,Math.min(desiredTokens,Math.floor(p.contextTokens/2)));
+  const outputTokens=Math.max(1,Math.min(desiredTokens,Math.floor(p.contextTokens/2)));
   const inputBudget=Math.max(600,Math.floor((p.contextTokens-Math.min(outputTokens,Math.floor(p.contextTokens*0.5))-160)*0.66));
   const input=String(userText||'').slice(0,6000);
   const directives=[
@@ -173,7 +175,7 @@ export function buildRequest(state,userText){
     '[見出し:項目≡<内容>] は人物・設定の項目と値を意味する記法です。記法自体は本文に出力しません。',
     '前のターンの描写や同じ表現を繰り返さず、過度に類似する返答を避けてください。',
     '展開速度：'+p.pace+'。視点：'+p.pov+'。生成の目安：約'+p.targetChars+'文字。',
-    p.includeInput?'今回の入力にあるユーザー自身の言葉や行動だけを必要に応じて本文へ自然に反映する。入力に無い新たなユーザーの発言・行動・内心は創作しない。':'ユーザーの入力内容は事実として引き継ぎ、直接の繰り返しを避けて反応と展開を書く。入力に無いユーザーの言葉や行動は創作しない。'
+    p.recordInputInBody?'ユーザー入力はアプリ側で確定本文へ原文を追加します。あなたは入力文を繰り返さず、他の人物の反応と物語の続きを描写してください。入力されていない本人の台詞・行動・内心は創作しないでください。':p.includeInput?'今回の入力でユーザーが実際に記載した言葉・行動だけを本文へ必要に応じて自然に含めてください。記載のない本人の台詞・行動・内心は加えないでください。':'今回の入力内容を確定した事実として扱い、本人の入力を長々と繰り返さず相手の反応から描写してください。記載のない本人の台詞・行動・内心は創作しないでください。'
   ].join('\n');
   const final='今回の入力：\n'+input+'\n\n【最重要】ユーザー本人の新しい台詞・行動・内心を代筆しない。禁止ワード・展開を守る。設定記法を出力しない。物語本文のみ続ける。';
   let available=Math.max(150,inputBudget-directives.length-final.length-200);
@@ -225,7 +227,9 @@ export function buildRequest(state,userText){
     meta:{characters:system.length+final.length,estimatedTokens:Math.ceil((system.length+final.length)/0.66),
       contextTokens:p.contextTokens,outputTokens,omitted:allocations.filter(a=>a.omitted>0),
       bodyOmitted:Math.max(0,d.body.length-body.length),
-      overBudget:system.length+final.length>inputBudget}
+      overBudget:system.length+final.length>inputBudget,
+      outputCapped:desiredTokens>outputTokens,
+      outputTooShort:outputTokens<Math.ceil(p.targetChars*1.5)}
   };
 }
 export function buildMessages(state,userText){return buildRequest(state,userText).messages;}
@@ -234,12 +238,19 @@ export function acceptTurn(state,candidate){
   if(!text)throw Error('候補が空です。');
   if(d.turns.length>=20000)throw Error('履歴が20,000ターンの上限に達しました。外部JSONへ保存して整理してください。');
   const input=String(candidate.user||'');
+  const synthetic=input.trim()==='この場面を自然に続きを進める'&&!String(candidate.sourceDraft||'').trim();
+  const prelude=d.prefs.recordInputInBody&&!synthetic&&input.trim()
+    ?'【あなたの入力】\n'+input.trim()+'\n\n':'';
   const prefix=d.body?'\n\n':'';
-  if(d.body.length+prefix.length+text.length>BODY_LIMIT)throw Error('本文の入力上限を超えています。先にJSONを保存してください。');
-  const before=d.body, beforeTurns=d.turns.length;
-  d.body+=prefix+text;
-  d.turns.push({user:input,preview:text.slice(0,240),replyHash:bodyFingerprint(text),at:new Date().toISOString(),bodyStart:before.length+prefix.length,bodyEnd:d.body.length});
-  d.undo={beforeLength:before.length,added:prefix+text,afterHash:checksum(d.body),beforeTurns,input};
+  const bodySegment=prelude+text;
+  if(d.body.length+prefix.length+bodySegment.length>BODY_LIMIT)
+    throw Error('本文の入力上限を超えています。先にJSONを保存してください。');
+  const before=d.body,beforeTurns=d.turns.length;
+  d.body+=prefix+bodySegment;
+  d.turns.push({user:input,...(prelude?{userPrelude:prelude}:{}),
+    preview:bodySegment.slice(0,240),replyHash:bodyFingerprint(bodySegment),
+    at:new Date().toISOString(),bodyStart:before.length+prefix.length,bodyEnd:d.body.length});
+  d.undo={beforeLength:before.length,added:prefix+bodySegment,afterHash:checksum(d.body),beforeTurns,input};
   d.pendingCandidate=null;
   d.draft=d.draft===candidate.sourceDraft?'':d.draft;
   d.branches=state.branches||[];

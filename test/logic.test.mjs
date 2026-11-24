@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {FORMAT,VERSION,BODY_LIMIT,LIMITS,freshState,cleanState,warningsForState,buildRequest,buildMessages,
-  samplerParams,parseImport,readableText,acceptTurn,undoTurn} from '../src/logic.js';
+  samplerParams,parseImport,readableText,compactBackup,acceptTurn,undoTurn} from '../src/logic.js';
 
 test('existing character-book notation and plain Japanese are preserved',()=>{
   const s=freshState();s.characters='[海:名称≡<虎田海>]\n優しい人物。';
@@ -132,4 +132,34 @@ test('short body never wastes 40 percent of budget on nonexistent prose',()=>{
   const omitted=m=>m.meta.omitted.reduce((n,v)=>n+v.omitted,0);
   assert.ok(omitted(withShort)-omitted(without)<260);
   assert.equal(withShort.meta.bodyOmitted,0);
+});
+
+test('optional input-to-body preserves verbatim user action without changing old backups',()=>{
+  let s=freshState();
+  assert.equal(s.prefs.recordInputInBody,false);
+  s.prefs.recordInputInBody=true;
+  s=acceptTurn(s,{user:'明日、屋上で会おう',text:'一歌は頷いた。',sourceDraft:'明日、屋上で会おう'});
+  assert.equal(s.body,'【あなたの入力】\n明日、屋上で会おう\n\n一歌は頷いた。');
+  assert.equal(s.turns[0].userPrelude,'【あなたの入力】\n明日、屋上で会おう\n\n');
+  assert.equal(cleanState(JSON.parse(JSON.stringify(s))).turns[0].userPrelude,s.turns[0].userPrelude);
+  assert.equal(parseImport('v1.json',JSON.stringify(s),freshState()).state.body,s.body);
+  const lite=compactBackup(s);
+  assert.equal(parseImport('v2.json',lite,freshState()).state.body,s.body);
+  assert.equal(readableText(s,'txt').includes('明日、屋上で会おう'),true);
+});
+test('synthetic auto-continue prompt is never recorded as a user action',()=>{
+  let s=freshState();s.prefs.recordInputInBody=true;
+  s=acceptTurn(s,{user:'この場面を自然に続きを進める',text:'窓辺で話が続いた。',sourceDraft:''});
+  assert.equal(s.body,'窓辺で話が続いた。');
+  assert.equal(s.turns[0].userPrelude,undefined);
+});
+test('max_tokens stays within context and explicit small values stay small',()=>{
+  const s=freshState();s.prefs.contextTokens=2048;s.prefs.targetChars=1000;
+  s.prefs.max_tokens=8000;
+  const request=buildRequest(s,'続ける');
+  assert.equal(request.meta.outputTokens,1024);
+  assert.equal(request.meta.outputCapped,true);
+  s.prefs.max_tokens=40;
+  assert.equal(buildRequest(s,'続ける').meta.outputTokens,40);
+  assert.equal(buildRequest(s,'続ける').meta.outputTooShort,true);
 });

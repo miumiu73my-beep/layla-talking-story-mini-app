@@ -201,3 +201,21 @@ test('30 archived branches allow repeated safe undo without stale state.undo',as
   assert.equal(timeline(second).length,1);
   assert.equal(s.turns.length,3);
 });
+
+test('turn timeline separates user prelude from AI reply and branches safely',async()=>{
+  const {reconcileBodyEdit}=await import('../src/branches.js');
+  let s=freshState();s.prefs.recordInputInBody=true;
+  s=acceptTurn(s,{user:'手を振る',text:'一歌が微笑んだ。',sourceDraft:'手を振る'});
+  s=acceptTurn(s,{user:'近づく',text:'隣へ歩いてきた。',sourceDraft:'近づく'});
+  const positions=timeline(s);
+  assert.equal(positions[0].reply,'一歌が微笑んだ。');
+  assert.equal(positions[1].reply,'隣へ歩いてきた。');
+  const edited=reconcileBodyEdit(s,s.body.replace('一歌が微笑んだ。','一歌は嬉しそうに微笑んだ。'));
+  assert.equal(timeline(edited)[0].reply,'一歌は嬉しそうに微笑んだ。');
+  const rewound=rewindBefore(edited,1);
+  assert.equal(rewound.turns.length,1);
+  assert.ok(!rewound.body.includes('近づく'));
+  assert.ok(rewound.branches[0].body.includes('近づく'));
+  const rerendered=editReplyAt(edited,1,'一歌は手を取った。');
+  assert.ok(rerendered.body.includes('【あなたの入力】\n近づく\n\n一歌は手を取った。'));
+});

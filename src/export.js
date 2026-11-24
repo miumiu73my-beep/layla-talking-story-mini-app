@@ -21,17 +21,31 @@ export function browserDownload(name,blob){
     setTimeout(()=>URL.revokeObjectURL(url),30000);
   }
 }
+// Layla SDK's native saveFile expects *raw base64*, not a Blob or data URL.
+// Encode in blocks divisible by three to avoid corrupting base64 padding.
+export function utf8ToBase64(text){
+  const bytes=new TextEncoder().encode(text),block=24576,out=[];
+  for(let i=0;i<bytes.length;i+=block){
+    const part=bytes.subarray(i,Math.min(i+block,bytes.length));
+    const chars=new Array(part.length);
+    for(let j=0;j<part.length;j++)chars[j]=String.fromCharCode(part[j]);
+    out.push(btoa(chars.join('')));
+  }
+  return out.join('');
+}
 export async function writeFile(host,name,text,mime){
   const blob=new Blob([text],{type:mime+';charset=utf-8'});
   let reason='';
   if(typeof host?.utils?.saveFile==='function'){
     try{
-      const r=await host.utils.saveFile(name,blob,true);
-      if(r?.success||r===true||r===undefined||r===null)
+      const r=await host.utils.saveFile(name,utf8ToBase64(text),true);
+      if(r?.success===true||r===true)
         return {kind:'share',message:'Layla側で保存・共有を開始しました。「ファイル」に保存されたことを確認してください。'};
       if(r?.cancelled||/cancel|キャンセル/i.test(String(r?.message||'')))
         return {kind:'cancelled',message:'保存をキャンセルしました。'};
-      reason=String(r?.message||'Layla保存APIのエラー');
+      if(r===undefined||r===null)
+        return {kind:'unconfirmed',message:'Laylaから保存結果が返っていません。実際にファイルがあるか確認し、必要なら「共有できない場合：手動で救出」を押してください。'};
+      reason=String(r?.message||'Layla保存APIが成功を返しませんでした。');
     }catch(err){
       if(err?.name==='AbortError'||/cancel|キャンセル/i.test(String(err?.message||'')))
         return {kind:'cancelled',message:'保存をキャンセルしました。'};

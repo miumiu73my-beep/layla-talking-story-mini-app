@@ -43,7 +43,10 @@ export function timeline(state){
       throw Error('第'+(i+1)+'ターンが直接編集され、履歴と一致しません。');
     if(t.replyHash&&bodyFingerprint(content)!==t.replyHash)
       throw Error('第'+(i+1)+'ターンの本文が編集済みです。');
-    found.push({start,end:stop,user:t.user,reply:content,index:i});
+    if(t.userPrelude&&(!content.startsWith(t.userPrelude)||t.userPrelude.length>=content.length))
+      throw Error('第'+(i+1)+'ターンのユーザー入力併記部分が編集済みです。履歴を再設定してください。');
+    found.push({start,end:stop,user:t.user,reply:t.userPrelude?content.slice(t.userPrelude.length):content,
+      fullText:content,index:i});
     end=stop;
   }
   return found;
