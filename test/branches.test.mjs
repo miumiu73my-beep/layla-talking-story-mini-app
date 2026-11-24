@@ -130,3 +130,11 @@ test('branch count limit fails safely without discarding originals',()=>{
   assert.throws(()=>forkAt(s,{index:0}),/外部JSONバックアップ/);
   assert.equal(s.branches.length,MAX_ARCHIVED_BRANCHES);
 });
+
+test('old v1 backups have deterministic branch metadata for recovery comparison',()=>{
+  const s=freshState();
+  delete s.activeBranch;delete s.branches;delete s.updatedAt;
+  const first=cleanState(s),second=cleanState(s);
+  assert.deepEqual(first,second);
+  assert.equal(first.activeBranch.createdAt,'legacy-v1');
+});

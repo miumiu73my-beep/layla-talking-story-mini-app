@@ -93,6 +93,9 @@ export function cleanState(raw){
   const views=['ユーザー視点（二人称寄り）','相手キャラの一人称','三人称（客観）'];
   const oldView={'二人称寄り':views[0],'一人称':views[1],'三人称':views[2]};
   d.prefs.pov=oldView[d.prefs.pov]|| (views.includes(d.prefs.pov)?d.prefs.pov:views[0]);
+  // Old v1 backups have no branch metadata. Use a deterministic default so
+  // SQLite/IndexedDB equivalence checks do not report phantom conflicts.
+  if(raw.activeBranch===undefined||raw.activeBranch===null)d.activeBranch.createdAt='legacy-v1';
   if(raw.activeBranch!==undefined&&raw.activeBranch!==null){
     const m=raw.activeBranch;
     if(typeof m!=='object'||Array.isArray(m)||typeof m.id!=='string'||!/^[A-Za-z0-9_-]{1,100}$/.test(m.id))
@@ -122,7 +125,7 @@ export function cleanState(raw){
       return entry;
     });
   }
-  d.updatedAt=typeof raw.updatedAt==='string'?raw.updatedAt:d.updatedAt;
+  d.updatedAt=typeof raw.updatedAt==='string'?raw.updatedAt:'legacy-v1';
   return d;
 }
 export function warningsForState(data){

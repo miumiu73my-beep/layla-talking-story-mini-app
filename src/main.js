@@ -29,6 +29,7 @@ function lockUI(){
   for(const id of ['generate','new-story','restore','user-input'])
     if(el(id))el(id).disabled=disabled;
   el('nav-settings').disabled=!ready||busy||branchBusy;
+  el('nav-main').disabled=!ready||branchBusy;
   el('import').disabled=!ready||busy||branchBusy||Boolean(store?.recoveryRequired);
   if(el('recover'))el('recover').disabled=!ready||!store?.recoveryRequired;
   if(el('raw-backup'))el('raw-backup').disabled=!ready;
@@ -152,14 +153,14 @@ function showCandidate(message){
   lockUI();
 }
 function showMain(){
-  if(!ready)return;
+  if(!ready||branchBusy)return;
   el('screen-main').hidden=false;el('screen-settings').hidden=true;
   el('nav-main').classList.add('primary');el('nav-settings').classList.remove('primary');
   paint();void saveNow(); // Save immediately on navigation.
   window.scrollTo(0,0);
 }
 function showSettings(){
-  if(!ready||busy)return;
+  if(!ready||busy||branchBusy)return;
   el('screen-main').hidden=true;el('screen-settings').hidden=false;
   el('nav-main').classList.remove('primary');el('nav-settings').classList.add('primary');
   rebuildSettings();lockUI();window.scrollTo(0,0);
