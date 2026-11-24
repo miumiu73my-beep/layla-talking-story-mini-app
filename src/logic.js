@@ -27,6 +27,7 @@ export function freshState(){
     title:'新しい物語',synopsis:'',characters:'',world:'',memory:'',
     avoidPlot:'',avoidWords:'',player:'',goal:'',rules:'',modelNote:'',
     body:'',turns:[],draft:'',pendingCandidate:null,undo:null,
+    activeBranch:{id:'main',name:'本編',createdAt:new Date().toISOString(),parentId:null,forkTurn:null},branches:[],
     prefs:{targetChars:300,contextChars:3600,contextTokens:8192,pace:'普通',
       pov:'ユーザー視点（二人称寄り）',autoAdopt:false,includeInput:true,
       temperature:'',top_p:'',top_k:'',min_p:'',repeat_penalty:'',
@@ -57,6 +58,7 @@ export function cleanState(raw){
       if(typeof t.preview==='string')u.preview=t.preview;
       if(Number.isSafeInteger(t.bodyStart))u.bodyStart=t.bodyStart;
       if(Number.isSafeInteger(t.bodyEnd))u.bodyEnd=t.bodyEnd;
+      if(typeof t.replyHash==='string')u.replyHash=t.replyHash;
       return u;
     });
   }
@@ -91,6 +93,35 @@ export function cleanState(raw){
   const views=['ユーザー視点（二人称寄り）','相手キャラの一人称','三人称（客観）'];
   const oldView={'二人称寄り':views[0],'一人称':views[1],'三人称':views[2]};
   d.prefs.pov=oldView[d.prefs.pov]|| (views.includes(d.prefs.pov)?d.prefs.pov:views[0]);
+  if(raw.activeBranch!==undefined&&raw.activeBranch!==null){
+    const m=raw.activeBranch;
+    if(typeof m!=='object'||Array.isArray(m)||typeof m.id!=='string'||!/^[A-Za-z0-9_-]{1,100}$/.test(m.id))
+      throw Error('有効な分岐情報を読み取れません。');
+    d.activeBranch={id:m.id,name:typeof m.name==='string'&&m.name.trim()?m.name.slice(0,90):'本編',
+      createdAt:typeof m.createdAt==='string'?m.createdAt:d.activeBranch.createdAt,
+      parentId:typeof m.parentId==='string'?m.parentId:null,
+      forkTurn:Number.isSafeInteger(m.forkTurn)?m.forkTurn:null};
+  }
+  if(raw.branches!==undefined){
+    if(!Array.isArray(raw.branches)||raw.branches.length>30)
+      throw Error('保存された分岐情報が不正です。JSONの生データは切り捨てません。');
+    const used=new Set([d.activeBranch.id]);
+    d.branches=raw.branches.map(b=>{
+      if(!b||typeof b!=='object'||Array.isArray(b)||typeof b.id!=='string'||
+        !/^[A-Za-z0-9_-]{1,100}$/.test(b.id)||used.has(b.id))throw Error('分岐IDが不正または重複しています。');
+      used.add(b.id);
+      const clean=cleanState({...b,activeBranch:null,branches:[]});
+      const entry={
+        id:b.id,name:typeof b.name==='string'&&b.name.trim()?b.name.slice(0,90):'無題の分岐',
+        createdAt:typeof b.createdAt==='string'?b.createdAt:'',
+        parentId:typeof b.parentId==='string'?b.parentId:null,
+        forkTurn:Number.isSafeInteger(b.forkTurn)?b.forkTurn:null
+      };
+      for(const key of Object.keys(LIMITS))entry[key]=clean[key];
+      for(const key of ['body','turns','draft','pendingCandidate','undo','prefs'])entry[key]=clean[key];
+      return entry;
+    });
+  }
   d.updatedAt=typeof raw.updatedAt==='string'?raw.updatedAt:d.updatedAt;
   return d;
 }
@@ -192,7 +223,7 @@ export function acceptTurn(state,candidate){
   if(d.body.length+prefix.length+text.length>BODY_LIMIT)throw Error('本文の入力上限を超えています。先にJSONを保存してください。');
   const before=d.body, beforeTurns=d.turns.length;
   d.body+=prefix+text;
-  d.turns.push({user:input,preview:text.slice(0,240),at:new Date().toISOString(),bodyStart:before.length+prefix.length,bodyEnd:d.body.length});
+  d.turns.push({user:input,preview:text.slice(0,240),replyHash:bodyFingerprint(text),at:new Date().toISOString(),bodyStart:before.length+prefix.length,bodyEnd:d.body.length});
   d.undo={beforeLength:before.length,added:prefix+text,afterHash:checksum(d.body),beforeTurns,input};
   d.pendingCandidate=null;
   d.draft=d.draft===candidate.sourceDraft?'':d.draft;
