@@ -1,5 +1,5 @@
 import {makeRuntime} from './runtime.js';
-import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,acceptTurn,undoTurn,bodyFingerprint} from './logic.js';
+import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,acceptTurn,bodyFingerprint} from './logic.js';
 import {openStore} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,rewindBefore,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,MAX_ARCHIVED_BRANCHES} from './branches.js';
 import {writeFile,filename} from './export.js';
@@ -110,7 +110,7 @@ function showBranches(){
   const target=el('branch-list');target.replaceChildren();
   const current=state.activeBranch||{id:'main',name:'本編'};
   el('branch-current').textContent=current.name+'（現在／'+state.turns.length+'ターン）';
-  el('branch-count').textContent=state.branches.length+' / '+MAX_ARCHIVED_BRANCHES+'件の保存済み分岐';
+  el('branch-count').textContent=state.branches.length+' / '+MAX_ARCHIVED_BRANCHES+'件の保存済み分岐。分岐が増えると保存容量が増えます。定期的にJSONバックアップしてください。';
   const renameCurrent=actionButton('現在の分岐名を変更',()=>branchAction('rename',current.id));
   target.append(renameCurrent);
   if(!state.branches.length){target.append(node('p','hint','まだ分岐はありません。過去の返信を編集・再生成・Undoすると、元の展開がここに保存されます。'));return;}
@@ -441,7 +441,7 @@ function textModal(question,initial,{max=15000,multiline=true,options=[['save','
     const editor=node(multiline?'textarea':'input','modal-editor');
     if(!multiline)editor.type='text';
     editor.value=String(initial||'');editor.maxLength=max;
-    editor.rows=multiline?Math.min(12,Math.max(5,editor.value.split('\n').length+1)):undefined;
+    if(multiline)editor.rows=Math.min(12,Math.max(5,editor.value.split('\n').length+1));
     body.after(editor);
     for(const [value,label] of options){
       const button=node('button',value==='save'||value==='generate'?'primary':'ghost',label);
@@ -473,7 +473,7 @@ async function applyStoryChange(transform,note){
       return false;
     }
     historyOffset=0;fullBody=false;paint();
-    status(note+'（元の分岐は保持されています）');
+    status(note);
     return true;
   }catch(e){
     state=original;candidate=oldCandidate;paint();

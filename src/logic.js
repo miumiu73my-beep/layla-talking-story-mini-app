@@ -126,7 +126,7 @@ export function cleanState(raw){
   return d;
 }
 export function warningsForState(data){
-  const d=cleanState(data),warnings=[];
+  const d=cleanState({...data,branches:[]}),warnings=[];
   for(const [key,max] of Object.entries(LIMITS)){
     if(d[key].length>max)warnings.push(key+'：推奨入力上限を超過（既存データは保持）');
   }
@@ -158,7 +158,7 @@ export function samplerParams(prefs){
   return out;
 }
 export function buildRequest(state,userText){
-  const d=cleanState(state),p=d.prefs;
+  const d=cleanState({...state,branches:[]}),p=d.prefs;
   const outputTokens=Number(p.max_tokens)||Math.min(4096,Math.ceil(p.targetChars*2.2)+128);
   const inputBudget=Math.max(600,Math.floor((p.contextTokens-Math.min(outputTokens,Math.floor(p.contextTokens*0.5))-160)*0.66));
   const input=String(userText||'').slice(0,6000);
@@ -216,7 +216,7 @@ export function buildRequest(state,userText){
 }
 export function buildMessages(state,userText){return buildRequest(state,userText).messages;}
 export function acceptTurn(state,candidate){
-  const d=cleanState(state),text=String(candidate?.text||'').trim();
+  const d=cleanState({...state,branches:[]}),text=String(candidate?.text||'').trim();
   if(!text)throw Error('候補が空です。');
   const input=String(candidate.user||'');
   const prefix=d.body?'\n\n':'';
@@ -227,17 +227,18 @@ export function acceptTurn(state,candidate){
   d.undo={beforeLength:before.length,added:prefix+text,afterHash:checksum(d.body),beforeTurns,input};
   d.pendingCandidate=null;
   d.draft=d.draft===candidate.sourceDraft?'':d.draft;
+  d.branches=state.branches||[];
   return d;
 }
 export function undoTurn(state){
-  const d=cleanState(state),u=d.undo;
+  const d=cleanState({...state,branches:[]}),u=d.undo;
   if(!u||d.body.length!==u.beforeLength+u.added.length||!d.body.endsWith(u.added)||checksum(d.body)!==u.afterHash||d.turns.length!==u.beforeTurns+1)throw Error('本文が編集されているため安全に取り消せません。');
   d.body=d.body.slice(0,u.beforeLength);d.turns=d.turns.slice(0,u.beforeTurns);
   if(!d.draft)d.draft=u.input;
-  d.undo=null;return d;
+  d.undo=null;d.branches=state.branches||[];return d;
 }
 export function readableText(state,format){
-  const d=cleanState(state),title=(d.title.trim()||'無題の作品').replace(/[\r\n]/g,' ');
+  const d=cleanState({...state,branches:[]}),title=(d.title.trim()||'無題の作品').replace(/[\r\n]/g,' ');
   if(format==='txt')return 'TALKING_STORY_TXT_V2\n作品：'+title+'\n\n'+d.body;
   if(format==='md')return '<!-- TALKING_STORY_MD_V2 -->\n# '+title+'\n\n'+d.body;
   throw Error('未対応の形式です。');
