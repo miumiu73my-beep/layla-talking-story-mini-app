@@ -1,7 +1,7 @@
 import {makeRuntime} from './runtime.js';
 import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint} from './logic.js';
 import {openStore} from './persistence.js';
-import {timeline,timelineAt,forkAt,rewindAfter,rewindBefore,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES} from './branches.js';
+import {timeline,timelineAt,forkAt,rewindAfter,rewindBefore,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery,dailyCheckpointDue} from './branches.js';
 import {writeFile,filename,browserDownload} from './export.js';
 import './style.css';
 
@@ -11,6 +11,22 @@ let state=freshState(),store=null,ready=false,saveBlocked=true,busy=false,stream
 let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning='',notice='',lastAcceptedMessage='';
 let lastExport=null,pendingBodyEdit=null,bodyEditTimer=null,bodyEditBackup=null;
 let deletionWarning='',historyWarning='';
+const bodyRecovery=makeBodyRecovery();
+let periodicAt=null,periodicTask=null,periodicWarning='';
+function resetBodyRecovery(){bodyRecovery.reset();periodicAt=null;periodicWarning='';}
+async function ensurePeriodicCheckpoint(){
+  if(!store||saveBlocked||!state.body.length)return;
+  if(periodicTask){await periodicTask;return;}
+  if(!dailyCheckpointDue(periodicAt))return;
+  const snapshot=cleanState({...state,branches:[]});
+  periodicTask=(async()=>{
+    try{
+      await store.checkpoint(snapshot,periodicAt===null?'セッション開始時の自動復元点':'日次自動復元点',{scope:'active'});
+      periodicAt=Date.now();bodyRecovery.seed(snapshot);periodicWarning='';
+    }catch(e){periodicWarning='自動復元点の作成に失敗しました: '+String(e?.message||e);}
+  })();
+  try{await periodicTask;}finally{periodicTask=null;}
+}
 let historyOffset=0,branchBusy=false,bodyBackupBusy=false,editRev=0,savedRev=0,stopUntil=0,retryFallback=null;
 let activeGenerationFinished=null,stopUnconfirmed=false;
 const HISTORY_PAGE_SIZE=30;
@@ -21,7 +37,7 @@ function status(text,error=false){
 }
 function safety(text=''){
   const warnings=ready?warningsForState(state):[];
-  const problem=[text,saveError,backupSizeWarning,saveBlocked?'保存停止中。JSON書き出しで現状を退避し、復旧元を確認してください。':''].filter(Boolean).join('／');
+  const problem=[text,saveError,backupSizeWarning,periodicWarning,saveBlocked?'保存停止中。JSON書き出しで現状を退避し、復旧元を確認してください。':''].filter(Boolean).join('／');
   const n=el('safety');
   n.hidden=!problem&&!warnings.length;
   n.textContent=[problem,...warnings].filter(Boolean).join('／');
@@ -69,7 +85,8 @@ async function saveNow(force=false){
   commitPendingBodyEdit();
   clearTimeout(saveTimer);saveTimer=null;
   if(!store||saveBlocked){safety();return false;}
-  if(!force&&editRev===savedRev)return true;
+  await ensurePeriodicCheckpoint();
+  if(!force&&editRev===savedRev){safety();return true;}
   const revision=editRev;
   try{
     await store.save(state);
@@ -274,21 +291,26 @@ function rebuildSettings(){
     const text=edit.value;
     count.textContent=text.length+' / '+BODY_LIMIT+'文字';
     clearTimeout(bodyEditTimer);bodyEditTimer=null;
-    // Do not let an older debounce fire while the pre-deletion snapshot is written.
-    if(text.length<state.body.length*0.5&&state.body.length>500){
+    if(text===state.body){pendingBodyEdit=null;return;}
+    // Retain the original baseline across small deletions and autosaves.
+    // Write the recovery point before applying a potentially destructive edit.
+    const plan=bodyRecovery.plan(state,text.length);
+    if(plan){
       pendingBodyEdit=null;
       bodyBackupBusy=true;lockUI();
       bodyEditBackup=(async()=>{
         try{
-          await store.checkpoint(state,'本文を大きく削除する前');
-          deletionWarning='本文を大幅に削除しました。削除前の本文は復元点に保存されています。';
+          await store.checkpoint(plan.snapshot,plan.reason,{scope:'active'});
+          bodyRecovery.completed(plan);
+          if(plan.large)deletionWarning='本文を累積で大幅に削除しました。削除前の本文は重要復元点に保存されています。';
           pendingBodyEdit=text;
           renderBodyEditWarnings();
           commitPendingBodyEdit();
         }catch(e){
+          bodyRecovery.failed(plan);
           edit.value=state.body;pendingBodyEdit=null;
           count.textContent=state.body.length+' / '+BODY_LIMIT+'文字';
-          status('削除前の復元点を作れなかったため変更を取り消しました: '+e.message,true);
+          status('編集前の復元点を作れなかったため変更を取り消しました: '+e.message,true);
         }finally{
           bodyBackupBusy=false;bodyEditBackup=null;lockUI();
         }
@@ -296,9 +318,10 @@ function rebuildSettings(){
       return;
     }
     pendingBodyEdit=text;
-    bodyEditTimer=setTimeout(commitPendingBodyEdit,330);
+    bodyEditTimer=setTimeout(commitPendingBodyEdit,400);
   };
-  edit.oninput=queueBodyEdit;
+  edit.oninput=event=>{if(!event.isComposing)queueBodyEdit();};
+  edit.oncompositionend=queueBodyEdit;
   edit.onblur=()=>{if(!bodyBackupBusy){queueBodyEdit();if(!bodyBackupBusy)commitPendingBodyEdit();}};
   updatePromptMeta();
 }
@@ -519,7 +542,7 @@ async function handleImport(file){
       if(await modal('現在の保存先は読み取り専用です。既存の異常データが残る場合があります。外部バックアップを確認した上で復旧を許可しますか？')!=='yes')return;
       await store.allowImportRecovery();saveBlocked=false;
     }else if(!await beforeDestructive('import'))return;
-    state=parsed.state;state.updatedAt=new Date().toISOString();
+    resetBodyRecovery();state=parsed.state;state.updatedAt=new Date().toISOString();
     candidate=state.pendingCandidate;fullBody=false;paint();rebuildSettings();
     editRev++;if(await saveNow(true))status('ファイルを読み込み保存しました。');
     else status('読み込みましたが保存に失敗しました。外部JSONへ書き出してください。',true);
@@ -529,7 +552,7 @@ async function resetStory(){
   if(!ready||busy||bodyBackupBusy||saveBlocked)return;
   if(await modal('新しい作品にすると本文・設定・保存済みのすべての分岐が置き換わります。事前にJSONを外部保存してください。')!=='yes')return;
   if(!await beforeDestructive('reset'))return;
-  state=freshState();candidate=null;paint();rebuildSettings();editRev++;await saveNow(true);
+  resetBodyRecovery();state=freshState();candidate=null;paint();rebuildSettings();editRev++;await saveNow(true);
 }
 async function restoreCheckpoint(){
   if(!ready||saveBlocked||busy||bodyBackupBusy)return;
@@ -551,7 +574,7 @@ async function restoreCheckpoint(){
     // Keep the complete old work in that case, too.
     const crossBranch=scope==='active'&&selected.activeBranch.id!==state.activeBranch.id;
     if(!await beforeDestructive('選択した復元点を開く',{scope:!crossBranch&&(scope==='active'||scope==='branch')?'active':'full'}))return;
-    state=selected;candidate=state.pendingCandidate;fullBody=false;
+    resetBodyRecovery();state=selected;candidate=state.pendingCandidate;fullBody=false;
     editRev++;paint();rebuildSettings();
     if(await saveNow(true))status('第'+(n+1)+'候補の復元点へ戻しました。');
     else status('復元内容を保存できませんでした。JSONで退避してください。',true);
@@ -568,7 +591,7 @@ async function recoverChoice(){
   if(choice!=='idb'&&choice!=='sqlite')return;
   try{
     const recovered=await store.chooseRecovery(choice);
-    state=store.compactState(cleanState(recovered));candidate=state.pendingCandidate;
+    resetBodyRecovery();state=store.compactState(cleanState(recovered));candidate=state.pendingCandidate;
     saveBlocked=false;saveError='';ready=true;
     editRev++;savedRev=editRev;
     paint();rebuildSettings();lockUI();safety();
@@ -585,7 +608,7 @@ async function rebuildIdb(){
   if(await modal('検証済みのIndexedDBデータを使ってSQLiteを再作成します。破損した旧SQLite行は救出用に保持します。実行しますか？')!=='yes')return;
   branchBusy=true;lockUI();
   try{
-    state=store.compactState(await store.rebuildFromIdb());candidate=state.pendingCandidate;
+    const rebuilt=await store.rebuildFromIdb();resetBodyRecovery();state=store.compactState(rebuilt);candidate=state.pendingCandidate;
     saveBlocked=false;saveError='';editRev++;savedRev=editRev;fullBody=false;paint();rebuildSettings();safety();
     status('IndexedDBからSQLiteを再作成しました。');
   }catch(e){saveBlocked=true;status('SQLiteの再作成に失敗しました: '+String(e.message||e),true);safety();}
@@ -654,6 +677,7 @@ async function applyStoryChange(transform,note,{destructive=false,checkpointScop
     if(!await beforeDestructive(checkpointScope==='branch'?'分岐削除前':'分岐操作',{checkpoint:destructive,scope:checkpointScope,branchId}))return false;
     const changed=await transform(original);
     if(!changed||typeof changed!=='object')throw Error('変更後の状態が不正です。');
+    if(changed.body!==original.body||changed.activeBranch.id!==original.activeBranch.id)resetBodyRecovery();
     state=changed;candidate=state.pendingCandidate;
     state.updatedAt=new Date().toISOString();editRev++;
     if(!await saveNow(true)){
@@ -813,6 +837,7 @@ function setup(){
   };
   document.addEventListener('visibilitychange',()=>{
     if(document.visibilityState==='hidden'&&ready){state.pendingCandidate=candidate;void saveNow();}
+    else if(document.visibilityState==='visible'&&ready&&!busy&&!branchBusy&&!bodyBackupBusy)void ensurePeriodicCheckpoint().then(()=>safety());
   });
   window.addEventListener('pagehide',()=>{if(ready){state.pendingCandidate=candidate;void saveNow();}});
   el('modal').hidden=true;paint();
@@ -830,7 +855,9 @@ async function init(){
       if(!candidate.text?.trim()){candidate=null;state.pendingCandidate=null;}
       else if(candidate.note?.includes('生成中'))candidate.note='中断前に保存された未採用候補です。確認してください。';
     }
-    ready=true;saveBlocked=store.readOnly||!store.hasStorage;
+    saveBlocked=store.readOnly||!store.hasStorage;
+    if(!saveBlocked&&!store.recoveryRequired)await ensurePeriodicCheckpoint();
+    ready=true;
     if(store.recoveryRequired){
       saveError='SQLiteとIndexedDBの編集が衝突しています。上部の「復旧元を選択」から保存元を選んでください。';
       status(saveError,true);
