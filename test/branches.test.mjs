@@ -58,12 +58,14 @@ test('past assistant replies can be manually edited while preserving old future'
   assert.ok(!edited.body.includes('ドアの向こうから声がした。'));
   assert.ok(edited.branches[0].body.includes('ドアの向こうから声がした。'));
 });
-test('reply regeneration creates a fork before the selected turn',()=>{
+test('latest regeneration uses reply trash; earlier regeneration still forks',()=>{
   const s=story(),r=regenerateAt(s,2);
   assert.equal(r.turns.length,2);
   assert.equal(r.draft,'ドアを開く');
   assert.ok(!r.body.includes('ドアの向こうから声がした。'));
-  assert.equal(r.branches[0].turns.length,3);
+  assert.equal(r.branches.length,0);
+  assert.equal(r.replyTrash[0],'ドアの向こうから声がした。');
+  const prior=regenerateAt(s,1);assert.equal(prior.branches[0].turns.length,3);
 });
 test('rewind before last and before first turn preserves full original body',()=>{
   const original=story();
@@ -293,4 +295,31 @@ test('optimized reconciliation still rejects changed user preludes',async()=>{
   let s=freshState();s.prefs.recordInputInBody=true;
   s=acceptTurn(s,{user:'入力',text:'回答',sourceDraft:''});
   assert.throws(()=>reconcileBodyEdit(s,s.body.replace('入力','変更')),/併記/);
+});
+
+test('edited last reply can be undone at capacity and restored as an editable candidate',async()=>{
+  const {reconcileBodyEdit,rewindLastWithoutFork}=await import('../src/branches.js');
+  const {restoreReplyCandidate,compactBackup}=await import('../src/logic.js');
+  const s=story();s.branches=Array.from({length:30},(_,i)=>({id:'arch'+i,name:'旧分岐'}));
+  const edited=reconcileBodyEdit(s,s.body+'追記。');
+  assert.equal(edited.undo,null);
+  const r=rewindLastWithoutFork(edited);
+  assert.equal(r.branches.length,30);assert.equal(r.activeBranch.id,s.activeBranch.id);
+  assert.equal(r.replyTrash[0],'ドアの向こうから声がした。追記。');
+  const restored=restoreReplyCandidate(r,0);
+  assert.equal(restored.text,r.replyTrash[0]);assert.equal(restored.baseFingerprint,bodyFingerprint(r.body));
+  assert.equal(r.turns.length,2);
+  const portable=cleanState({...r,branches:[]});
+  assert.deepEqual(parseImport('full.json',JSON.stringify(portable),freshState()).state.replyTrash,r.replyTrash);
+  assert.deepEqual(parseImport('light.json',compactBackup(portable),freshState()).state.replyTrash,r.replyTrash);
+});
+test('reply trash is bounded; candidate text changes mark only actual stream updates',async()=>{
+  const {rememberReply,restoreReplyCandidate,updateStreamText}=await import('../src/logic.js');
+  let trash=[];for(let i=0;i<24;i++)trash=rememberReply(trash,'reply '+i);
+  assert.equal(trash.length,20);assert.equal(trash[0],'reply 23');assert.equal(trash[19],'reply 4');
+  const s=story();s.replyTrash=trash;const c=restoreReplyCandidate(s,0);
+  assert.equal(updateStreamText(c,'途中'),true);assert.equal(updateStreamText(c,'途中'),false);
+  assert.equal(updateStreamText(c,'途中まで'),true);s.pendingCandidate=c;
+  assert.equal(cleanState(s).pendingCandidate.text,'途中まで');
+  assert.throws(()=>restoreReplyCandidate(s,0));
 });
