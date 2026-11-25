@@ -219,3 +219,16 @@ test('turn timeline separates user prelude from AI reply and branches safely',as
   const rerendered=editReplyAt(edited,1,'一歌は手を取った。');
   assert.ok(rerendered.body.includes('【あなたの入力】\n近づく\n\n一歌は手を取った。'));
 });
+
+test('rewinding a corrected legacy turn retains start and end additions',async()=>{
+  const {reconcileBodyEdit}=await import('../src/branches.js');
+  const s=freshState();
+  s.body='旧応答A。\n\n旧応答B。\n\n旧応答C。';
+  s.turns=[{user:'A',reply:'旧応答A。'},{user:'B',reply:'旧応答B。'},{user:'C',reply:'旧応答C。'}];
+  let pos=timeline(s)[1];
+  const first=reconcileBodyEdit(s,s.body.slice(0,pos.start)+'冒頭。'+s.body.slice(pos.start));
+  pos=timeline(first)[1];
+  const last=reconcileBodyEdit(first,first.body.slice(0,pos.end)+'末尾。'+first.body.slice(pos.end));
+  assert.equal(timeline(last)[1].reply,'冒頭。旧応答B。末尾。');
+  assert.equal(rewindAfter(last,1).body,'旧応答A。\n\n冒頭。旧応答B。末尾。');
+});
