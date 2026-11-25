@@ -37,7 +37,9 @@ function lockUI(){
   el('import').disabled=!ready||busy||branchBusy||bodyBackupBusy||Boolean(store?.recoveryRequired);
   if(el('recover'))el('recover').disabled=!ready||!store?.recoveryRequired;
   if(el('recover-now')){el('recover-now').hidden=!store?.recoveryRequired;el('recover-now').disabled=!ready||busy;}
-  if(el('raw-backup'))el('raw-backup').disabled=!ready;
+  if(el('raw-backup'))el('raw-backup').disabled=!ready||branchBusy;
+  if(el('raw-rows'))el('raw-rows').disabled=!ready||busy||branchBusy;
+  if(el('rebuild-idb'))el('rebuild-idb').disabled=!ready||busy||branchBusy||!store?.canRebuildFromIdb;
   if(el('reset-history'))el('reset-history').disabled=disabled;
   for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy||bodyBackupBusy;
   el('stop').disabled=!busy;
@@ -494,11 +496,11 @@ async function exportAs(ext){
     if(editRev!==savedRev)void saveNow(); // Never overwrite an identical saved generation.
   }catch(e){status('書き出しに失敗しました: '+String(e.message||e),true);}
 }
-async function beforeDestructive(action,{checkpoint=true}={}){
+async function beforeDestructive(action,{checkpoint=true,scope,branchId}={}){
   if(!store?.hasStorage){status('端末保存ができません。外部JSONバックアップを取ってください。',true);return false;}
   try{
     if(!await saveNow())throw Error('現在の状態を保存できません。');
-    if(checkpoint)await store.checkpoint(state,action);
+    if(checkpoint)await store.checkpoint(state,action,{scope,branchId});
     return true;
   }catch(e){
     status('操作前の安全保存に失敗したため中止しました: '+String(e.message||e),true);
@@ -535,14 +537,17 @@ async function restoreCheckpoint(){
     const versions=await store.checkpointList();
     if(!versions.length){status('復元できる以前の保存点はありません。');return;}
     const choices=versions.map((v,i)=>[String(i),String(i+1)+'：'+
-      new Date(v.at).toLocaleString('ja-JP')+'／'+(v.reason||'保存点')+'／'+(v.chars??'不明')+'文字']);
+      new Date(v.at).toLocaleString('ja-JP')+'／'+(v.title||'無題')+'／'+(v.reason||'保存点')+'／'+(v.scope==='branch'?'削除分岐のみ':v.scope==='active'?'本編のみ':'作品全体')+'／'+(v.chars??'不明')+'文字']);
     choices.push(['cancel','キャンセル']);
     const selection=await modal('復元する時点を選んでください。復元前の現在の状態も保存点に退避します。',choices);
     if(typeof selection!=='string'||!/^\d+$/.test(selection))return;
     const n=Number(selection);
     if(!Number.isSafeInteger(n)||n<0||n>=versions.length)return;
-    const selected=await store.loadCheckpoint(versions[n].id);
-    if(!await beforeDestructive('選択した復元点を開く'))return;
+    commitPendingBodyEdit();
+    const selected=await store.loadCheckpoint(versions[n].id,state);
+    // A full restore replaces all archives; preserve the whole current work first.
+    const scope=versions[n].scope;
+    if(!await beforeDestructive('選択した復元点を開く',{scope:scope==='active'||scope==='branch'?'active':'full'}))return;
     state=selected;candidate=state.pendingCandidate;fullBody=false;
     editRev++;paint();rebuildSettings();
     if(await saveNow(true))status('第'+(n+1)+'候補の復元点へ戻しました。');
@@ -572,6 +577,33 @@ async function recoverChoice(){
   }
 }
 
+async function rebuildIdb(){
+  if(!store?.canRebuildFromIdb||busy||branchBusy)return;
+  if(await modal('検証済みのIndexedDBデータを使ってSQLiteを再作成します。破損した旧SQLite行は救出用に保持します。実行しますか？')!=='yes')return;
+  branchBusy=true;lockUI();
+  try{
+    state=store.compactState(await store.rebuildFromIdb());candidate=state.pendingCandidate;
+    saveBlocked=false;saveError='';editRev++;savedRev=editRev;fullBody=false;paint();rebuildSettings();safety();
+    status('IndexedDBからSQLiteを再作成しました。');
+  }catch(e){saveBlocked=true;status('SQLiteの再作成に失敗しました: '+String(e.message||e),true);safety();}
+  finally{branchBusy=false;lockUI();}
+}
+async function exportRawRows(){
+  if(!store||busy||branchBusy)return;
+  branchBusy=true;lockUI();
+  try{
+    const keys=await store.rawRowKeys(),pages=Math.ceil(keys.length/10);
+    if(!pages){status('救出できるSQLite行がありません。');return;}
+    const result=await textModal('SQLite救出用JSON：全'+pages+'ファイル（1ファイル最大10行）。書き出す番号を1〜'+pages+'から指定してください。分岐・旧世代・復元点の原文も含みます。救出中は編集しないでください。','1',{max:10,multiline:false});
+    if(!result)return;
+    const page=Number(result.text)-1;
+    const raw=await store.rawRowPage(keys,page);
+    const name=filename('talking-story-raw-rows-'+(page+1)+'-of-'+pages,'json');
+    const exported=await writeFile(host,name,raw,'application/json');
+    presentExport(name,raw,'application/json',exported);
+  }catch(e){status('分割救出に失敗しました: '+String(e.message||e),true);}
+  finally{branchBusy=false;lockUI();}
+}
 async function exportRaw(){
   try{
     const raw=await store.rawDump();
@@ -610,13 +642,13 @@ function textModal(question,initial,{max=15000,multiline=true,options=[['save','
     editor.focus();
   });
 }
-async function applyStoryChange(transform,note,{destructive=false}={}){
+async function applyStoryChange(transform,note,{destructive=false,checkpointScope,branchId}={}){
   if(!ready||busy||branchBusy||bodyBackupBusy||saveBlocked)return false;
   branchBusy=true;lockUI();
   commitPendingBodyEdit();
   const original=state,oldCandidate=candidate;
   try{
-    if(!await beforeDestructive('分岐操作',{checkpoint:destructive}))return false;
+    if(!await beforeDestructive(checkpointScope==='branch'?'分岐削除前':'分岐操作',{checkpoint:destructive,scope:checkpointScope,branchId}))return false;
     const changed=await transform(original);
     if(!changed||typeof changed!=='object')throw Error('変更後の状態が不正です。');
     state=changed;candidate=state.pendingCandidate;
@@ -702,7 +734,7 @@ async function branchAction(action,id){
     if(result)await applyStoryChange(async s=>renameBranch(await store.materialize(s,id),id,result.text),'分岐名を変更しました');
   }else if(action==='delete'){
     if(await modal('保存されている分岐「'+found.name+'」を削除しますか？\n現在の分岐は削除しません。削除前の状態は復元点へ保存しますが、外部JSONバックアップも推奨します。')!=='yes')return;
-    await applyStoryChange(s=>deleteInactiveBranch(s,id),'指定分岐を削除しました',{destructive:true});
+    await applyStoryChange(s=>deleteInactiveBranch(s,id),'指定分岐を削除しました',{destructive:true,checkpointScope:'branch',branchId:id});
   }
 }
 
@@ -717,7 +749,7 @@ function setup(){
     '<div id="screen-settings" hidden><section class="panel"><h2>作品設定</h2><p class="hint">日本語の文章と [海:名称≡&lt;虎田海&gt;] 形式は混在できます。</p><div id="settings-fields"></div></section>'+
     '<section class="panel"><h2>生成設定</h2><div id="preference-fields"></div><p class="hint" id="prompt-meta"></p></section>'+
     '<section class="panel"><h2>確定本文の編集</h2><p class="hint">ここが正本です。長編の場合は編集前にJSONをバックアップしてください。</p><p id="edit-count" class="hint"></p><p id="edit-warning" class="safety" hidden>本文を大きく削除しました。誤操作であれば、直ちに「直前の状態を復元」を利用してください。</p><textarea id="edit-body" class="long" rows="12"></textarea></section>'+
-    '<section class="panel"><h2>バックアップ・復元</h2><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-backup">保存生データの救出</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
+    '<section class="panel"><h2>バックアップ・復元</h2><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
     '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p class="hint">コピーするか、通常ブラウザではダウンロードを選択してください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="copy-manual">テキストをコピー</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
     '</main><nav class="nav"><button class="primary" id="nav-main">本文へ戻る</button><button id="nav-settings">設定</button><button id="quick-backup">JSON保存</button></nav>'+
     '<div id="modal" class="overlay" hidden role="dialog" aria-modal="true"><div class="modal-card"><p id="modal-content"></p><div id="modal-buttons" class="actions"></div></div></div>';
@@ -760,6 +792,8 @@ function setup(){
     if(await applyStoryChange(s=>clearHistoryAgainstBody(s),'本文を保持して履歴をリセットしました。',{destructive:true}))rebuildSettings();
   };
   el('raw-backup').onclick=()=>void exportRaw();
+  el('raw-rows').onclick=()=>void exportRawRows();
+  el('rebuild-idb').onclick=()=>void rebuildIdb();
   el('close-manual').onclick=()=>{el('manual-text').value='';el('manual-export').hidden=true;};
   el('open-export-manual').onclick=showManualExport;
   el('download-manual').onclick=()=>{
