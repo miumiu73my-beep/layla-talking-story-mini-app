@@ -949,7 +949,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   async function allowImportRecovery(){
     if(recoveryRequired)throw Error('まずSQLite/IndexedDBの復旧元を選択してください。');
-    if(!sqlAvailable&&!idb&&!(sqliteCorrupt&&typeof sql==='function'))throw Error('保存先がありません。JSONは閲覧できますが端末へ保存できません。');
+    if(!sqlAvailable&&!idb&&!(sqliteCorrupt&&typeof sql==='function'))throw Error('保存先がありません。ファイルを読み込めません。既存の作品は変更していません。保存先を復旧してから再試行してください。');
     // User-confirmed recovery: preserve the corrupt ACTIVE manifest under a new
     // key before replacing it. Do not GC unknown orphan chunks on this write.
     if(sqliteCorrupt&&typeof sql==='function'){
