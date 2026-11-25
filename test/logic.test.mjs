@@ -163,3 +163,27 @@ test('max_tokens stays within context and explicit small values stay small',()=>
   assert.equal(buildRequest(s,'続ける').meta.outputTokens,40);
   assert.equal(buildRequest(s,'続ける').meta.outputTooShort,true);
 });
+
+test('legacy 768 migrates once but explicit new 768 survives',()=>{
+  const old=freshState();delete old.prefs.maxTokensVersion;old.prefs.max_tokens='768';old.prefs.targetChars=1000;
+  const migrated=cleanState(old);assert.equal(migrated.prefs.max_tokens,'');
+  assert.equal(buildRequest(migrated,'続ける').meta.outputTokens,2328);
+  migrated.prefs.max_tokens=768;assert.equal(cleanState(migrated).prefs.max_tokens,768);
+});
+test('long input is never silently truncated',()=>{
+  const s=freshState();s.prefs.contextTokens=32768;const input='あ'.repeat(6000);
+  assert.ok(buildRequest(s,input).messages[1].content.includes(input));
+  assert.throws(()=>buildRequest(s,input+'い'),/送信上限/);
+});
+test('early diverging siblings compress, legacy v2 reads and invalid forward refs fail',()=>{
+  const s=freshState();s.body='A'.repeat(100000);const prefix='別'.repeat(80000);
+  s.branches=[0,1,2].map(i=>({id:'b'+i,name:'分岐'+i,parentId:'main',forkTurn:1,body:prefix+'😀'+i,prefs:{max_tokens:768},modelNote:'旧メモ'}));
+  const lite=compactBackup(s),v=JSON.parse(lite);
+  assert.ok(lite.length<JSON.stringify(s).length*0.7);
+  const restored=parseImport('x.json',lite,s).state;
+  assert.equal(restored.branches[2].body,s.branches[2].body);
+  assert.equal(restored.branches[0].prefs,undefined);assert.equal(restored.branches[0].modelNote,undefined);
+  const old={schema:FORMAT,version:2,kind:'shared-prefix',baseBody:'共通',payload:{...freshState(),body:{prefix:2,suffix:'本文'},branches:[]}};
+  assert.equal(parseImport('old.json',JSON.stringify(old),s).state.body,'共通本文');
+  v.entries[0].base=1;assert.throws(()=>parseImport('bad.json',JSON.stringify(v),s),/参照/);
+});
