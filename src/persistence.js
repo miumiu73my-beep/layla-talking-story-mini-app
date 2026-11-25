@@ -578,7 +578,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     // keys for GC; their actual values are fetched only when selected.
     const payload=JSON.stringify({scope:'full-index',state:JSON.parse(raw),archives:archiveEntries});
     return {entry:{...entry,hash:checksum(payload),size:payload.length,
-      archiveKeys:archiveEntries.flatMap(a=>[a.key,...(a.parts||[])])},raw:payload};
+      archiveKeys:archiveEntries.map(a=>a.key)},raw:payload};
   }
   async function writeCheckpoint(entry,raw,fullArchives=null){
     if(readOnly)throw Error('復旧中のため復元点を作成できません。');
@@ -674,7 +674,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     for(const key of keys){
       if(typeof key!=='string')continue;
       if(key.startsWith('checkpoint-archive/')){
-        if(!unknown.size&&!keptArchives.has(key))await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
+        const owner=key.includes('/part/')?key.slice(0,key.indexOf('/part/')):key;
+        if(!unknown.size&&!keptArchives.has(owner))await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
         continue;
       }
       if(!key.startsWith('checkpoint/')||!key.includes('/part/'))continue;
