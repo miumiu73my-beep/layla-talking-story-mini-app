@@ -327,3 +327,29 @@ test('reply trash is bounded; candidate text changes mark only actual stream upd
   assert.equal(cleanState(s).pendingCandidate.text,'途中まで');
   assert.throws(()=>restoreReplyCandidate(s,0));
 });
+
+
+test('latest regeneration keeps next draft intact, including after adoption',()=>{
+  const s=story();s.draft='  次の入力\n';
+  const r=regenerateAt(s,2);assert.equal(r.draft,s.draft);assert.equal(r.branches.length,0);
+  const a=acceptTurn(r,{user:s.turns[2].user,text:'新しい返答',sourceDraft:r.draft,preserveDraft:true});
+  assert.equal(a.draft,s.draft);
+});
+test('reply editing preserves original prelude regardless of preference',()=>{
+  const s=freshState();s.prefs.recordInputInBody=true;
+  const a=acceptTurn(s,{user:'入力A',text:'返信A',sourceDraft:''});
+  a.prefs.recordInputInBody=false;
+  const b=editReplyAt(a,0,'返信B');
+  assert.equal(b.turns[0].userPrelude,a.turns[0].userPrelude);assert.equal(timelineAt(b,0).reply,'返信B');
+  const c=acceptTurn(s,{user:'入力B',text:'返信C',sourceDraft:'',userPrelude:''});
+  const d=editReplyAt(c,0,'返信D');assert.equal(d.body,'返信D');
+});
+test('synthetic turn does not populate draft or prelude on rewind, regeneration or editing',async()=>{
+  const {rewindLastWithoutFork}=await import('../src/branches.js');
+  const s=freshState();s.prefs.recordInputInBody=true;
+  const a=acceptTurn(s,{user:'この場面を自然に続きを進める',text:'返信',sourceDraft:''});
+  assert.equal(rewindLastWithoutFork(a).draft,'');assert.equal(regenerateAt(a,0).draft,'');
+  assert.equal(editReplyAt(a,0,'編集後').body,'編集後');
+  const b=acceptTurn(a,{user:'次へ',text:'次の返信',sourceDraft:''});
+  assert.equal(regenerateAt(b,0).draft,'');
+});

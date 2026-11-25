@@ -1,5 +1,5 @@
 import {makeRuntime} from './runtime.js';
-import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning} from './logic.js';
+import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning,AUTO_CONTINUE_INPUT,editableTurnInput} from './logic.js';
 import {openStore} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
 import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload,serializeBackup} from './export.js';
@@ -39,7 +39,7 @@ async function ensurePeriodicCheckpoint(){
 let historyOffset=0,branchBusy=false,bodyBackupBusy=false,editRev=0,savedRev=0,stopUntil=0,retryFallback=null;
 let activeGenerationFinished=null,stopUnconfirmed=false,streamSaveInFlight=false;
 const HISTORY_PAGE_SIZE=30;
-const promptDraft=()=>state.draft.trim()||'この場面を自然に続きを進める';
+const promptDraft=()=>state.draft.trim()||AUTO_CONTINUE_INPUT;
 function status(text,error=false){
   notice=text||'';
   const e=el('status');if(e){e.textContent=notice;e.className='status'+(error?' error':'');}
@@ -440,7 +440,7 @@ async function useCandidate(){
     return saved;
   }catch(e){status('採用できません: '+String(e.message||e),true);return false;}
 }
-async function startGeneration({retry=false,inputOverride=null}={}){
+async function startGeneration({retry=false,inputOverride=null,preserveDraft=false}={}){
   if(busy||bodyBackupBusy||saveBlocked||!ready)return;
   if(Date.now()<stopUntil){status('前の生成が停止したことを確認中です。終了確認後に再生成できます。',true);return;}
   if(stopUnconfirmed){
@@ -465,7 +465,7 @@ async function startGeneration({retry=false,inputOverride=null}={}){
   if(old?.text?.trim())state.replyTrash=rememberReply(state.replyTrash,old.text);
   const thisId=++activeId;
   busy=true;stream=null;
-  candidate={user:requestInput,text:'',sourceDraft:retry&&old?old.sourceDraft:state.draft,baseFingerprint,note:'生成中…'};
+  candidate={user:requestInput,text:'',sourceDraft:retry&&old?old.sourceDraft:state.draft,baseFingerprint,note:'生成中…',...((preserveDraft||retry&&old?.preserveDraft)?{preserveDraft:true}:{})};
   state.pendingCandidate=candidate;persist(0);showCandidate('生成中…');lockUI();
   let finished=false,stopResolver=null;
   const aborted=new Promise(resolve=>{stopResolver=resolve;});
@@ -821,7 +821,7 @@ async function actOnTurn(index,action){
   if(action==='user'){
     const decision=await textModal(
       '第'+(index+1)+'ターン：あなたの送信内容を編集します。\n元のストーリーは別分岐に残し、この入力から新しい展開を作ります。',
-      turn.user,{max:15000,options:[['generate','変更して再生成'],['draft','入力欄に戻す'],['cancel','キャンセル']]}
+      editableTurnInput(turn.user),{max:15000,options:[['generate','変更して再生成'],['draft','入力欄に戻す'],['cancel','キャンセル']]}
     );
     if(!decision)return;
     if(await applyStoryChange(s=>editUserAt(s,index,decision.text),'過去の入力を編集した分岐を作成しました')){
@@ -846,11 +846,12 @@ async function actOnTurn(index,action){
   }
   if(action==='regenerate'){
     const latest=index===state.turns.length-1;
-    const explanation=latest?'直前の返信はごみ箱へ移し、分岐を増やさず再生成します。未採用候補もごみ箱に移ります。':'元のストーリー全体は別の分岐に残し、選択ターンの前から再生成します。';
+    const explanation=latest?'直前の返信はごみ箱へ移し、分岐を増やさず再生成します。未採用候補もごみ箱に移ります。入力途中の下書きは入力欄に残し、元のターンの入力で再生成します。':'元のストーリー全体は別の分岐に残し、選択ターンの前から再生成します。';
     if(await modal('第'+(index+1)+'ターンの返信を再生成します。\n'+explanation)!=='yes')return;
     const input=turn.user;
+    const preserveDraft=latest&&state.draft.length>0;
     if(await applyStoryChange(s=>regenerateAt(s,index),latest?'直前の返信をごみ箱へ移しました。':'再生成用の分岐を作成しました')){
-      showMain();el('prompt-section').scrollIntoView({block:'start'});await startGeneration({inputOverride:input});
+      showMain();el('prompt-section').scrollIntoView({block:'start'});await startGeneration({inputOverride:input,preserveDraft});
     }
     return;
   }

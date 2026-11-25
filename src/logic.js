@@ -3,6 +3,9 @@ export const FORMAT='layla-talking-story-backup',VERSION=1;
 export const BODY_LIMIT=1500000,TRANSFER_MAX_BYTES=50000000;
 export const REPLY_TRASH_LIMIT=20;
 export const PROMPT_INPUT_LIMIT=6000;
+export const AUTO_CONTINUE_INPUT='この場面を自然に続きを進める';
+export const isSyntheticInput=value=>String(value??'').trim()===AUTO_CONTINUE_INPUT;
+export const editableTurnInput=value=>isSyntheticInput(value)?'':String(value??'');
 export function inputLimitWarning(text,prefs){
   const n=String(text||'').length;
   const limit=prefs?promptFrame(cleanState({prefs}).prefs).inputLimit:PROMPT_INPUT_LIMIT;
@@ -20,7 +23,7 @@ export function restoreReplyCandidate(state,index){
   if(state.pendingCandidate)throw Error('先に未採用候補を採用するか破棄してください。');
   const text=state.replyTrash?.[index];
   if(typeof text!=='string'||!text.trim())throw Error('返信が見つかりません。');
-  const user=state.draft.trim()||'この場面を自然に続きを進める';
+  const user=state.draft.trim()||AUTO_CONTINUE_INPUT;
   return {user,text,sourceDraft:state.draft,baseFingerprint:bodyFingerprint(state.body),note:'ごみ箱から復元した候補です。現在の本文・入力に合うか確認してから採用してください。'};
 }
 // Return true only for a changed stream payload; callers advance the dirty revision.
@@ -114,7 +117,7 @@ export function cleanState(raw){
   if(raw.pendingCandidate!==undefined&&raw.pendingCandidate!==null){
     const c=raw.pendingCandidate;
     if(!c||typeof c!=='object'||typeof c.user!=='string'||typeof c.text!=='string')throw Error('未採用候補が不正です。');
-    d.pendingCandidate={user:c.user,text:c.text,sourceDraft:typeof c.sourceDraft==='string'?c.sourceDraft:'',baseFingerprint:typeof c.baseFingerprint==='string'?c.baseFingerprint:bodyFingerprint(c.baseBody||''),note:typeof c.note==='string'?c.note:''};
+    d.pendingCandidate={user:c.user,text:c.text,sourceDraft:typeof c.sourceDraft==='string'?c.sourceDraft:'',baseFingerprint:typeof c.baseFingerprint==='string'?c.baseFingerprint:bodyFingerprint(c.baseBody||''),note:typeof c.note==='string'?c.note:'',...(c.preserveDraft===true?{preserveDraft:true}:{})};
   }
   if(raw.undo!==undefined&&raw.undo!==null){
     const u=raw.undo;
@@ -226,7 +229,7 @@ function promptFrame(p){
     'ユーザー本人の新しい台詞・行動・感情・思考・決断は勝手に創作してはいけません。入力された行動・台詞はそのまま物語の因果に取り込んでください。',
     '他の登場人物の台詞と反応、環境、出来事、自然な進展を描写してください。唐突な設定改変や大きな時間跳躍を避けてください。',
     '[見出し:項目≡<内容>] は人物・設定の項目と値を意味する記法です。記法自体は本文に出力しません。',
-    '前のターンの描写や同じ表現を繰り返さず、過度に類似する返答を避けてください。',
+    '前のターンの描写や同じ表現を繰り返さず、過度に類似する返答を避けてください。入力併記用の見出し「【あなたの入力】」は出力しないでください。',
     '展開速度：'+p.pace+'。視点：'+p.pov+'。生成の目安：約'+p.targetChars+'文字。',
     p.recordInputInBody?'ユーザー入力はアプリ側で確定本文へ原文を追加します。あなたは入力文を繰り返さず、他の人物の反応と物語の続きを描写してください。入力されていない本人の台詞・行動・内心は創作しないでください。':p.includeInput?'今回の入力でユーザーが実際に記載した言葉・行動だけを本文へ必要に応じて自然に含めてください。記載のない本人の台詞・行動・内心は加えないでください。':'今回の入力内容を確定した事実として扱い、本人の入力を長々と繰り返さず相手の反応から描写してください。記載のない本人の台詞・行動・内心は創作しないでください。'
   ].join('\n');
@@ -242,8 +245,9 @@ export function buildRequest(state,userText){
   if(warning)throw Error(warning);
   const final=prefix+input+suffix;
   let remaining=Math.max(0,inputBudget-directives.length-final.length);
-  const recent=d.turns.slice(-5).map(t=>t.user.trim()).filter(Boolean);
-  const historyText=recent.map((v,i)=>String(i+1)+'. '+v.slice(0,300)).join('\n');
+  const recent=d.turns.slice(-5).filter(t=>t.user.trim()&&!isSyntheticInput(t.user));
+  const historyFor=turns=>turns.map((t,i)=>String(i+1)+'. '+t.user.trim().slice(0,300)).join('\n');
+  const historyText=historyFor(recent);
   const sections=[
     ['ユーザーの役割','player',false],
     ['絶対に守るルール','rules',false],
@@ -292,11 +296,15 @@ export function buildRequest(state,userText){
   let system=directives;
   for(const e of allocations)if(e.text)system+=e.header+e.text;
   let space=Math.max(0,inputBudget-system.length-final.length);
-  const userHistory=safeTail(historyText,historyBudget);
+  const preliminaryHistory=safeTail(historyText,historyBudget);
+  const historySpace=preliminaryHistory&&space>=historyHeader.length+preliminaryHistory.length?historyHeader.length+preliminaryHistory.length:0;
+  const body=safeTail(d.body,Math.max(0,Math.min(p.contextChars,space-historySpace-bodyHeader.length)));
+  // Omit only input already present verbatim in the transmitted body tail.
+  const tailStart=d.body.length-body.length;
+  const userHistory=historySpace?safeTail(historyFor(recent.filter(t=>!(t.userPrelude&&Number.isSafeInteger(t.bodyStart)&&t.bodyStart>=tailStart&&d.body.slice(t.bodyStart,t.bodyStart+t.userPrelude.length)===t.userPrelude))),historyBudget):'';
   if(userHistory&&space>=historyHeader.length+userHistory.length){
     system+=historyHeader+userHistory;space-=historyHeader.length+userHistory.length;
   }
-  const body=safeTail(d.body,Math.max(0,Math.min(p.contextChars,space-bodyHeader.length)));
   if(body)system+=bodyHeader+body;
   else if(!d.body){
     const intro='\n\n【開始場面】\nまだ本文がありません。今回の入力と設定に合った物語の導入を描写してください。';
@@ -318,9 +326,10 @@ export function acceptTurn(state,candidate){
   if(!text)throw Error('候補が空です。');
   if(d.turns.length>=20000)throw Error('履歴が20,000ターンの上限に達しました。外部JSONへ保存して整理してください。');
   const input=String(candidate.user||'');
-  const synthetic=input.trim()==='この場面を自然に続きを進める'&&!String(candidate.sourceDraft||'').trim();
-  const prelude=d.prefs.recordInputInBody&&!synthetic&&input.trim()
-    ?'【あなたの入力】\n'+input.trim()+'\n\n':'';
+  const synthetic=isSyntheticInput(input);
+  // Reply edits pass the historical prelude, including an empty string.
+  const prelude=synthetic?'':typeof candidate.userPrelude==='string'?candidate.userPrelude:
+    d.prefs.recordInputInBody&&input.trim()?'【あなたの入力】\n'+input.trim()+'\n\n':'';
   const prefix=d.body?'\n\n':'';
   const bodySegment=prelude+text;
   if(d.body.length+prefix.length+bodySegment.length>BODY_LIMIT)
@@ -332,7 +341,7 @@ export function acceptTurn(state,candidate){
     at:new Date().toISOString(),bodyStart:before.length+prefix.length,bodyEnd:d.body.length});
   d.undo={beforeLength:before.length,added:prefix+bodySegment,afterHash:checksum(d.body),beforeTurns,input};
   d.pendingCandidate=null;
-  d.draft=d.draft===candidate.sourceDraft?'':d.draft;
+  d.draft=!candidate.preserveDraft&&d.draft===candidate.sourceDraft?'':d.draft;
   d.branches=state.branches||[];
   return d;
 }
@@ -340,7 +349,7 @@ export function undoTurn(state){
   const d=cleanState({...state,branches:[]}),u=d.undo;
   if(!u||d.body.length!==u.beforeLength+u.added.length||!d.body.endsWith(u.added)||checksum(d.body)!==u.afterHash||d.turns.length!==u.beforeTurns+1)throw Error('本文が編集されているため安全に取り消せません。');
   d.body=d.body.slice(0,u.beforeLength);d.turns=d.turns.slice(0,u.beforeTurns);
-  if(!d.draft)d.draft=u.input;
+  if(!d.draft)d.draft=editableTurnInput(u.input);
   d.undo=null;d.branches=state.branches||[];return d;
 }
 export function readableText(state,format){

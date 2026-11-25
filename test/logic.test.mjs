@@ -209,3 +209,27 @@ test('small context and exact input boundary never reject short prompts',()=>{
   const s=freshState();s.prefs.contextTokens=2048;
   assert.equal(buildRequest(s,'あ'.repeat(200)).meta.overBudget,false);
 });
+
+
+test('regenerated candidate preserves next draft across save and adoption',()=>{
+  const s=freshState();s.draft='次の入力';
+  s.pendingCandidate={user:'次の入力',text:'新しい返信',sourceDraft:s.draft,preserveDraft:true};
+  const loaded=cleanState(JSON.parse(JSON.stringify(s)));
+  assert.equal(loaded.pendingCandidate.preserveDraft,true);
+  assert.equal(acceptTurn(loaded,loaded.pendingCandidate).draft,'次の入力');
+});
+test('synthetic input is omitted from body and recent history even with nonempty sourceDraft',()=>{
+  const s=freshState();s.prefs.recordInputInBody=true;
+  const a=acceptTurn(s,{user:'この場面を自然に続きを進める',text:'続き。',sourceDraft:'この場面を自然に続きを進める'});
+  assert.equal(a.body,'続き。');assert.equal(undoTurn(a).draft,'');
+  const req=buildRequest(a,'次へ');
+  assert.ok(req.messages[0].content.includes('見出し「【あなたの入力】」は出力しない'));
+  assert.ok(!req.messages[0].content.includes('この場面を自然に続きを進める'));
+});
+test('recent user history only omits input already transmitted in body tail',()=>{
+  const s=freshState();s.prefs.recordInputInBody=true;
+  const a=acceptTurn(s,{user:'屋上で会おう',text:'頷いた。',sourceDraft:''});
+  assert.equal(buildRequest(a,'次へ').messages[0].content.split('屋上で会おう').length-1,1);
+  a.body+='長'.repeat(13000);
+  assert.ok(buildRequest(a,'次へ').messages[0].content.includes('屋上で会おう'));
+});

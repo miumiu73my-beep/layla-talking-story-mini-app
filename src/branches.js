@@ -1,7 +1,7 @@
 // Non-destructive branching for prior turns. No Layla-specific dependencies.
 // Active branch stays in root body/turns/settings for v1 JSON compatibility;
 // inactive branches are full snapshots so none are silently overwritten.
-import {cleanState,bodyFingerprint,acceptTurn,FIELDS,isArchiveReference,rememberReply} from './logic.js';
+import {cleanState,bodyFingerprint,acceptTurn,FIELDS,isArchiveReference,rememberReply,editableTurnInput} from './logic.js';
 
 export const MAX_ARCHIVED_BRANCHES=30;
 export const SNAPSHOT_FIELDS=[
@@ -99,17 +99,19 @@ export function editReplyAt(state,index,replacement){
   if(!text)throw Error('編集後の返信が空です。');
   const old=timelineAt(state,index);
   const next=forkAt(state,{index,label:'第'+(index+1)+'ターンの返信を編集'});
-  next.draft=old.user;
-  return acceptTurn(next,{user:old.user,text,sourceDraft:old.user});
+  next.draft=editableTurnInput(old.user);
+  return acceptTurn(next,{user:old.user,text,sourceDraft:next.draft,userPrelude:state.turns[index].userPrelude||''});
 }
 export function regenerateAt(state,index){
   const old=timelineAt(state,index);
   if(index===state.turns.length-1){
     if(old.end!==state.body.length)throw Error('最終ターン後に独立した追記があります。元の展開を守るため、分岐で巻き戻してから再生成してください。');
-    const next=rewindLastWithoutFork(state);next.draft=old.user;return next;
+    const next=rewindLastWithoutFork(state);
+    // Historical input is sent independently of the next draft.
+    next.draft=state.draft.length?state.draft:editableTurnInput(old.user);return next;
   }
   const next=forkAt(state,{index,label:'第'+(index+1)+'ターンの返信を再生成'});
-  next.draft=old.user;
+  next.draft=editableTurnInput(old.user);
   return next;
 }
 export function switchBranch(state,id,{inheritLore=false}={}){
@@ -225,7 +227,7 @@ export function rewindLastWithoutFork(state){
   // Preserve any independent manually appended text after the last turn.
   d.body=d.body.slice(0,prefixBefore(d.body,last.start))+d.body.slice(last.end);
   d.turns.pop();
-  if(!d.draft.trim())d.draft=last.user||d.draft;
+  if(!d.draft.length)d.draft=editableTurnInput(last.user);
   d.undo=null;d.pendingCandidate=null;
   d.branches=state.branches||[];
   return d;
