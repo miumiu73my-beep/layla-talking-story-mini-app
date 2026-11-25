@@ -1,7 +1,7 @@
 // Non-destructive branching for prior turns. No Layla-specific dependencies.
 // Active branch stays in root body/turns/settings for v1 JSON compatibility;
 // inactive branches are full snapshots so none are silently overwritten.
-import {cleanState,bodyFingerprint,acceptTurn,FIELDS} from './logic.js';
+import {cleanState,bodyFingerprint,acceptTurn,FIELDS,isArchiveReference} from './logic.js';
 
 export const MAX_ARCHIVED_BRANCHES=30;
 export const SNAPSHOT_FIELDS=[
@@ -114,6 +114,7 @@ export function switchBranch(state,id,{inheritLore=false}={}){
   const i=s.branches.findIndex(b=>b.id===id);
   if(i<0)throw Error('分岐が見つかりません。');
   const target=s.branches[i];
+  if(isArchiveReference(target))throw Error('切替先の分岐を先に読み込んでください。');
   const archivedCurrent=snapshot(s,s.activeBranch);
   const next={...s,branches:[...s.branches.slice(0,i),...s.branches.slice(i+1),archivedCurrent],
     activeBranch:branchMeta(target)};
@@ -131,6 +132,7 @@ export function renameBranch(state,id,name){
   else{
     const b=s.branches.find(b=>b.id===id);
     if(!b)throw Error('分岐が見つかりません。');
+    if(isArchiveReference(b))throw Error('分岐名の変更前に分岐を読み込んでください。');
     s.branches=s.branches.map(entry=>entry.id===id?{...entry,name:label}:entry);
   }
   return cleanState(s);
