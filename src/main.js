@@ -2,7 +2,7 @@ import {makeRuntime} from './runtime.js';
 import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning} from './logic.js';
 import {openStore} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
-import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload} from './export.js';
+import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload,serializeBackup} from './export.js';
 import './style.css';
 
 const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getElementById(id);
@@ -57,22 +57,22 @@ function safety(text=''){
 }
 function lockUI(){
   if(store?.readOnly)saveBlocked=true;
-  const disabled=!ready||busy||branchBusy||bodyBackupBusy||saveBlocked;
+  const disabled=!ready||busy||branchBusy||bodyBackupBusy||saveBlocked||exporting;
   const cooling=Date.now()<stopUntil;
   for(const id of ['generate','new-story','restore','user-input'])
     if(el(id))el(id).disabled=disabled||(id==='generate'&&cooling);
   el('nav-settings').disabled=!ready||busy||branchBusy||bodyBackupBusy;
   el('nav-main').disabled=!ready||branchBusy||bodyBackupBusy;
-  el('import').disabled=!ready||busy||branchBusy||bodyBackupBusy||Boolean(store?.recoveryRequired);
-  if(el('recover'))el('recover').disabled=!ready||!store?.recoveryRequired;
-  if(el('recover-now')){el('recover-now').hidden=!store?.recoveryRequired;el('recover-now').disabled=!ready||busy;}
+  el('import').disabled=!ready||busy||branchBusy||bodyBackupBusy||exporting||Boolean(store?.recoveryRequired);
+  if(el('recover'))el('recover').disabled=!ready||exporting||branchBusy||!store?.recoveryRequired;
+  if(el('recover-now')){el('recover-now').hidden=!store?.recoveryRequired;el('recover-now').disabled=!ready||busy||exporting||branchBusy;}
   if(el('raw-backup'))el('raw-backup').disabled=!ready||branchBusy||exporting;
   if(el('raw-body'))el('raw-body').disabled=!ready||busy||branchBusy||exporting||bodyBackupBusy;
   if(el('purge-corrupt'))el('purge-corrupt').disabled=disabled||exporting||store?.mode()!=='SQLite';
   if(el('raw-rows'))el('raw-rows').disabled=!ready||busy||branchBusy||exporting;
-  if(el('rebuild-idb'))el('rebuild-idb').disabled=!ready||busy||branchBusy||!store?.canRebuildFromIdb;
+  if(el('rebuild-idb'))el('rebuild-idb').disabled=!ready||busy||branchBusy||exporting||!store?.canRebuildFromIdb;
   if(el('reset-history'))el('reset-history').disabled=disabled;
-  for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy||(bodyBackupBusy&&input.id!=='edit-body');
+  for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy||exporting||(bodyBackupBusy&&input.id!=='edit-body');
   el('stop').disabled=!busy;
   for(const id of ['accept','retry','discard','candidate-edit'])if(el(id))
     el(id).disabled=disabled||!candidate||(id==='accept'&&!candidate?.text?.trim())||(id==='retry'&&cooling);
@@ -572,25 +572,6 @@ function presentExport(name,content,mime,result,warning=''){
   const alternative=needsManual&&text===null?'／大きいため手動欄に保持しません。ファイルを確認し、必要なら本編のみJSON・軽量JSON・本文TXTまたは分割救出をお試しください。':'';
   status((warning?warning+'／':'')+result.message+alternative,Boolean(warning)||needsManual);
 }
-// Serialize full backups one archive at a time; do not retain all materialized
-// branch objects or continue accumulating an unimportable >50 MB JSON.
-async function fullBackup(snapshot){
-  // branches can appear anywhere in property order, so construct the object
-  // without that property, then append the array explicitly.
-  const {branches,...base}=snapshot;
-  const head=JSON.stringify(base).slice(0,-1)+',"branches":[';
-  const pieces=[head];let bytes=utf8ByteLength(head)+2;
-  if(bytes>TRANSFER_MAX_BYTES)return null;
-  for(const b of branches){
-    const full=store?(await store.materialize({...snapshot,branches:[b]},b.id)).branches[0]:b;
-    const part=JSON.stringify(full);
-    bytes+=utf8ByteLength(part)+(pieces.length>1?1:0);
-    if(bytes>TRANSFER_MAX_BYTES)return null;
-    if(pieces.length>1)pieces.push(',');
-    pieces.push(part);
-  }
-  pieces.push(']}');return pieces.join('');
-}
 async function exportAs(ext){
   if(!ready||exporting||branchBusy)return;
   exporting=true;clearManualExport();lockUI();
@@ -606,9 +587,8 @@ async function exportAs(ext){
       if(choice!=='yes')return;
     }
     let content;
-    if(light)content=compactBackup(store?await store.materialize(snapshot):snapshot);
+    if(light||ext==='json')content=await serializeBackup(snapshot,async b=>store?(await store.materialize({...snapshot,branches:[b]},b.id)).branches[0]:b,{compact:light,maxBytes:TRANSFER_MAX_BYTES});
     else if(mainOnly)content=JSON.stringify({...snapshot,branches:[]});
-    else if(ext==='json')content=await fullBackup(snapshot);
     else content=readableText(snapshot,ext);
     if(json&&(content===null||utf8ByteLength(content)>TRANSFER_MAX_BYTES)){
       backupSizeWarning='50MB超のJSONは再読み込みできないため書き出しを中止しました。軽量JSONまたは本編のみJSONを利用してください。';
