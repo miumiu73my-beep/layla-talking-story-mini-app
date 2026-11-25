@@ -476,3 +476,32 @@ test('failed startup read without IndexedDB rejects save and retains all SQLite 
   await assert.rejects(st.save({...original,body:'上書き不可'}),/保存できません/);
   assert.deepEqual([...sql.map],before);
 });
+
+test('draft-only save reuses exact SQLite root chunks and frozen archives',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),st=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  let state=freshState();state.body='あ'.repeat(250000);
+  state.branches=[{id:'fork',name:'分岐',body:'い'.repeat(250000)}];
+  state=cleanState(state);
+  const archive=state.branches[0];
+  assert.equal(cleanState(state).branches[0],archive);
+  assert.ok(Object.isFrozen(archive)&&Object.isFrozen(archive.turns));
+  await st.save(state);
+  const before=JSON.parse(sql.map.get('active'));
+  state.draft='入力のみ';
+  await st.save(state);
+  const after=JSON.parse(sql.map.get('active'));
+  assert.ok(after.parts.filter(k=>before.parts.includes(k)).length>=5);
+  assert.deepEqual(after.branchParts,before.branchParts);
+  const reopened=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  assert.equal(reopened.initial.body,state.body);
+  assert.equal(reopened.initial.draft,'入力のみ');
+  assert.equal(reopened.initial.branches[0].body,archive.body);
+});
+test('queued saves capture mutable active fields before asynchronous writes',async()=>{
+  const sql=fakeSql(),st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  const state=freshState();state.body='保存対象';state.draft='最初';
+  const saving=st.save(state);state.body='未保存の変更';state.draft='後から変更';
+  await saving;
+  const reopened=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  assert.equal(reopened.initial.body,'保存対象');assert.equal(reopened.initial.draft,'最初');
+});
