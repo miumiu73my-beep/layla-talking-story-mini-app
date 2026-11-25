@@ -609,3 +609,80 @@ test('corrupted split pending IDB archive cannot replace healthy SQLite',async()
   assert.equal(sql.map.get('active'),manifest);
   assert.equal((await reopened.materialize(reopened.initial)).branches[0].body,'正しい分岐本文');
 });
+
+
+test('scoped checkpoints do not read or duplicate unrelated long archived branches',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),st=await openStore({db:sql},()=>{},{idbFactory:idb.factory,lazyArchives:true});
+  const s=freshState();s.body='本'.repeat(1000000);
+  s.branches=Array.from({length:30},(_,i)=>({id:'archive'+i,name:'分岐'+i,body:'枝'.repeat(1000000)+i}));
+  await st.save(s);
+  const compact=st.compactState(cleanState(s));
+  let reads=0;const original=sql.executeSql.bind(sql);
+  sql.executeSql=async(q,a=[])=>{
+    if(q.startsWith('SELECT v FROM')&&String(a[0]).includes('/branch/'))reads++;
+    return original(q,a);
+  };
+  await st.checkpoint(compact,'本文を大きく削除する前');
+  const entry=(await st.checkpointList()).find(x=>x.scope==='active');
+  assert.ok(entry);assert.ok(entry.size<1100000);assert.equal(reads,0);
+  const restored=await st.loadCheckpoint(entry.id,{...compact,body:'短縮'});
+  assert.equal(restored.body,s.body);assert.equal(restored.branches.length,30);
+  assert.equal(reads,0);
+  await st.checkpoint(compact,'分岐削除前',{scope:'branch',branchId:'archive2'});
+  const deleted=(await st.checkpointList()).find(x=>x.scope==='branch');
+  assert.ok(deleted.size<1100000);
+  const restoredBranch=await st.loadCheckpoint(deleted.id,{...compact,branches:compact.branches.filter(b=>b.id!=='archive2')});
+  assert.equal(restoredBranch.body,s.body);
+  assert.equal(restoredBranch.branches.find(b=>b.id==='archive2').body,'枝'.repeat(1000000)+'2');
+  assert.equal(restoredBranch.branches.length,30);
+  await assert.rejects(st.loadCheckpoint(deleted.id,compact));
+});
+
+test('important checkpoints have independent quotas in SQLite and IndexedDB',async()=>{
+  for(const host of [{db:fakeSql()},{}]){
+    const st=await openStore(host,()=>{},{idbFactory:fakeIdb().factory,lazyArchives:true});
+    const s=freshState();s.body='重要な原稿';
+    for(const reason of ['import','reset','本文を大きく削除する前'])await st.checkpoint(s,reason);
+    for(let i=0;i<10;i++)await st.checkpoint(s,'通常'+i);
+    const list=await st.checkpointList();
+    assert.equal(list.length,11);
+    for(const reason of ['import','reset','本文を大きく削除する前'])assert.ok(list.some(x=>x.reason===reason));
+    assert.ok(!list.some(x=>x.reason==='通常0'));
+  }
+});
+
+test('corrupt generation rows survive repeated saves and restart and are exported by key',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),host={db:sql};
+  let st=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+  const s=freshState();s.body='旧原稿'.repeat(30000);
+  s.branches=[{id:'oldfork',name:'旧分岐',body:'分岐の救出本文'}];
+  await st.save(s);
+  const m=JSON.parse(sql.map.get('active'));
+  sql.map.delete(m.parts[1]);
+  const surviving=[...m.parts,...m.branchParts[0].parts].filter(k=>sql.map.has(k));
+  st=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+  assert.equal(st.readOnly,true);assert.equal(st.canRebuildFromIdb,true);
+  const recovered=await st.rebuildFromIdb();
+  assert.equal(recovered.body,s.body);assert.equal(st.mode(),'SQLite');
+  await st.save({...freshState(),body:'新原稿1'});
+  await st.save({...freshState(),body:'新原稿2'});
+  st=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+  await st.save({...freshState(),body:'新原稿3'});
+  for(const key of surviving)assert.ok(sql.map.has(key));
+  const keys=await st.rawRowKeys(),rows=[];
+  for(let i=0;i<Math.ceil(keys.length/10);i++)rows.push(...JSON.parse(await st.rawRowPage(keys,i)).rows);
+  assert.ok(rows.some(r=>r.value?.includes('分岐の救出本文')));
+  assert.ok(rows.some(r=>r.key.startsWith('corrupt-backup/')));
+});
+
+test('failed corrupt protection does not authorize replacing the old ACTIVE',async()=>{
+  const sql=fakeSql();const s=freshState();s.body='旧原稿';seed(sql,s);
+  const m=JSON.parse(sql.map.get('active'));m.hash='broken';sql.map.set('active',JSON.stringify(m));
+  const original=sql.map.get('active');
+  const st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  sql.setFailWrite(true);
+  await assert.rejects(st.allowImportRecovery());
+  assert.equal(st.readOnly,true);
+  await assert.rejects(st.save(freshState()));
+  assert.equal(sql.map.get('active'),original);
+});
