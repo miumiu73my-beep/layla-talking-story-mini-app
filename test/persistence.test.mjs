@@ -714,3 +714,33 @@ test('whole-work checkpoint archive pool deduplicates unchanged branches and sur
     assert.equal((await reopened.loadCheckpoint(selected.id)).branches[0].body,'枝'.repeat(120000));
   }
 });
+
+test('cumulative deletion checkpoint restores original body after autosaves and rotation',async()=>{
+  const {makeBodyRecovery}=await import('../src/branches.js');
+  for(const host of [{db:fakeSql()},{}]){
+    const idb=fakeIdb(),st=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+    let s=freshState();s.body='原稿'.repeat(5000);
+    s.branches=[{id:'archive',name:'旧分岐',body:'保存済み分岐'}];
+    const original=s.body;
+    await st.save(s);s=st.compactState(cleanState(s));
+    const r=makeBodyRecovery();
+    await st.checkpoint(s,'セッション開始時の自動復元点',{scope:'active'});r.seed(s);
+    for(const length of [6000,3600,2160]){
+      const plan=r.plan(s,length);
+      if(plan){
+        await st.checkpoint(plan.snapshot,plan.reason,{scope:'active'});
+        r.completed(plan);
+      }
+      s={...s,body:s.body.slice(0,length)};
+      await st.save(s);s=st.compactState(s);
+    }
+    for(let i=0;i<10;i++)await st.checkpoint(s,'日次自動復元点',{scope:'active'});
+    const reopened=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+    const item=(await reopened.checkpointList()).find(x=>x.reason==='本文の累積・大幅削除前');
+    assert.ok(item);
+    const restored=await reopened.loadCheckpoint(item.id,reopened.initial);
+    assert.equal(restored.body,original);
+    assert.equal(restored.branches.length,1);
+    assert.equal(restored.branches[0].id,'archive');
+  }
+});
