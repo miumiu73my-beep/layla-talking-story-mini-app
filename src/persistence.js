@@ -2,7 +2,7 @@
 // Compatible with the legacy talking_story_data_v1 ACTIVE {version:1,parts,at} format.
 // Immutable chunks -> single manifest switch; retain the previous generation.
 // Never auto-overwrite healthy SQLite with unvalidated/different pending IDB data.
-import {cleanState,checksum} from './logic.js';
+import {cleanState,checksum,compactBackup,expandCompactBackup} from './logic.js';
 
 const TABLE='talking_story_data_v1',ACTIVE='active',DBNAME='talking-story-fallback-v1';
 export function splitChunks(src,limit=40000){
@@ -294,12 +294,25 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   // A checkpoint's parent key holds small metadata; its data is in chunks.
   // Old single-row SQL and IDB checkpoints remain readable.
+  let checkpointTail=Promise.resolve(),lastCheckpointAt=0;
   async function checkpoint(state,reason='操作前'){
     if(readOnly)throw Error('復旧中のため復元点を作成できません。');
-    const normalized=validator(state),raw=JSON.stringify(normalized);
-    const id='checkpoint/'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8);
-    const entry={id,at:Date.now(),title:normalized.title,chars:normalized.body.length,reason,
-      hash:checksum(raw),size:raw.length};
+    // Snapshot before waiting: the caller may continue editing the state.
+    const normalized=validator(state);
+    const compact=Boolean(normalized.branches?.length);
+    const raw=compact?compactBackup(normalized):JSON.stringify(normalized);
+    const at=lastCheckpointAt=Math.max(Date.now(),lastCheckpointAt+1);
+    const id='checkpoint/'+at.toString(36)+'-'+Math.random().toString(36).slice(2,8);
+    const entry={id,at,title:normalized.title,chars:normalized.body.length,reason,
+      format:compact?'shared-prefix-v2':'v1',hash:checksum(raw),size:raw.length};
+    // A concurrent checkpoint must never prune another's unfinished chunks.
+    const task=checkpointTail.then(()=>writeCheckpoint(entry,raw));
+    checkpointTail=task.catch(()=>{});
+    return task;
+  }
+  async function writeCheckpoint(entry,raw){
+    if(readOnly)throw Error('復旧中のため復元点を作成できません。');
+    const {id}=entry;
     let sqlFailure=null;
     if(sqlAvailable){
       try{
@@ -311,10 +324,20 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
           names.push(key);
         }
         await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[id,JSON.stringify({...entry,parts:names})]);
-        try{await pruneSqlCheckpoints();}catch(e){notify('古い復元点の整理は次回行います: '+e.message,true);}
+        try{await pruneSqlCheckpoints(id);}catch(e){notify('古い復元点の整理は次回行います: '+e.message,true);}
         return;
       }catch(e){
         sqlFailure=e;
+        // If the parent was actually committed despite an SDK error, do not
+        // delete its data. Otherwise reclaim partial writes immediately.
+        try{
+          const parent=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[id]));
+          if(!parent.length){
+            const keys=sqlRows(await run('SELECT k FROM '+TABLE)).map(r=>r.k);
+            for(const key of keys)if(typeof key==='string'&&key.startsWith(id+'/part/'))
+              await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
+          }
+        }catch{/* A future successful checkpoint will collect orphan chunks. */}
         notify('SQLite復元点の作成に失敗しました。IndexedDBへ退避を試します: '+e.message,true);
       }
     }
@@ -322,8 +345,10 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       // Only index metadata is read to show the restore picker.
       await idb.put('checkpoint-data/'+id,raw);
       const list=(await idb.get('checkpoint-index'))||[];
-      await idb.put('checkpoint-index',[entry,...list].slice(0,8));
-      for(const old of list.slice(7))if(typeof idb.delete==='function')
+      const sorted=[entry,...list].sort((a,b)=>(Number(b.at)||0)-(Number(a.at)||0));
+      try{await idb.put('checkpoint-index',sorted.slice(0,8));}
+      catch(e){if(typeof idb.delete==='function')try{await idb.delete('checkpoint-data/'+id);}catch{}throw e;}
+      for(const old of sorted.slice(8))if(typeof idb.delete==='function')
         try{await idb.delete('checkpoint-data/'+old.id);}catch(e){notify('古いIndexedDB復元点の清掃を延期します: '+e.message,true);}
       return;
     }
@@ -338,24 +363,32 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         const row=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]))[0]?.v;
         if(typeof row!=='string')continue;
         const entry=JSON.parse(row);
+        if(!entry||typeof entry!=='object'||(!Array.isArray(entry.parts)&&typeof entry.data!=='string'))throw Error('復元点の親情報が不正です。');
         parents.push({key,entry});
       }catch(e){notify('旧復元点のメタ情報を読めません: '+e.message,true);}
     }
     return parents;
   }
-  async function pruneSqlCheckpoints(){
+  async function pruneSqlCheckpoints(newId){
     const parents=await sqlCheckpointParents();
-    parents.sort((a,b)=>(Number(b.entry.at)||0)-(Number(a.entry.at)||0));
+    parents.sort((a,b)=>(Number(b.entry.at)||0)-(Number(a.entry.at)||0)||
+      Number(b.key===newId)-Number(a.key===newId)||b.key.localeCompare(a.key));
     const keep=parents.slice(0,8),drop=parents.slice(8);
     // Include every committed parent part in the keep-set. Remove uncommitted
     // orphan /part rows as well as parts of evicted snapshots.
-    const keptParts=new Set(keep.flatMap(p=>p.entry.parts||[]));
+    const keptParts=new Set(keep.flatMap(p=>Array.isArray(p.entry.parts)?p.entry.parts:[]));
     const keys=sqlRows(await run('SELECT k FROM '+TABLE)).map(r=>r.k);
+    const readable=new Set(parents.map(p=>p.key));
+    const unknown=new Set(keys.filter(k=>typeof k==='string'&&/^checkpoint\\/[^/]+$/.test(k)&&!readable.has(k)));
+    // Preserve parts of unreadable parent rows for forensic recovery. Remove
+    // evicted parents first, so an interrupted GC never leaves a broken parent.
+    for(const p of drop)await run('DELETE FROM '+TABLE+' WHERE k=?',[p.key]);
     for(const key of keys){
-      if(typeof key==='string'&&key.startsWith('checkpoint/')&&key.includes('/part/')&&!keptParts.has(key))
+      if(typeof key!=='string'||!key.startsWith('checkpoint/')||!key.includes('/part/'))continue;
+      const owner=key.slice(0,key.indexOf('/part/'));
+      if(!keptParts.has(key)&&!unknown.has(owner))
         await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
     }
-    for(const p of drop)await run('DELETE FROM '+TABLE+' WHERE k=?',[p.key]);
   }
   async function checkpointList(){
     const all=[];
@@ -405,7 +438,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       if(entry.hash&&checksum(raw)!==entry.hash)throw Error('復元点のチェックサムが一致しません。');
     }
     if(typeof raw!=='string')throw Error('復元点を読み込めません。');
-    return validator(JSON.parse(raw));
+    const parsed=JSON.parse(raw);
+    return validator(parsed?.version===2?expandCompactBackup(parsed):parsed);
   }
   // Backward-compatible eager API for existing callers/tests. The UI uses
   // checkpointList + loadCheckpoint to avoid loading 12 huge documents at once.
