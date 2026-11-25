@@ -1,7 +1,7 @@
 // Non-destructive branching for prior turns. No Layla-specific dependencies.
 // Active branch stays in root body/turns/settings for v1 JSON compatibility;
 // inactive branches are full snapshots so none are silently overwritten.
-import {cleanState,bodyFingerprint,acceptTurn,FIELDS,isArchiveReference} from './logic.js';
+import {cleanState,bodyFingerprint,acceptTurn,FIELDS,isArchiveReference,rememberReply} from './logic.js';
 
 export const MAX_ARCHIVED_BRANCHES=30;
 export const SNAPSHOT_FIELDS=[
@@ -104,6 +104,10 @@ export function editReplyAt(state,index,replacement){
 }
 export function regenerateAt(state,index){
   const old=timelineAt(state,index);
+  if(index===state.turns.length-1){
+    if(old.end!==state.body.length)throw Error('最終ターン後に独立した追記があります。元の展開を守るため、分岐で巻き戻してから再生成してください。');
+    const next=rewindLastWithoutFork(state);next.draft=old.user;return next;
+  }
   const next=forkAt(state,{index,label:'第'+(index+1)+'ターンの返信を再生成'});
   next.draft=old.user;
   return next;
@@ -209,18 +213,19 @@ export function reconcileBodyEdit(state,nextBody){
   d.branches=state.branches||[];
   return d;
 }
-// A bounded-branch emergency undo: no full additional fork, only an explicit
-// checkpoint is needed before invoking this pure transformation.
+// Latest-turn undo does not create a branch or depend on legacy state.undo.
+// Keep only the discarded reply (plus any displaced pending candidate).
 export function rewindLastWithoutFork(state){
   const d=cleanState({...state,branches:[]});
   const turns=timeline(d);
   if(!turns.length)throw Error('取り消せるターンがありません。');
   const last=turns[turns.length-1];
-  if(last.end!==d.body.length)
-    throw Error('最終ターンの後に直接追記があります。先に本文を確認してください。');
-  d.body=d.body.slice(0,prefixBefore(d.body,last.start));
+  d.replyTrash=rememberReply(d.replyTrash,d.pendingCandidate?.text);
+  d.replyTrash=rememberReply(d.replyTrash,last.reply);
+  // Preserve any independent manually appended text after the last turn.
+  d.body=d.body.slice(0,prefixBefore(d.body,last.start))+d.body.slice(last.end);
   d.turns.pop();
-  d.draft=last.user||d.draft;
+  if(!d.draft.trim())d.draft=last.user||d.draft;
   d.undo=null;d.pendingCandidate=null;
   d.branches=state.branches||[];
   return d;
