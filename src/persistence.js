@@ -379,7 +379,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const keptParts=new Set(keep.flatMap(p=>Array.isArray(p.entry.parts)?p.entry.parts:[]));
     const keys=sqlRows(await run('SELECT k FROM '+TABLE)).map(r=>r.k);
     const readable=new Set(parents.map(p=>p.key));
-    const unknown=new Set(keys.filter(k=>typeof k==='string'&&/^checkpoint\\/[^/]+$/.test(k)&&!readable.has(k)));
+    const unknown=new Set(keys.filter(k=>typeof k==='string'&&/^checkpoint\/[^/]+$/.test(k)&&!readable.has(k)));
     // Preserve parts of unreadable parent rows for forensic recovery. Remove
     // evicted parents first, so an interrupted GC never leaves a broken parent.
     for(const p of drop)await run('DELETE FROM '+TABLE+' WHERE k=?',[p.key]);
