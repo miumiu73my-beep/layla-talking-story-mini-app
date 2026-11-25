@@ -1,6 +1,27 @@
 // Pure data validation, prompt budgeting and reversible story state transitions.
 export const FORMAT='layla-talking-story-backup',VERSION=1;
 export const BODY_LIMIT=1500000,TRANSFER_MAX_BYTES=50000000;
+export const REPLY_TRASH_LIMIT=20;
+// Keep recent replies, not entire story snapshots. Retain a single oversized
+// reply intact rather than silently truncating it.
+export function rememberReply(trash,text){
+  if(typeof text!=='string'||!text.trim())return [...trash];
+  const entries=[text,...trash].slice(0,REPLY_TRASH_LIMIT);
+  let total=entries[0].length;
+  return entries.filter((entry,i)=>{if(i===0)return true;total+=entry.length;return total<=BODY_LIMIT;});
+}
+export function restoreReplyCandidate(state,index){
+  if(state.pendingCandidate)throw Error('先に未採用候補を採用するか破棄してください。');
+  const text=state.replyTrash?.[index];
+  if(typeof text!=='string'||!text.trim())throw Error('返信が見つかりません。');
+  const user=state.draft.trim()||'この場面を自然に続きを進める';
+  return {user,text,sourceDraft:state.draft,baseFingerprint:bodyFingerprint(state.body),note:'ごみ箱から復元した候補です。現在の本文・入力に合うか確認してから採用してください。'};
+}
+// Return true only for a changed stream payload; callers advance the dirty revision.
+export function updateStreamText(candidate,text){
+  if(typeof text!=='string'||candidate.text===text)return false;
+  candidate.text=text;return true;
+}
 export const LIMITS=Object.freeze({
   title:120,synopsis:12000,characters:30000,world:25000,memory:25000,
   avoidPlot:15000,avoidWords:10000,player:10000,goal:15000,rules:15000,modelNote:120
@@ -26,7 +47,7 @@ export function freshState(){
   return {schema:FORMAT,version:VERSION,updatedAt:new Date().toISOString(),
     title:'新しい物語',synopsis:'',characters:'',world:'',memory:'',
     avoidPlot:'',avoidWords:'',player:'',goal:'',rules:'',modelNote:'',
-    body:'',turns:[],draft:'',pendingCandidate:null,undo:null,
+    body:'',turns:[],draft:'',pendingCandidate:null,undo:null,replyTrash:[],
     activeBranch:{id:'main',name:'本編',createdAt:new Date().toISOString(),parentId:null,forkTurn:null},branches:[],
     prefs:{targetChars:300,contextChars:3600,contextTokens:8192,pace:'普通',
       pov:'ユーザー視点（二人称寄り）',autoAdopt:false,includeInput:true,recordInputInBody:false,
@@ -79,6 +100,10 @@ export function cleanState(raw){
       if(typeof t.userPrelude==='string')u.userPrelude=t.userPrelude;
       return u;
     });
+  }
+  if(raw.replyTrash!==undefined){
+    if(!Array.isArray(raw.replyTrash)||raw.replyTrash.length>REPLY_TRASH_LIMIT||raw.replyTrash.some(t=>typeof t!=='string'||!t.trim()))throw Error('返信ごみ箱の形式が不正です。');
+    d.replyTrash=[...raw.replyTrash];
   }
   if(raw.pendingCandidate!==undefined&&raw.pendingCandidate!==null){
     const c=raw.pendingCandidate;
