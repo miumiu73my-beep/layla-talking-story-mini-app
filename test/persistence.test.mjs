@@ -530,7 +530,11 @@ test('lazy split store keeps only metadata and does not read or write archived b
   assert.deepEqual(idbAfter.core,idbBefore.core);
   assert.deepEqual(idbAfter.archives,idbBefore.archives);
   assert.deepEqual(writes,['active']);assert.equal(reads.length,0);
-  const reopened=await openStore(host,()=>{},opts);
+  reads.length=0;
+  const idbReads=[],readFactory=async()=>{const db=await idb.factory();return {...db,get:async key=>{idbReads.push(key);return db.get(key);}};};
+  const reopened=await openStore(host,()=>{},{...opts,idbFactory:readFactory});
+  assert.equal(reads.filter(k=>k.includes('/branch/')).length,0);
+  assert.equal(idbReads.filter(k=>k.includes('/branch/')).length,0);
   assert.equal(reopened.initial.draft,'下書きのみ');
   assert.equal(reopened.initial.branches[29].body,undefined);
   const selected=await reopened.materialize(reopened.initial,'fork29');
@@ -770,4 +774,60 @@ test('stream partial candidate and reply trash survive SQLite and IDB-only resta
     assert.deepEqual(reopened.initial.replyTrash,['前の返信']);
     assert.equal(reopened.initial.branches.length,0);
   }
+});
+
+test('lazy split missing SQL archive preserves root and other archives without IDB',async()=>{
+  const sql=fakeSql(),host={db:sql},opts={lazyArchives:true,idbFactory:async()=>{throw Error('no IDB');}};
+  let st=await openStore(host,()=>{},opts);
+  const state=cleanState({...freshState(),body:'救出する本編',branches:[
+    {id:'bad',name:'破損分岐',body:'枝'.repeat(90000)},
+    {id:'good',name:'健全分岐',body:'正常な分岐本文'}]});
+  await st.save(state);
+  const manifest=sql.map.get('active'),m=JSON.parse(manifest);
+  sql.map.delete(m.branchParts[0].parts[0]);
+  const surviving=[...sql.map.keys()];
+  st=await openStore(host,()=>{},opts);
+  assert.equal(st.initial.body,state.body);
+  assert.equal(st.initial.branches.length,2);
+  assert.match(st.archiveIssue(st.initial.branches[0]),/欠落/);
+  assert.equal(st.archiveIssue(st.initial.branches[1]),'');
+  assert.equal(st.readOnly,true);
+  assert.equal((await st.materialize(st.initial,'good')).branches[1].body,'正常な分岐本文');
+  await assert.rejects(st.materialize(st.initial,'bad'),/読み込めません/);
+  await assert.rejects(st.save({...st.initial,draft:'上書き禁止'}),/上書き禁止/);
+  assert.equal(sql.map.get('active'),manifest);
+  assert.deepEqual([...sql.map.keys()],surviving);
+});
+
+test('lazy archive checksum failure is deferred until selected and prevents later writes',async()=>{
+  for(const withSql of [true,false]){
+    const sql=fakeSql(),idb=fakeIdb(),host=withSql?{db:sql}:{};
+    const opts={lazyArchives:true,idbFactory:idb.factory};
+    let st=await openStore(host,()=>{},opts);
+    await st.save(cleanState({...freshState(),body:'本編',branches:[{id:'one',name:'破損候補',body:'原文'}]}));
+    const rec=idb.data.get('latest');
+    idb.data.set(rec.archives[0].key,'broken');
+    if(withSql){const m=JSON.parse(sql.map.get('active'));sql.map.set(m.branchParts[0].parts[0],'broken');}
+    st=await openStore(host,()=>{},opts);
+    assert.equal(st.initial.body,'本編');
+    assert.equal(st.readOnly,false);
+    await assert.rejects(st.materialize(st.initial,'one'),/読み込めません/);
+    assert.match(st.archiveIssue(st.initial.branches[0]),/読み込めません/);
+    assert.equal(st.readOnly,true);
+    await assert.rejects(st.save(st.initial),/上書き禁止/);
+  }
+});
+
+test('legacy split archives acquire summaries on next save',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),host={db:sql},opts={lazyArchives:true,idbFactory:idb.factory};
+  let st=await openStore(host,()=>{},opts);
+  await st.save(cleanState({...freshState(),body:'旧形式',branches:[{id:'one',name:'旧分岐',body:'旧本文'}]}));
+  const m=JSON.parse(sql.map.get('active')),record=idb.data.get('latest');
+  for(const e of [...m.branchParts,...record.archives]){delete e.summary;delete e.summaryHash;}
+  sql.map.set('active',JSON.stringify(m));idb.data.set('latest',record);
+  st=await openStore(host,()=>{},opts);
+  assert.equal(st.initial.branches[0].name,'旧分岐');
+  await st.save({...st.initial,draft:'移行'});
+  assert.equal(JSON.parse(sql.map.get('active')).branchParts[0].summary.name,'旧分岐');
+  assert.equal(idb.data.get('latest').archives[0].summary.name,'旧分岐');
 });
