@@ -7,7 +7,7 @@ export const MAX_ARCHIVED_BRANCHES=30;
 export const SNAPSHOT_FIELDS=[
   ...FIELDS.map(([key])=>key),'body','turns','draft','pendingCandidate','undo','prefs'
 ];
-const copy=x=>JSON.parse(JSON.stringify(x));
+const copy=x=>x===null||typeof x!=='object'?x:JSON.parse(JSON.stringify(x));
 export function branchMeta(raw={},fallbackId='main',fallbackName='本編'){
   const id=typeof raw?.id==='string'&&/^[A-Za-z0-9_-]{1,100}$/.test(raw.id)?raw.id:fallbackId;
   const name=typeof raw?.name==='string'&&raw.name.trim()?raw.name.trim().slice(0,90):fallbackName;
@@ -79,7 +79,7 @@ export function forkAt(state,{index,after=false,label='別の展開'}={}){
   };
   // A timeline whose last turn is manually edited should never get silently reinterpreted.
   timeline(forked);
-  return forked;
+  return cleanState(forked);
 }
 export function rewindAfter(state,index){
   return forkAt(state,{index,after:true,label:'第'+(index+1)+'ターンまで戻した分岐'});
@@ -131,9 +131,9 @@ export function renameBranch(state,id,name){
   else{
     const b=s.branches.find(b=>b.id===id);
     if(!b)throw Error('分岐が見つかりません。');
-    b.name=label;
+    s.branches=s.branches.map(entry=>entry.id===id?{...entry,name:label}:entry);
   }
-  return s;
+  return cleanState(s);
 }
 export function deleteInactiveBranch(state,id){
   const s=cleanState(state);
