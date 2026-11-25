@@ -71,6 +71,7 @@ async function saveNow(force=false){
   const revision=editRev;
   try{
     await store.save(state);
+    state=store.compactState(state);
     savedRev=Math.max(savedRev,revision);
     saveError=store.backupWarning||'';
     status(saveError||'保存済み（'+store.mode()+'）',Boolean(saveError));
@@ -142,7 +143,7 @@ function showBranches(){
   for(const b of state.branches.slice().reverse()){
     const row=node('div','branch-row'),summary=node('div','branch-summary');
     summary.append(node('strong','',b.name));
-    summary.append(node('div','hint',b.turns.length+'ターン・本文'+b.body.length.toLocaleString('ja-JP')+'文字'));
+    summary.append(node('div','hint',(b.turnCount??b.turns.length)+'ターン・本文'+(b.chars??b.body.length).toLocaleString('ja-JP')+'文字'));
     const actions=node('div','actions branch-actions');
     actions.append(
       actionButton('この分岐を開く',()=>branchAction('switch',b.id)),
@@ -477,7 +478,8 @@ async function exportAs(ext){
     if(bodyEditBackup)await bodyEditBackup;
     commitPendingBodyEdit();
     const light=ext==='compact-json';
-    const content=light?compactBackup(state):ext==='json'?JSON.stringify(state):readableText(state,ext);
+    const snapshot=(light||ext==='json')?await store.materialize(cleanState(state)):state;
+    const content=light?compactBackup(snapshot):ext==='json'?JSON.stringify(snapshot):readableText(snapshot,ext);
     const tooLarge=(ext==='json'||light)&&new TextEncoder().encode(content).length>TRANSFER_MAX_BYTES;
     const warning=tooLarge?'このJSONは50MB超で再読み込みできません。軽量JSONや分岐整理後の再保存が必要です。':'';
     if(warning)backupSizeWarning=warning;
@@ -558,7 +560,7 @@ async function recoverChoice(){
   if(choice!=='idb'&&choice!=='sqlite')return;
   try{
     const recovered=await store.chooseRecovery(choice);
-    state=cleanState(recovered);candidate=state.pendingCandidate;
+    state=store.compactState(cleanState(recovered));candidate=state.pendingCandidate;
     saveBlocked=false;saveError='';ready=true;
     editRev++;savedRev=editRev;
     paint();rebuildSettings();lockUI();safety();
@@ -615,7 +617,7 @@ async function applyStoryChange(transform,note,{destructive=false}={}){
   const original=state,oldCandidate=candidate;
   try{
     if(!await beforeDestructive('分岐操作',{checkpoint:destructive}))return false;
-    const changed=transform(original);
+    const changed=await transform(original);
     if(!changed||typeof changed!=='object')throw Error('変更後の状態が不正です。');
     state=changed;candidate=state.pendingCandidate;
     state.updatedAt=new Date().toISOString();editRev++;
@@ -694,10 +696,10 @@ async function branchAction(action,id){
     const selection=await modal('「'+found.name+'」に切り替えます。人物設定・世界観・自由記憶・ユーザー設定はどうしますか？\n生成パラメータは常に現在の値を引き継ぎます。',
       [['branch','切替先分岐の設定を使用'],['inherit','現在の設定を引き継ぐ'],['cancel','キャンセル']]);
     if(selection!=='branch'&&selection!=='inherit')return;
-    if(await applyStoryChange(s=>switchBranch(s,id,{inheritLore:selection==='inherit'}),'分岐を切り替えました'))showMain();
+    if(await applyStoryChange(async s=>switchBranch(await store.materialize(s,id),id,{inheritLore:selection==='inherit'}),'分岐を切り替えました'))showMain();
   }else if(action==='rename'){
     const result=await textModal('分岐の名前を編集します。',found.name,{max:90,multiline:false});
-    if(result)await applyStoryChange(s=>renameBranch(s,id,result.text),'分岐名を変更しました');
+    if(result)await applyStoryChange(async s=>renameBranch(await store.materialize(s,id),id,result.text),'分岐名を変更しました');
   }else if(action==='delete'){
     if(await modal('保存されている分岐「'+found.name+'」を削除しますか？\n現在の分岐は削除しません。削除前の状態は復元点へ保存しますが、外部JSONバックアップも推奨します。')!=='yes')return;
     await applyStoryChange(s=>deleteInactiveBranch(s,id),'指定分岐を削除しました',{destructive:true});
@@ -781,7 +783,7 @@ function setup(){
 async function init(){
   setup();lockUI();
   try{
-    store=await openStore(host,(message,isError=false)=>status(message,isError),{validator:cleanState});
+    store=await openStore(host,(message,isError=false)=>status(message,isError),{validator:cleanState,lazyArchives:true});
     if(store.initial){
       try{state=cleanState(store.initial);}
       catch(e){saveBlocked=true;saveError='データ読み込みエラー: '+e.message;ready=true;paint();safety();return;}
