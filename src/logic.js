@@ -34,6 +34,15 @@ export function freshState(){
       repeat_last_n:'',repeat_penalty_slope:'',frequency_penalty:'',
       presence_penalty:'',max_tokens:''}};
 }
+// Only canonical, deeply immutable archived snapshots can bypass revalidation.
+const canonicalArchives=new WeakSet();
+function freezeArchive(value){
+  if(value&&typeof value==='object'&&!Object.isFrozen(value)){
+    for(const child of Object.values(value))freezeArchive(child);
+    Object.freeze(value);
+  }
+  return value;
+}
 export function cleanState(raw){
   if(!raw||typeof raw!=='object'||Array.isArray(raw))throw Error('作品の形式が不正です。');
   if(raw.schema!==undefined&&raw.schema!==FORMAT)throw Error('別の形式のバックアップです。');
@@ -115,6 +124,7 @@ export function cleanState(raw){
       if(!b||typeof b!=='object'||Array.isArray(b)||typeof b.id!=='string'||
         !/^[A-Za-z0-9_-]{1,100}$/.test(b.id)||used.has(b.id))throw Error('分岐IDが不正または重複しています。');
       used.add(b.id);
+      if(canonicalArchives.has(b))return b;
       const clean=cleanState({...b,activeBranch:null,branches:[]});
       const entry={
         id:b.id,name:typeof b.name==='string'&&b.name.trim()?b.name.slice(0,90):'無題の分岐',
@@ -124,6 +134,7 @@ export function cleanState(raw){
       };
       for(const key of Object.keys(LIMITS))entry[key]=clean[key];
       for(const key of ['body','turns','draft','pendingCandidate','undo','prefs'])entry[key]=clean[key];
+      freezeArchive(entry);canonicalArchives.add(entry);
       return entry;
     });
   }
