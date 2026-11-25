@@ -2,6 +2,11 @@
 export const FORMAT='layla-talking-story-backup',VERSION=1;
 export const BODY_LIMIT=1500000,TRANSFER_MAX_BYTES=50000000;
 export const REPLY_TRASH_LIMIT=20;
+export const PROMPT_INPUT_LIMIT=6000;
+export function inputLimitWarning(text){
+  const n=String(text||'').length;
+  return n>PROMPT_INPUT_LIMIT?'今回の入力は'+n+'文字です。送信上限'+PROMPT_INPUT_LIMIT+'文字を超えています。短くするまで生成できません（原文は保存されます）。':'';
+}
 // Keep recent replies, not entire story snapshots. Retain a single oversized
 // reply intact rather than silently truncating it.
 export function rememberReply(trash,text){
@@ -53,7 +58,7 @@ export function freshState(){
       pov:'ユーザー視点（二人称寄り）',autoAdopt:false,includeInput:true,recordInputInBody:false,
       temperature:'',top_p:'',top_k:'',min_p:'',repeat_penalty:'',
       repeat_last_n:'',repeat_penalty_slope:'',frequency_penalty:'',
-      presence_penalty:'',max_tokens:''}};
+      presence_penalty:'',max_tokens:'',maxTokensVersion:1}};
 }
 // Only canonical, deeply immutable archived snapshots can bypass revalidation.
 const canonicalArchives=new WeakSet(), archiveReferences=new WeakSet();
@@ -127,6 +132,9 @@ export function cleanState(raw){
       if(typeof value==='string'||typeof value==='number'||typeof value==='boolean')d.prefs[key]=value;
     }
   }
+  // Reset the legacy default once; a newly selected explicit 768 is preserved.
+  if(raw.prefs?.maxTokensVersion!==1&&Number(d.prefs.max_tokens)===768)d.prefs.max_tokens='';
+  d.prefs.maxTokensVersion=1;
   d.prefs.targetChars=bound(d.prefs.targetChars,100,1000,300);
   d.prefs.contextChars=bound(d.prefs.contextChars,500,12000,3600);
   d.prefs.contextTokens=bound(d.prefs.contextTokens,2048,65536,8192);
@@ -166,8 +174,8 @@ export function cleanState(raw){
         parentId:typeof b.parentId==='string'?b.parentId:null,
         forkTurn:Number.isSafeInteger(b.forkTurn)?b.forkTurn:null
       };
-      for(const key of Object.keys(LIMITS))entry[key]=clean[key];
-      for(const key of ['body','turns','draft','pendingCandidate','undo','prefs'])entry[key]=clean[key];
+      for(const key of Object.keys(LIMITS))if(key!=='modelNote')entry[key]=clean[key];
+      for(const key of ['body','turns','draft','pendingCandidate','undo'])entry[key]=clean[key];
       freezeArchive(entry);canonicalArchives.add(entry);
       return entry;
     });
@@ -176,11 +184,12 @@ export function cleanState(raw){
   return d;
 }
 export function warningsForState(data){
-  const d=cleanState({...data,branches:[]}),warnings=[];
+  // The live state is validated; warnings only inspect string lengths.
+  const d=data,warnings=[];
   for(const [key,max] of Object.entries(LIMITS)){
-    if(d[key].length>max)warnings.push(key+'：推奨入力上限を超過（既存データは保持）');
+    if(typeof d[key]==='string'&&d[key].length>max)warnings.push(key+'：推奨入力上限を超過（既存データは保持）');
   }
-  if(d.body.length>BODY_LIMIT)warnings.push('本文が150万字を超過しています。削除せず読み込みました。外部JSONへバックアップしてください。');
+  if(typeof d.body==='string'&&d.body.length>BODY_LIMIT)warnings.push('本文が150万字を超過しています。削除せず読み込みました。外部JSONへバックアップしてください。');
   return warnings;
 }
 function safeTail(input,n){
@@ -212,7 +221,9 @@ export function buildRequest(state,userText){
   const desiredTokens=Number(p.max_tokens)||Math.min(4096,Math.ceil(p.targetChars*2.2)+128);
   const outputTokens=Math.max(1,Math.min(desiredTokens,Math.floor(p.contextTokens/2)));
   const inputBudget=Math.max(600,Math.floor((p.contextTokens-Math.min(outputTokens,Math.floor(p.contextTokens*0.5))-160)*0.66));
-  const input=String(userText||'').slice(0,6000);
+  const input=String(userText||'');
+  const warning=inputLimitWarning(input);
+  if(warning)throw Error(warning);
   const directives=[
     'あなたはユーザーが参加する対話型日本語フィクションの語り手です。本文だけを書いてください。',
     'ユーザー本人の新しい台詞・行動・感情・思考・決断は勝手に創作してはいけません。入力された行動・台詞はそのまま物語の因果に取り込んでください。',
@@ -315,42 +326,63 @@ export function readableText(state,format){
   throw Error('未対応の形式です。');
 }
 
-// Optional smaller JSON backup: keep v1 full backup available, while the v2
-// variant shares long common body prefixes across archived branches.
-// The normal app state and SQLite layout remain the original v1 schema.
+// V2 branch-prefix: sorted adjacent bodies share their longest common prefix,
+// including siblings which diverged early from the active branch. Old v2 reads remain.
+function commonPrefix(a,b){
+  let n=0;const limit=Math.min(a.length,b.length);
+  while(n<limit&&a.charCodeAt(n)===b.charCodeAt(n))n++;
+  if(n>0&&n<b.length&&b.charCodeAt(n)>=0xdc00&&b.charCodeAt(n)<=0xdfff)n--;
+  return n;
+}
 export function compactBackup(state){
   const d=cleanState(state);
   if(d.branches.some(isArchiveReference))throw Error('軽量JSONの作成前に分岐を読み込んでください。');
   const bodies=[d.body,...d.branches.map(b=>b.body)];
-  const base=bodies.reduce((a,b)=>b.length>a.length?b:a,'');
-  const pack=body=>{
-    let common=0;
-    while(common<body.length&&common<base.length&&body.charCodeAt(common)===base.charCodeAt(common))common++;
-    if(common>0&&common<body.length&&common<base.length){
-      const code=body.charCodeAt(common);
-      if(code>=0xdc00&&code<=0xdfff)common--;
-    }
-    return {prefix:common,suffix:body.slice(common)};
-  };
-  const payload={...d,body:pack(d.body),
-    branches:d.branches.map(b=>({...b,body:pack(b.body)}))};
-  return JSON.stringify({schema:FORMAT,version:2,kind:'shared-prefix',baseBody:base,payload});
+  const sorted=bodies.map((body,index)=>({body,index})).sort((a,b)=>a.body<b.body?-1:a.body>b.body?1:a.index-b.index);
+  const indices=[],entries=[];
+  sorted.forEach(({body,index},i)=>{
+    const prefix=i?commonPrefix(sorted[i-1].body,body):0;
+    entries.push({base:prefix?i-1:null,prefix,suffix:body.slice(prefix)});
+    indices[index]=i;
+  });
+  const payload={...d,body:indices[0],branches:d.branches.map((b,i)=>({...b,body:indices[i+1]}))};
+  return JSON.stringify({schema:FORMAT,version:2,kind:'branch-prefix',entries,payload});
 }
 export function expandCompactBackup(value){
-  if(value?.schema!==FORMAT||value?.version!==2||value.kind!=='shared-prefix'||
-    typeof value.baseBody!=='string'||!value.payload||typeof value.payload!=='object')
+  if(value?.schema!==FORMAT||value?.version!==2||!value.payload||typeof value.payload!=='object')
     throw Error('軽量JSONバックアップの形式が正しくありません。');
-  const unpack=entry=>{
-    if(!entry||!Number.isSafeInteger(entry.prefix)||entry.prefix<0||
-       entry.prefix>value.baseBody.length||typeof entry.suffix!=='string')
-      throw Error('共有本文の参照位置が不正です。');
-    return value.baseBody.slice(0,entry.prefix)+entry.suffix;
-  };
   const raw=value.payload;
   if(!Array.isArray(raw.branches)||raw.branches.length>30)
     throw Error('軽量JSONの分岐数が不正です。');
-  return cleanState({...raw,body:unpack(raw.body),
-    branches:raw.branches.map(b=>({...b,body:unpack(b.body)}))});
+  let unpack;
+  if(value.kind==='shared-prefix'&&typeof value.baseBody==='string'){
+    unpack=entry=>{
+      if(!entry||!Number.isSafeInteger(entry.prefix)||entry.prefix<0||
+         entry.prefix>value.baseBody.length||typeof entry.suffix!=='string')
+        throw Error('共有本文の参照位置が不正です。');
+      return value.baseBody.slice(0,entry.prefix)+entry.suffix;
+    };
+  }else if(value.kind==='branch-prefix'&&Array.isArray(value.entries)&&value.entries.length===raw.branches.length+1){
+    const decoded=[];
+    for(const entry of value.entries){
+      if(!entry||!Number.isSafeInteger(entry.prefix)||entry.prefix<0||typeof entry.suffix!=='string')
+        throw Error('共有本文の参照位置が不正です。');
+      if(entry.base===null){
+        if(entry.prefix!==0)throw Error('共有本文の参照位置が不正です。');
+        decoded.push(entry.suffix);continue;
+      }
+      if(!Number.isSafeInteger(entry.base)||entry.base<0||entry.base>=decoded.length||entry.prefix>decoded[entry.base].length)
+        throw Error('共有本文の参照位置が不正です。');
+      decoded.push(decoded[entry.base].slice(0,entry.prefix)+entry.suffix);
+    }
+    const used=new Set();
+    unpack=index=>{
+      if(!Number.isSafeInteger(index)||index<0||index>=decoded.length||used.has(index))
+        throw Error('共有本文の分岐参照が不正です。');
+      used.add(index);return decoded[index];
+    };
+  }else throw Error('軽量JSONバックアップの形式が正しくありません。');
+  return cleanState({...raw,body:unpack(raw.body),branches:raw.branches.map(b=>({...b,body:unpack(b.body)}))});
 }
 
 export function parseImport(filename,content,current){
