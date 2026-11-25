@@ -266,7 +266,6 @@ function rebuildSettings(){
   pendingBodyEdit=null;clearTimeout(bodyEditTimer);bodyEditTimer=null;
   deletionWarning='';historyWarning='';renderBodyEditWarnings();
   const count=el('edit-count');count.textContent=state.body.length+' / '+BODY_LIMIT+'文字';
-  let composing=false;
   const queueBodyEdit=()=>{
     if(bodyBackupBusy||saveBlocked)return;
     const text=edit.value;
@@ -294,12 +293,10 @@ function rebuildSettings(){
       return;
     }
     pendingBodyEdit=text;
-    if(!composing)bodyEditTimer=setTimeout(commitPendingBodyEdit,330);
+    bodyEditTimer=setTimeout(commitPendingBodyEdit,330);
   };
-  edit.oncompositionstart=()=>{composing=true;clearTimeout(bodyEditTimer);bodyEditTimer=null;};
-  edit.oncompositionend=()=>{composing=false;queueBodyEdit();};
-  edit.oninput=()=>{if(composing){count.textContent=edit.value.length+' / '+BODY_LIMIT+'文字';return;}queueBodyEdit();};
-  edit.onblur=()=>{if(!bodyBackupBusy){composing=false;queueBodyEdit();if(!bodyBackupBusy)commitPendingBodyEdit();}};
+  edit.oninput=queueBodyEdit;
+  edit.onblur=()=>{if(!bodyBackupBusy){queueBodyEdit();if(!bodyBackupBusy)commitPendingBodyEdit();}};
   updatePromptMeta();
 }
 function renderBodyEditWarnings(){
