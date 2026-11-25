@@ -3,6 +3,7 @@
 // Immutable chunks -> single manifest switch; retain the previous generation.
 // Never auto-overwrite healthy SQLite with unvalidated/different pending IDB data.
 import {cleanState,checksum,compactBackup,expandCompactBackup,archiveReference,isArchiveReference} from './logic.js';
+import {snapshot as branchSnapshot,MAX_ARCHIVED_BRANCHES} from './branches.js';
 
 const TABLE='talking_story_data_v1',ACTIVE='active',DBNAME='talking-story-fallback-v1';
 export function splitChunks(src,limit=40000){
@@ -71,7 +72,7 @@ function validate(raw,validator){
 export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,validator=cleanState,lazyArchives=false}={}){
   let idb=null,fallback=null,sqlAvailable=false,sqlProblem='',rawEvidence=null,sqliteCorrupt=false;
   let sqlSnapshot=null,manifest=null,readOnly=false,recoveryRequired=false;
-  let preferred=null,mode='保存不可',seq=0,backupWarning='',nextSqlRetry=0,skipCleanupOnce=false;
+  let preferred=null,mode='保存不可',seq=0,backupWarning='',nextSqlRetry=0,rebuildPending=false;
   // A session must never overwrite SQLite it failed to fully read on startup.
   let sqlInitialized=false,sqlRetryBlocked=false;
   const branchCache=new WeakMap();
@@ -396,10 +397,24 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     // Retain active and previous immutable branches. GC only unreferenced
     // generations; never remove checkpoint chunks.
     try{
-      if(skipCleanupOnce){skipCleanupOnce=false;return;}
       const retain=new Set([ACTIVE,...keys,...(previous?.parts||[])]);
       for(const b of [...branchParts,...(previous?.branchParts||[])])for(const key of b.parts)retain.add(key);
       const all=sqlRows(await run('SELECT k FROM '+TABLE));
+      // Recovery markers survive restart and protect every readable old generation row.
+      for(const {k} of all){
+        if(typeof k!=='string')continue;
+        if(k.startsWith('corrupt-keep/'))retain.add(k.slice('corrupt-keep/'.length));
+        if(k.startsWith('corrupt-backup/')&&!k.startsWith('corrupt-backup/v2-')){
+          // Older versions saved only a manifest; conservatively retain all rows if unreadable.
+          const raw=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[k]))[0]?.v;
+          const old=JSON.parse(raw);
+          if(!Array.isArray(old.parts))throw Error('旧破損目録を解析できません。清掃を保留します。');
+          for(const generation of [old,old.previous])if(generation){
+            for(const key of generation.parts||[])retain.add(key);
+            for(const b of generation.branchParts||[])for(const key of b.parts||[])retain.add(key);
+          }
+        }
+      }
       for(const row of all){
         const key=row.k;
         if(typeof key==='string'&&key.startsWith('g')&&!retain.has(key))
@@ -483,17 +498,39 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   // A checkpoint's parent key holds small metadata; its data is in chunks.
   // Old single-row SQL and IDB checkpoints remain readable.
   let checkpointTail=Promise.resolve(),lastCheckpointAt=0;
-  async function checkpoint(state,reason='操作前'){
+  const protectedReason=reason=>/^(import|reset)$|取込|読み込|新規作成|新しい作品|本文.*(削除|大幅)/.test(reason||'');
+  function retention(entries){
+    const regular=entries.filter(e=>!protectedReason(e.reason)),important=entries.filter(e=>protectedReason(e.reason));
+    // Independent quota: ordinary operations never evict the last three important points.
+    return [...regular.slice(0,8),...important.slice(0,3)];
+  }
+  async function checkpoint(state,reason='操作前',{scope=lazy?'active':'full',branchId=null}={}){
     if(readOnly)throw Error('復旧中のため復元点を作成できません。');
     // Snapshot before waiting: the caller may continue editing the state.
     const snapshot=validator(state);
-    const normalized=lazy?await materialize(snapshot):snapshot;
-    const compact=Boolean(normalized.branches?.length);
-    const raw=compact?compactBackup(normalized):JSON.stringify(normalized);
+    // Replacing an entire work or resolving storage conflicts must preserve all
+    // archives. Ordinary points preserve only the active branch.
+    if(scope==='active'&&(/^(import|reset)$|復旧元|自動復旧前/.test(reason)))scope='full';
+    let normalized,raw,format;
+    if(scope==='branch'){
+      const b=snapshot.branches.find(x=>x.id===branchId);
+      if(!b)throw Error('削除する分岐が見つかりません。');
+      const branch=await readArchive(b);
+      normalized={title:branch.name,body:branch.body};
+      raw=JSON.stringify({scope:'branch',branch});format='scoped-v1';
+    }else if(scope==='active'){
+      normalized=validator({...snapshot,branches:[]});
+      raw=JSON.stringify({scope:'active',state:normalized});format='scoped-v1';
+    }else if(scope==='full'){
+      normalized=lazy?await materialize(snapshot):snapshot;
+      const compact=Boolean(normalized.branches?.length);
+      raw=compact?compactBackup(normalized):JSON.stringify(normalized);
+      format=compact?'shared-prefix-v2':'v1';
+    }else throw Error('復元点の範囲が不正です。');
     const at=lastCheckpointAt=Math.max(Date.now(),lastCheckpointAt+1);
     const id='checkpoint/'+at.toString(36)+'-'+Math.random().toString(36).slice(2,8);
     const entry={id,at,title:normalized.title,chars:normalized.body.length,reason,
-      format:compact?'shared-prefix-v2':'v1',hash:checksum(raw),size:raw.length};
+      format,scope,hash:checksum(raw),size:raw.length};
     // A concurrent checkpoint must never prune another's unfinished chunks.
     const task=checkpointTail.then(()=>writeCheckpoint(entry,raw));
     checkpointTail=task.catch(()=>{});
@@ -535,9 +572,10 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       await idb.put('checkpoint-data/'+id,raw);
       const list=(await idb.get('checkpoint-index'))||[];
       const sorted=[entry,...list].sort((a,b)=>(Number(b.at)||0)-(Number(a.at)||0));
-      try{await idb.put('checkpoint-index',sorted.slice(0,8));}
+      const kept=retention(sorted),keepIds=new Set(kept.map(x=>x.id));
+      try{await idb.put('checkpoint-index',kept);}
       catch(e){if(typeof idb.delete==='function')try{await idb.delete('checkpoint-data/'+id);}catch{}throw e;}
-      for(const old of sorted.slice(8))if(typeof idb.delete==='function')
+      for(const old of sorted.filter(x=>!keepIds.has(x.id)))if(typeof idb.delete==='function')
         try{await idb.delete('checkpoint-data/'+old.id);}catch(e){notify('古いIndexedDB復元点の清掃を延期します: '+e.message,true);}
       return;
     }
@@ -562,7 +600,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const parents=await sqlCheckpointParents();
     parents.sort((a,b)=>(Number(b.entry.at)||0)-(Number(a.entry.at)||0)||
       Number(b.key===newId)-Number(a.key===newId)||b.key.localeCompare(a.key));
-    const keep=parents.slice(0,8),drop=parents.slice(8);
+    const keepIds=new Set(retention(parents.map(p=>({...p.entry,id:p.key}))).map(e=>e.id));
+    const keep=parents.filter(p=>keepIds.has(p.key)),drop=parents.filter(p=>!keepIds.has(p.key));
     // Include every committed parent part in the keep-set. Remove uncommitted
     // orphan /part rows as well as parts of evicted snapshots.
     const keptParts=new Set(keep.flatMap(p=>Array.isArray(p.entry.parts)?p.entry.parts:[]));
@@ -609,29 +648,30 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     if(sqlAvailable){
       const parents=await sqlCheckpointParents();
       for(const {key,entry} of parents)
-        all.push({id:key,at:Number(entry.at)||0,title:entry.title,chars:entry.chars,reason:entry.reason||'旧復元点'});
+        all.push({id:key,at:Number(entry.at)||0,title:entry.title,chars:entry.chars,reason:entry.reason||'旧復元点',scope:entry.scope||'full',hash:entry.hash,size:entry.size});
       if(manifest?.previous)all.push({id:'previous',at:manifest.previous.at||0,
         title:'直前の保存世代',chars:null,reason:'直前の保存世代'});
     }
     if(idb)try{
       const indexed=await idb.get('checkpoint-index');
       for(const entry of indexed||[])all.push({id:'idb/'+entry.id,at:entry.at,title:entry.title,chars:entry.chars,
-        reason:entry.reason||'IndexedDB復元点'});
+        reason:entry.reason||'IndexedDB復元点',scope:entry.scope||'full',hash:entry.hash,size:entry.size});
       // Old IDB versions stored every snapshot in one array. Convert once to
       // individual records; future lists do not load the old manuscript bodies.
       const legacy=await legacyCheckpointIndex();
       for(const entry of legacy)all.push(entry);
     }catch(e){notify('IndexedDB復元点の一覧を読み込めません: '+e.message,true);}
-    return all.sort((a,b)=>b.at-a.at).slice(0,12);
+    return all.sort((a,b)=>b.at-a.at);
   }
-  async function loadCheckpoint(id){
-    let raw=null;
+  async function loadCheckpoint(id,current=null){
+    let raw=null,metadata=null;
     if(id==='previous'){
       if(!manifest?.previous)throw Error('直前の保存世代がありません。');
       return readGeneration(manifest.previous);
     }
     if(id.startsWith('idb/')){
       if(!idb)throw Error('IndexedDBが利用できません。');
+      metadata=((await idb.get('checkpoint-index'))||[]).find(x=>x.id===id.slice(4));
       raw=await idb.get('checkpoint-data/'+id.slice(4));
     }else if(id.startsWith('legacy-idb/')){
       const n=Number(id.slice('legacy-idb/'.length));
@@ -648,7 +688,27 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       if(entry.hash&&checksum(raw)!==entry.hash)throw Error('復元点のチェックサムが一致しません。');
     }
     if(typeof raw!=='string')throw Error('復元点を読み込めません。');
+    if(metadata&&(metadata.hash&&checksum(raw)!==metadata.hash||metadata.size!==undefined&&raw.length!==metadata.size))
+      throw Error('IndexedDB復元点のチェックサムが一致しません。');
     const parsed=JSON.parse(raw);
+    if(parsed.scope==='branch'){
+      if(!current)throw Error('分岐の復元には現在の作品が必要です。');
+      const d=validator(current),b=validatedArchive(parsed.branch,parsed.branch?.id);
+      if(d.activeBranch.id===b.id||d.branches.some(x=>x.id===b.id))
+        throw Error('同じIDの分岐が存在します。既存分岐を上書きしません。');
+      if(d.branches.length>=MAX_ARCHIVED_BRANCHES)throw Error('分岐が上限に達しています。');
+      return validator({...d,branches:[...d.branches,b]});
+    }
+    if(parsed.scope==='active'){
+      const restored=validator(parsed.state);
+      if(!current)return restored;
+      const d=validator(current),branches=d.branches.filter(b=>b.id!==restored.activeBranch.id);
+      if(d.activeBranch.id!==restored.activeBranch.id){
+        if(branches.length>=MAX_ARCHIVED_BRANCHES)throw Error('現在の分岐を保護する空きがありません。');
+        branches.push(branchSnapshot(d,d.activeBranch));
+      }
+      return validator({...restored,branches});
+    }
     return validator(parsed?.version===2?expandCompactBackup(parsed):parsed);
   }
   // Backward-compatible eager API for existing callers/tests. The UI uses
@@ -657,7 +717,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const list=await checkpointList();
     const out=[];
     for(const entry of list)try{
-      const data=JSON.stringify(await loadCheckpoint(entry.id));
+      const data=JSON.stringify(await materialize(await loadCheckpoint(entry.id,preferred)));
       out.push({...entry,data});
     }catch(e){notify('復元点が破損しています: '+e.message,true);}
     return out;
@@ -693,18 +753,57 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       try{
         const recoveredManifest=rawEvidence||JSON.stringify(manifest||{});
         await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[
-          'corrupt-backup/'+Date.now(),recoveredManifest
+          'corrupt-backup/v2-'+Date.now()+'-'+Math.random().toString(36).slice(2),recoveredManifest
         ]);
-        manifest=null;rootCache=null;sqlAvailable=true;sqlInitialized=true;sqlRetryBlocked=false;skipCleanupOnce=true;
+        // Preserve all old generation keys, even if the damaged manifest cannot be parsed.
+        // Publish write permission only after every durable protection marker is written.
+        const keys=sqlRows(await run('SELECT k FROM '+TABLE)).map(row=>row.k);
+        for(const key of keys)if(typeof key==='string'&&key.startsWith('g'))
+          await run('INSERT OR REPLACE INTO '+TABLE+' (k,v) VALUES (?,?)',['corrupt-keep/'+key,'1']);
+        manifest=null;rootCache=null;sqlAvailable=true;sqlInitialized=true;sqlRetryBlocked=false;
         sqliteCorrupt=false;sqlProblem='';
       }catch(e){
-        notify('SQLite復旧準備に失敗しました。IndexedDBへ退避します: '+e.message,true);
+        notify('SQLite復旧準備に失敗しました。破損データを保護するため復旧を中止します: '+e.message,true);
+        throw e;
       }
     }
     if(!sqlAvailable&&!idb)throw Error('SQLite復旧にも失敗し保存先がありません。読み取り専用を維持します。');
     readOnly=false;
     if(!sqlAvailable&&idb)mode='IndexedDB（退避）';
     return true;
+  }
+  async function rebuildFromIdb(){
+    if(!cleanIdb||recoveryRequired||!readOnly||(!sqliteCorrupt&&!rebuildPending))throw Error('検証済みIndexedDBからの再作成は利用できません。');
+    const selected=idbValid.value;
+    rebuildPending=true;
+    try{
+      await allowImportRecovery();
+      nextSqlRetry=0;
+      await save(selected);
+      if(mode!=='SQLite')throw Error('SQLiteへの書き込みを確認できません。');
+      rebuildPending=false;return selected;
+    }catch(e){readOnly=true;throw e;}
+  }
+  // Export bounded groups of raw SQLite rows, including archived branches,
+  // previous generations, checkpoint chunks and damaged backup evidence.
+  async function rawRowKeys(){
+    if(typeof sql!=='function')throw Error('SQLite APIを利用できません。');
+    return sqlRows(await run('SELECT k FROM '+TABLE)).map(r=>r.k)
+      .filter(k=>typeof k==='string'&&!k.startsWith('corrupt-keep/')).sort();
+  }
+  async function rawRowPage(keys,page=0){
+    const pageSize=10;
+    if(!Array.isArray(keys)||!Number.isSafeInteger(page)||page<0||page>=Math.ceil(keys.length/pageSize))
+      throw Error('救出ページが不正です。');
+    const rows=[];
+    for(const key of keys.slice(page*pageSize,(page+1)*pageSize)){
+      try{
+        const value=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]))[0]?.v;
+        if(typeof value!=='string')throw Error('保存行がありません。');
+        rows.push({key,value});
+      }catch(e){rows.push({key,error:String(e.message||e)});}
+    }
+    return JSON.stringify({schema:'layla-talking-story-recovery-rows',page:page+1,pages:Math.ceil(keys.length/pageSize),rows});
   }
   async function rawDump(){
     const LIMIT=2_000_000,MAX_PARTS=1200;
@@ -776,7 +875,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     get recoveryRequired(){return recoveryRequired;},get hasStorage(){return Boolean(sqlAvailable||idb);},
     mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},
     recoveryInfo:()=>({sqlite:sqlSnapshot?.validated.value?{title:sqlSnapshot.validated.value.title,chars:sqlSnapshot.validated.value.body.length,at:sqlSnapshot.validated.value.updatedAt,turns:sqlSnapshot.validated.value.turns.length}:null,idb:idbValid?.value?{title:idbValid.value.title,chars:idbValid.value.body.length,at:idbValid.value.updatedAt,turns:idbValid.value.turns.length}:null}),
-    save,checkpoint,checkpoints,checkpointList,loadCheckpoint,chooseRecovery,allowImportRecovery,rawDump,materialize,compactState,
+    get canRebuildFromIdb(){return cleanIdb&&readOnly&&!recoveryRequired&&(sqliteCorrupt||rebuildPending);},
+    save,checkpoint,checkpoints,checkpointList,loadCheckpoint,chooseRecovery,allowImportRecovery,rebuildFromIdb,rawDump,rawRowKeys,rawRowPage,materialize,compactState,
     flush:()=>new Promise((resolve,reject)=>{
       if(!working&&queued===null)return resolve();
       const wait=()=>{
