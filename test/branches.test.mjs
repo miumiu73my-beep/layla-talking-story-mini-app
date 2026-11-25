@@ -255,9 +255,13 @@ test('cumulative 40 percent deletions retain the original active snapshot across
   assert.equal(plan.snapshot.branches.length,0);
   // An unsuccessful checkpoint does not permit or forget the deletion.
   r.failed(plan);assert.equal(r.plan(s,3600).snapshot.body.length,10000);
-  r.completed(plan);s.body=s.body.slice(0,3600);
-  const next=r.plan(s,2160);
-  assert.equal(next.large,false);assert.equal(next.snapshot.body.length,3600);
+  s.body=s.body.slice(0,3600);r.completed(plan,s);
+  assert.equal(r.plan(s,3599),null);
+  assert.equal(r.plan(s,2160),null);
+  const next=r.plan(s,1700);
+  assert.equal(next.large,true);assert.equal(next.snapshot.body.length,3600);
+  s.body='';r.completed(next,s);
+  s.body='再開';assert.equal(r.plan(s,3),null);
 });
 
 test('first edit after growth and a new work use the correct recovery anchor',async()=>{
