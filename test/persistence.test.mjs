@@ -875,3 +875,33 @@ test('lazy root sections isolate settings, body and history writes across restar
     assert.deepEqual(restored.initial.turns,state.turns);
   }
 });
+
+
+test('daily checkpoints keep three distinct dates and never evict manual or important points',async()=>{
+  const realNow=Date.now;
+  try{
+    for(const host of [{db:fakeSql()},{}]){
+      const idb=fakeIdb(),opts={idbFactory:idb.factory,lazyArchives:true};
+      let st=await openStore(host,()=>{},opts);
+      const s=freshState();s.body='自動復元の原稿';
+      const day0=new Date(2026,10,20,12).getTime();
+      Date.now=()=>day0;
+      for(let i=0;i<8;i++)await st.checkpoint(s,'通常'+i);
+      for(const reason of ['import','reset','本文の累積・大幅削除前'])await st.checkpoint(s,reason);
+      for(let day=0;day<5;day++){
+        Date.now=()=>day0+day*86400000;
+        await st.checkpoint(s,'日次自動復元点',{scope:'active'});
+        for(let restart=0;restart<5;restart++){
+          st=await openStore(host,()=>{},opts);
+          const last=await st.latestAutomaticCheckpointAt();
+          assert.equal(new Date(last).toDateString(),new Date(Date.now()).toDateString());
+        }
+        await st.checkpoint(s,'日次自動復元点',{scope:'active'});
+      }
+      const list=await st.checkpointList();
+      assert.equal(list.filter(e=>e.reason==='日次自動復元点').length,3);
+      assert.equal(list.filter(e=>/^通常/.test(e.reason)).length,8);
+      for(const reason of ['import','reset','本文の累積・大幅削除前'])assert.ok(list.some(e=>e.reason===reason));
+    }
+  }finally{Date.now=realNow;}
+});
