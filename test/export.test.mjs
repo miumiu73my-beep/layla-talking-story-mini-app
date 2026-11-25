@@ -69,3 +69,8 @@ test('explicit cancellation wins over a contradictory success flag',async()=>{
   const result=await writeFile({utils:{saveFile:async()=>({success:true,cancelled:true})}},'story.txt','本文','text/plain');
   assert.equal(result.kind,'cancelled');
 });
+
+test('long titles retain the compact backup suffix',()=>{
+  const d=new Date(2026,10,24,0,4,5,678);
+  assert.match(filename('物語'.repeat(60),'json',d,'_軽量分岐'),/_軽量分岐_20261124-000405678\.json$/);
+});
