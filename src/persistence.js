@@ -22,10 +22,11 @@ export function sqlRows(result){
   if(rows===undefined||rows===null)
     throw Error('Layla SQLiteのSELECT結果が想定外の形式です。上書きを停止します。');
   let entries=null;
-  if(Array.isArray(rows))entries=rows;
-  else if(typeof rows.item==='function'&&typeof rows.length==='number')
-    entries=Array.from({length:rows.length},(_,i)=>rows.item(i));
-  else if(typeof rows.length==='number')entries=Array.from(rows);
+  if(Array.isArray(rows))entries=Array.from(rows);
+  else if(typeof rows==='object'&&Number.isSafeInteger(rows.length)&&rows.length>=0){
+    entries=typeof rows.item==='function'
+      ?Array.from({length:rows.length},(_,i)=>rows.item(i)):Array.from(rows);
+  }
   if(!entries)throw Error('Layla SQLiteの行データ形式が不明です。');
   if(entries.some(row=>!row||typeof row!=='object'||Array.isArray(row)))
     throw Error('SQLiteの行が名前付きフィールドを含みません。');
@@ -75,6 +76,13 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   let sqlInitialized=false,sqlRetryBlocked=false;
   const sql=host?.db?.executeSql;
   const run=async(q,args=[])=>host.db.executeSql(q,args);
+  // An empty result is only safe if the returned row container is valid.
+  async function readActiveRows(){
+    const rows=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[ACTIVE]));
+    if(rows.length>1||(rows.length===1&&typeof rows[0].v!=='string'))
+      throw Error('SQLite ACTIVEのSELECT結果に有効なvフィールドがありません。上書きを停止します。');
+    return rows;
+  }
   try{idb=await idbFactory();fallback=await idb.get('latest');}
   catch(e){notify('IndexedDBを利用できません: '+String(e.message||e));}
   if(typeof sql!=='function'){sqlProblem='SQLite API非対応（通常ブラウザ等）';}
@@ -82,7 +90,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     try{
       await run('CREATE TABLE IF NOT EXISTS '+TABLE+' (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
       sqlAvailable=true;
-      const rows=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[ACTIVE]));
+      const rows=await readActiveRows();
       if(rows.length){
         rawEvidence=rows[0].v;
         manifest=JSON.parse(String(rawEvidence));
@@ -104,7 +112,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       sqliteCorrupt=rawEvidence!==null||manifest!==null;
       readOnly=sqliteCorrupt;sqlAvailable=false;nextSqlRetry=Date.now()+20000;
       sqlRetryBlocked=!sqlInitialized;
-      notify(sqliteCorrupt?'SQLite保存を検証できません。上書きを停止しました: '+sqlProblem:'SQLiteを一時的に利用できません。IndexedDBへ退避を試します: '+sqlProblem);
+      notify(sqliteCorrupt?'SQLite保存を検証できません。上書きを停止しました: '+sqlProblem:'SQLiteを読み込めません。この起動中はSQLiteへ書き込まず、IndexedDBへ退避を試します。再起動後に保存元を確認してください: '+sqlProblem);
     }
   }
   let idbValid=null;
@@ -117,7 +125,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   const different=Boolean(cleanIdb&&sqlSnapshot?.validated.value&&!sqlSnapshot.validated.error&&
     JSON.stringify(idbValid.value)!==JSON.stringify(sqlSnapshot.validated.value));
   const safeFastForward=Boolean(cleanIdb&&fallback?.pending&&different&&sqlAvailable&&
-    Number.isSafeInteger(fallback.baseRev)&&fallback.baseRev===sqlSnapshot?.rev);
+    Number.isSafeInteger(fallback.baseRev)&&fallback.baseRev>0&&fallback.baseRev===sqlSnapshot?.rev);
   if(fallback?.pending&&cleanIdb&&different&&sqlAvailable&&!safeFastForward){
     recoveryRequired=true;readOnly=true;
     preferred=idbValid.value; // Display but do NOT write until explicit choice.
@@ -172,6 +180,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   async function readGeneration(m){return validator(await decodeGeneration(m));}
   async function writeSql(state){
+    if(!sqlInitialized||sqlRetryBlocked||!sqlAvailable)
+      throw Error('SQLiteの初期読込が未確認です。自動上書きを禁止します。');
     const generation='g'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
     const rootState={...state,branches:[]},rootJson=JSON.stringify(rootState);
     const chunks=splitChunks(rootJson);
@@ -223,20 +233,20 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   async function commit(raw){
     if(readOnly)throw Error('読み取り専用です。復旧元を確認するかJSONバックアップを利用してください。');
     const state=validator(JSON.parse(raw));
-    const saved={state,rev:seq+1,at:Date.now(),baseRev:manifest?.rev||0,pending:true};
+    const saved={state,rev:seq+1,at:Date.now(),baseRev:sqlInitialized&&!sqlRetryBlocked?(manifest?.rev||0):null,pending:true};
     if(!sqlAvailable&&!sqliteCorrupt&&sqlInitialized&&!sqlRetryBlocked&&
        typeof sql==='function'&&Date.now()>=nextSqlRetry){
       try{
         await run('CREATE TABLE IF NOT EXISTS '+TABLE+' (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
-        const rows=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[ACTIVE]));
+        const rows=await readActiveRows();
         // The ACTIVE manifest must still be exactly the generation we read.
         // Never write into an unknown or concurrently changed SQLite database.
         if(rows.length){
           const current=JSON.parse(String(rows[0].v));
-          if(!manifest||current.rev!==manifest.rev||
-             JSON.stringify(current.parts)!==JSON.stringify(manifest.parts)||
-             current.hash!==manifest.hash)
+          if(!manifest||JSON.stringify(current)!==JSON.stringify(manifest))
             throw Error('SQLite保存世代が変化しています。自動上書きを禁止しました。');
+          // A matching manifest is not sufficient if its chunks became unreadable.
+          await readGeneration(current);
         }else if(manifest){
           throw Error('SQLiteの既存ACTIVEが見つかりません。自動上書きを禁止しました。');
         }
