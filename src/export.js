@@ -1,11 +1,14 @@
 // File export prefers Layla native save, then Web Share, then browser download.
 // Never claim the file was actually saved by the OS until the user verifies it.
-export function filename(title,ext,date=new Date()){
+export function filename(title,ext,date=new Date(),suffix=''){
   const pad=x=>String(x).padStart(2,'0');
   const stamp=''+date.getFullYear()+pad(date.getMonth()+1)+pad(date.getDate())+'-'+pad(date.getHours())+
     pad(date.getMinutes())+pad(date.getSeconds())+String(date.getMilliseconds()).padStart(3,'0');
-  const clean=(String(title||'').trim()||'story').replace(/[\\/:*?"<>|\u0000-\u001f]/g,'_').slice(0,45);
-  return clean+'_'+stamp+'.'+ext;
+  const sanitize=value=>String(value).replace(/[\\/:*?"<>|\u0000-\u001f]/g,'_');
+  const ending=sanitize(suffix).slice(0,20);
+  let clean=sanitize(String(title||'').trim()||'story').slice(0,45-ending.length);
+  if(/[\uD800-\uDBFF]$/.test(clean))clean=clean.slice(0,-1);
+  return clean+ending+'_'+stamp+'.'+ext;
 }
 export function browserDownload(name,blob){
   if(typeof document==='undefined'||typeof URL==='undefined'||typeof URL.createObjectURL!=='function')
