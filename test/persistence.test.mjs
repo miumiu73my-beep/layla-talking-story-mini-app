@@ -733,9 +733,9 @@ test('cumulative deletion checkpoint restores original body after autosaves and 
       const plan=r.plan(s,length);
       if(plan){
         await st.checkpoint(plan.snapshot,plan.reason,{scope:'active'});
-        r.completed(plan);
       }
       s={...s,body:s.body.slice(0,length)};
+      if(plan)r.completed(plan,s);
       await st.save(s);s=st.compactState(s);
     }
     for(let i=0;i<10;i++)await st.checkpoint(s,'日次自動復元点',{scope:'active'});
@@ -830,4 +830,48 @@ test('legacy split archives acquire summaries on next save',async()=>{
   await st.save({...st.initial,draft:'移行'});
   assert.equal(JSON.parse(sql.map.get('active')).branchParts[0].summary.name,'旧分岐');
   assert.equal(idb.data.get('latest').archives[0].summary.name,'旧分岐');
+});
+
+test('lazy root sections isolate settings, body and history writes across restart',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={idbFactory:idb.factory,lazyArchives:true};
+  const host={db:sql};
+  let st=await openStore(host,()=>{},opts);
+  let state=cleanState({...freshState(),body:'本'.repeat(1000000),
+    turns:Array.from({length:1000},(_,i)=>({user:'履歴'.repeat(30)+i,at:''}))});
+  await st.save(state);
+  const before=JSON.parse(sql.map.get('active')),mirrorBefore=idb.data.get('latest');
+  assert.equal(before.rootSections.length,4);
+  assert.equal(mirrorBefore.coreParts.length,3);
+  const writes=[],scans=[],execute=sql.executeSql.bind(sql);
+  sql.executeSql=async(q,a=[])=>{
+    if(q.startsWith('INSERT'))writes.push(a[0]);
+    if(q.startsWith('SELECT k FROM'))scans.push(q);
+    return execute(q,a);
+  };
+  st=await openStore(host,()=>{},opts);
+  state=st.initial;
+  state.title+='設定';
+  await st.save(state);
+  const edited=JSON.parse(sql.map.get('active')),mirrorEdited=idb.data.get('latest');
+  const section=(m,i)=>m.parts.slice(m.rootSections.slice(0,i).reduce((a,b)=>a+b,0),
+    m.rootSections.slice(0,i+1).reduce((a,b)=>a+b,0));
+  assert.deepEqual(section(edited,1),section(before,1));
+  assert.deepEqual(section(edited,2),section(before,2));
+  assert.deepEqual(mirrorEdited.coreParts,mirrorBefore.coreParts);
+  assert.ok(writes.length<=3);
+  writes.length=0;scans.length=0;
+  state.body+='追加';
+  await st.save(state);
+  const appended=JSON.parse(sql.map.get('active')),mirrorAppended=idb.data.get('latest');
+  assert.deepEqual(section(appended,2),section(edited,2));
+  assert.deepEqual(mirrorAppended.coreParts.slice(1),mirrorEdited.coreParts.slice(1));
+  assert.ok(writes.length<=3);
+  assert.equal(scans.length,0);
+  const sqlRestored=await openStore(host,()=>{},opts);
+  const idbRestored=await openStore({},()=>{},opts);
+  for(const restored of [sqlRestored,idbRestored]){
+    assert.equal(restored.initial.body,state.body);
+    assert.equal(restored.initial.title,state.title);
+    assert.deepEqual(restored.initial.turns,state.turns);
+  }
 });
