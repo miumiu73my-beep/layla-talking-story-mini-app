@@ -86,6 +86,11 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     return {core:{...core,branches:[]},overlay:{draft,pendingCandidate,prefs,updatedAt}};
   };
   const coreSignature=core=>JSON.stringify({...core,body:''});
+  function checkOverlay(overlay,hash){
+    if(hash!==undefined&&checksum(JSON.stringify(overlay))!==hash)
+      throw Error('下書き・生成設定のチェックサムが一致しません。');
+    return overlay||{};
+  }
   const sameCore=(cache,core,signature)=>cache&&cache.body===core.body&&cache.signature===signature;
   function reference(b,source,entry){
     let ref=isArchiveReference(b)?b:storedRefs.get(b);
@@ -161,7 +166,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       branches.push(lazy?reference(full,'idb',entry):full);
     }
     if(lazy)idbRootCache={entry:record.core,body:core.body,signature:coreSignature(core)};
-    return {...core,...record.state,branches};
+    return {...core,...checkOverlay(record.state,record.overlayHash),branches};
   }
   async function writeMirror(saved){
     if(!lazy){await idb.put('latest',saved);return;}
@@ -193,7 +198,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         }
         archives.push(entry);
       }
-      const record={...header,format:2,state:overlay,core:coreEntry,archives,previousKeys,generation};
+      const record={...header,format:2,state:overlay,overlayHash:checksum(JSON.stringify(overlay)),core:coreEntry,archives,previousKeys,generation};
       // Manifest last: interrupted writes cannot replace the last valid snapshot.
       await idb.put('latest',record);
       idbLatest=record;idbRootCache={entry:coreEntry,body:core.body,signature};
@@ -310,8 +315,15 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   async function decodeGeneration(m,refs=false){
     if(!m||!Array.isArray(m.parts))throw Error('保存世代の情報がありません。');
-    const core=JSON.parse(await readParts(m.parts,m.hash,m.size));
-    const root={...core,...(m.overlay||{})};
+    const raw=await readParts(m.parts,m.hash,m.size),core=JSON.parse(raw);
+    const root={...core,...checkOverlay(m.overlay,m.overlayHash)};
+    // A fresh session can reuse unchanged root chunks too. This layout is
+    // produced by splitChunks; legacy roots are migrated on the next save.
+    if(refs&&m===manifest&&m.overlay){
+      const chunks=splitChunks(raw);
+      if(chunks.length===m.parts.length)
+        rootCache={manifest:m,chunks,body:core.body,signature:coreSignature(core)};
+    }
     // Old v1 manifest contains ALL branches inside root; new v1 stores immutable
     // archived branch blobs independently to avoid rewriting them on every edit.
     if(Array.isArray(m.branchParts)){
@@ -372,12 +384,12 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       ...(manifest.hash?{hash:manifest.hash}:{}),
       ...(manifest.size!==undefined?{size:manifest.size}:{}),
       ...(manifest.branchParts?{branchParts:manifest.branchParts}:{}),
-      ...(manifest.overlay?{overlay:manifest.overlay}:{}),
+      ...(manifest.overlay?{overlay:manifest.overlay,...(manifest.overlayHash!==undefined?{overlayHash:manifest.overlayHash}:{})}:{}),
       rev:manifest.rev||0
     }:null;
     const next={version:1,parts:keys,branchParts,at:Date.now(),rev:++seq,
       hash:reusable?manifest.hash:checksum(rootJson),size:reusable?manifest.size:rootJson.length,previous,
-      ...(lazy?{overlay}:{})};
+      ...(lazy?{overlay,overlayHash:checksum(JSON.stringify(overlay))}:{})};
     await run('INSERT OR REPLACE INTO '+TABLE+' (k,v) VALUES (?,?)',[ACTIVE,JSON.stringify(next)]);
     manifest=next;rootCache={manifest:next,chunks,body:core.body,signature};rawEvidence=null;
     if(lazy)for(let i=0;i<state.branches.length;i++)reference(state.branches[i],'sql',branchParts[i]);
