@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {filename,writeFile,utf8ToBase64} from '../src/export.js';
+import {filename,writeFile,utf8ToBase64,utf8ByteLength,manualExportPayload,MANUAL_EXPORT_LIMIT,serializeBackup} from '../src/export.js';
 test('filename uses local date including milliseconds and excludes dangerous characters',()=>{
   const d=new Date(2026,10,24,0,4,5,678);
   assert.equal(filename('   ','json',d),'story_20261124-000405678.json');
@@ -73,4 +73,35 @@ test('explicit cancellation wins over a contradictory success flag',async()=>{
 test('long titles retain the compact backup suffix',()=>{
   const d=new Date(2026,10,24,0,4,5,678);
   assert.match(filename('物語'.repeat(60),'json',d,'_軽量分岐'),/_軽量分岐_20261124-000405678\.json$/);
+});
+
+test('UTF-8 byte length and base64 match platform encoding including lone surrogates',()=>{
+  const text='あ😀\n'.repeat(10000)+'\ud800';
+  assert.equal(utf8ByteLength(text),Buffer.byteLength(text,'utf8'));
+  assert.equal(utf8ToBase64(text),Buffer.from(text,'utf8').toString('base64'));
+});
+test('large unconfirmed export does not retain payload; successful and cancelled exports release manual data',async()=>{
+  const large='海'.repeat(MANUAL_EXPORT_LIMIT+1);
+  const r=await writeFile({utils:{saveFile:async()=>undefined}},'large.txt',large,'text/plain');
+  assert.equal(r.kind,'unconfirmed');assert.equal(r.text,undefined);
+  assert.equal(manualExportPayload(large,r),null);
+  assert.equal(manualExportPayload('small',{kind:'share'}),null);
+  assert.equal(manualExportPayload('small',{kind:'cancelled'}),null);
+  assert.equal(manualExportPayload('small',{kind:'manual'}),'small');
+});
+test('bounded backup serializer loads each branch once and uses readable v1/v2 formats',async()=>{
+  const root={schema:'layla-talking-story-backup',version:1,body:'共通😀本文',branches:[{id:'a',body:'共通😀別'},{id:'b',body:'共通😀別追加'}]};
+  for(const compact of [false,true]){
+    let reads=0;
+    const raw=await serializeBackup(root,async b=>{reads++;return b;},{compact});
+    assert.equal(reads,2);const data=JSON.parse(raw);
+    if(!compact)assert.deepEqual(data,root);
+    else{
+      const bodies=[];
+      for(const entry of data.entries)bodies.push(entry.base===null?entry.suffix:bodies[entry.base].slice(0,entry.prefix)+entry.suffix);
+      assert.equal(bodies[data.payload.body],root.body);
+      assert.deepEqual(data.payload.branches.map(x=>bodies[x.body]),root.branches.map(x=>x.body));
+    }
+    assert.equal(await serializeBackup(root,async b=>b,{compact,maxBytes:5}),null);
+  }
 });
