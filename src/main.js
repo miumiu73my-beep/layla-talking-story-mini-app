@@ -36,7 +36,10 @@ function status(text,error=false){
   const e=el('status');if(e){e.textContent=notice;e.className='status'+(error?' error':'');}
 }
 function safety(text=''){
+  if(store?.readOnly)saveBlocked=true;
   const warnings=ready?warningsForState(state):[];
+  const unreadable=state.branches.filter(b=>store?.archiveIssue(b));
+  if(unreadable.length)warnings.push('読込不能の分岐 '+unreadable.length+'件：元データを保護しています。本文TXT/MDや生データ救出をご利用ください。');
   const problem=[text,saveError,backupSizeWarning,periodicWarning,saveBlocked?'保存停止中。JSON書き出しで現状を退避し、復旧元を確認してください。':''].filter(Boolean).join('／');
   const n=el('safety');
   n.hidden=!problem&&!warnings.length;
@@ -44,6 +47,7 @@ function safety(text=''){
   n.className='safety'+(problem?' error':'');
 }
 function lockUI(){
+  if(store?.readOnly)saveBlocked=true;
   const disabled=!ready||busy||branchBusy||bodyBackupBusy||saveBlocked;
   const cooling=Date.now()<stopUntil;
   for(const id of ['generate','new-story','restore','user-input'])
@@ -167,7 +171,7 @@ function showBranches(){
   if(!state.branches.length){target.append(node('p','hint','まだ分岐はありません。過去の返信を編集・再生成・巻き戻しすると、元の展開がここに保存されます。直前の取り消し・再生成は分岐を増やさずごみ箱に保存します。'));return;}
   for(const b of state.branches.slice().reverse()){
     const row=node('div','branch-row'),summary=node('div','branch-summary');
-    summary.append(node('strong','',b.name));
+    summary.append(node('strong','',b.name+(store?.archiveIssue(b)?'（読込不能・保護中）':'')));
     summary.append(node('div','hint',(b.turnCount??b.turns.length)+'ターン・本文'+(b.chars??b.body.length).toLocaleString('ja-JP')+'文字'));
     const actions=node('div','actions branch-actions');
     actions.append(
@@ -175,6 +179,7 @@ function showBranches(){
       actionButton('名前変更',()=>branchAction('rename',b.id)),
       actionButton('削除',()=>branchAction('delete',b.id))
     );
+    if(store?.archiveIssue(b))for(const button of actions.querySelectorAll('button'))button.dataset.invalidAction='1';
     row.append(summary,actions);target.append(row);
   }
 }
@@ -557,7 +562,7 @@ async function exportAs(ext){
       backupSizeWarning='';safety();
     }
     if(editRev!==savedRev)void saveNow(); // Never overwrite an identical saved generation.
-  }catch(e){status('書き出しに失敗しました: '+String(e.message||e),true);}
+  }catch(e){status('書き出しに失敗しました: '+String(e.message||e),true);safety();showBranches();lockUI();}
 }
 async function beforeDestructive(action,{checkpoint=true,scope,branchId}={}){
   if(!store?.hasStorage){status('端末保存ができません。外部JSONバックアップを取ってください。',true);return false;}
@@ -913,7 +918,6 @@ async function init(){
       else if(candidate.note?.includes('生成中'))candidate.note='中断前に保存された未採用候補です。確認してください。';
     }
     saveBlocked=store.readOnly||!store.hasStorage;
-    if(!saveBlocked&&!store.recoveryRequired)await ensurePeriodicCheckpoint();
     ready=true;
     if(store.recoveryRequired){
       saveError='SQLiteとIndexedDBの編集が衝突しています。上部の「復旧元を選択」から保存元を選んでください。';
@@ -925,6 +929,7 @@ async function init(){
       else status('準備完了。保存先：'+store.mode());
     }
     safety();
+    if(!saveBlocked&&!store.recoveryRequired)void ensurePeriodicCheckpoint().then(()=>safety());
   }catch(e){
     ready=true;saveBlocked=true;saveError='初期化に失敗: '+String(e.message||e);
     status(saveError,true);paint();safety();
