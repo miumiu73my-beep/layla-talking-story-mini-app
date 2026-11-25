@@ -2,14 +2,14 @@ import {makeRuntime} from './runtime.js';
 import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning} from './logic.js';
 import {openStore} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
-import {writeFile,filename,browserDownload} from './export.js';
+import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload} from './export.js';
 import './style.css';
 
 const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getElementById(id);
 const node=(tag,cls,value)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=value;return e;};
 let state=freshState(),store=null,ready=false,saveBlocked=true,busy=false,stream=null,activeId=0;
 let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning='',notice='',lastAcceptedMessage='';
-let lastExport=null,pendingBodyEdit=null,bodyEditTimer=null,bodyEditBackup=null;
+let lastExport=null,exporting=false,pendingBodyEdit=null,bodyEditTimer=null,bodyEditBackup=null;
 let deletionWarning='',historyWarning='';
 const bodyRecovery=makeBodyRecovery();
 let periodicAt=null,periodicTask=null,periodicWarning='',recoveryEpoch=0,periodicLoaded=false,periodicRetryAt=0;
@@ -66,8 +66,10 @@ function lockUI(){
   el('import').disabled=!ready||busy||branchBusy||bodyBackupBusy||Boolean(store?.recoveryRequired);
   if(el('recover'))el('recover').disabled=!ready||!store?.recoveryRequired;
   if(el('recover-now')){el('recover-now').hidden=!store?.recoveryRequired;el('recover-now').disabled=!ready||busy;}
-  if(el('raw-backup'))el('raw-backup').disabled=!ready||branchBusy;
-  if(el('raw-rows'))el('raw-rows').disabled=!ready||busy||branchBusy;
+  if(el('raw-backup'))el('raw-backup').disabled=!ready||branchBusy||exporting;
+  if(el('raw-body'))el('raw-body').disabled=!ready||busy||branchBusy||exporting||bodyBackupBusy;
+  if(el('purge-corrupt'))el('purge-corrupt').disabled=disabled||exporting||store?.mode()!=='SQLite';
+  if(el('raw-rows'))el('raw-rows').disabled=!ready||busy||branchBusy||exporting;
   if(el('rebuild-idb'))el('rebuild-idb').disabled=!ready||busy||branchBusy||!store?.canRebuildFromIdb;
   if(el('reset-history'))el('reset-history').disabled=disabled;
   for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy||(bodyBackupBusy&&input.id!=='edit-body');
@@ -80,8 +82,8 @@ function lockUI(){
     button.disabled=disabled||button.dataset.invalidAction==='1';
   for(const id of ['turn-go','turn-start'])if(el(id))el(id).disabled=disabled||!state.turns.length;
   for(const id of ['turn-older','turn-newer'])if(el(id))el(id).disabled=disabled||el(id).dataset.pageDisabled==='1';
-  for(const id of ['export-json','export-light-json','export-txt','export-md','quick-backup'])
-    if(el(id))el(id).disabled=!ready; // Export is allowed even in read-only recovery.
+  for(const id of ['export-json','export-light-json','export-main-json','export-txt','export-md','quick-backup'])
+    if(el(id))el(id).disabled=!ready||exporting||branchBusy; // Export is allowed even in read-only recovery.
 }
 function persist(delay=600){
   state.updatedAt=new Date().toISOString();
@@ -550,6 +552,10 @@ function stopGeneration(){
   }
   setTimeout(()=>release(false),5000);
 }
+function clearManualExport(){
+  lastExport=null;el('manual-text').value='';el('manual-export').hidden=true;
+  el('manual-name').textContent='';el('open-export-manual').hidden=true;
+}
 function showManualExport(){
   if(!lastExport)return;
   el('manual-export').hidden=false;el('manual-name').textContent=lastExport.name+(lastExport.warning?'／'+lastExport.warning:'');
@@ -559,32 +565,63 @@ function showManualExport(){
   el('manual-export').scrollIntoView({block:'nearest'});
 }
 function presentExport(name,content,mime,result,warning=''){
-  lastExport={name,text:content,mime,warning};
-  el('open-export-manual').hidden=false;
-  status((warning?warning+'／':'')+result.message,Boolean(warning)||result.kind==='manual'||result.kind==='unconfirmed');
-  if(result.kind==='manual'||result.kind==='unconfirmed'||!el('manual-export').hidden)showManualExport();
+  clearManualExport();
+  const text=manualExportPayload(content,result);
+  const needsManual=result.kind==='manual'||result.kind==='unconfirmed';
+  if(text!==null){lastExport={name,text,mime,warning};el('open-export-manual').hidden=false;}
+  const alternative=needsManual&&text===null?'／大きいため手動欄に保持しません。ファイルを確認し、必要なら本編のみJSON・軽量JSON・本文TXTまたは分割救出をお試しください。':'';
+  status((warning?warning+'／':'')+result.message+alternative,Boolean(warning)||needsManual);
+}
+// Serialize full backups one archive at a time; do not retain all materialized
+// branch objects or continue accumulating an unimportable >50 MB JSON.
+async function fullBackup(snapshot){
+  // branches can appear anywhere in property order, so construct the object
+  // without that property, then append the array explicitly.
+  const {branches,...base}=snapshot;
+  const head=JSON.stringify(base).slice(0,-1)+',"branches":[';
+  const pieces=[head];let bytes=utf8ByteLength(head)+2;
+  if(bytes>TRANSFER_MAX_BYTES)return null;
+  for(const b of branches){
+    const full=store?(await store.materialize({...snapshot,branches:[b]},b.id)).branches[0]:b;
+    const part=JSON.stringify(full);
+    bytes+=utf8ByteLength(part)+(pieces.length>1?1:0);
+    if(bytes>TRANSFER_MAX_BYTES)return null;
+    if(pieces.length>1)pieces.push(',');
+    pieces.push(part);
+  }
+  pieces.push(']}');return pieces.join('');
 }
 async function exportAs(ext){
-  if(!ready)return;
+  if(!ready||exporting||branchBusy)return;
+  exporting=true;clearManualExport();lockUI();
   try{
     while(bodyEditBackup)await bodyEditBackup;
     commitPendingBodyEdit();
-    const light=ext==='compact-json';
-    const snapshot=(light||ext==='json')&&store?await store.materialize(cleanState(state)):state;
-    const content=light?compactBackup(snapshot):ext==='json'?JSON.stringify(snapshot):readableText(snapshot,ext);
-    const tooLarge=(ext==='json'||light)&&new TextEncoder().encode(content).length>TRANSFER_MAX_BYTES;
-    const warning=tooLarge?'このJSONは50MB超で再読み込みできません。軽量JSONや分岐整理後の再保存が必要です。':'';
-    if(warning)backupSizeWarning=warning;
-    safety();
-    const name=filename(state.title,light?'json':ext,new Date(),light?'_軽量分岐':'');
-    const mime=(ext==='json'||light)?'application/json':ext==='md'?'text/markdown':'text/plain';
-    const result=await writeFile(host,name,content,mime);
-    presentExport(name,content,mime,result,warning);
-    if((ext==='json'||light)&&!warning&&result.kind==='share'){
-      backupSizeWarning='';safety();
+    const light=ext==='compact-json',mainOnly=ext==='main-json',json=light||mainOnly||ext==='json';
+    const snapshot=cleanState(state);
+    const branchChars=snapshot.branches.reduce((n,b)=>n+(b.chars??b.body?.length??0),0);
+    if((light||ext==='json')&&branchChars+snapshot.body.length>5000000){
+      const choice=await modal('分岐を含む大きなバックアップです。端末のメモリを多く使う場合があります。本編のみJSONも選べます。',[['yes','分岐込みで続行'],['main','本編のみJSON'],['no','キャンセル']]);
+      if(choice==='main'){exporting=false;lockUI();return await exportAs('main-json');}
+      if(choice!=='yes')return;
     }
-    if(editRev!==savedRev)void saveNow(); // Never overwrite an identical saved generation.
-  }catch(e){status('書き出しに失敗しました: '+String(e.message||e),true);safety();showBranches();lockUI();}
+    let content;
+    if(light)content=compactBackup(store?await store.materialize(snapshot):snapshot);
+    else if(mainOnly)content=JSON.stringify({...snapshot,branches:[]});
+    else if(ext==='json')content=await fullBackup(snapshot);
+    else content=readableText(snapshot,ext);
+    if(json&&(content===null||utf8ByteLength(content)>TRANSFER_MAX_BYTES)){
+      backupSizeWarning='50MB超のJSONは再読み込みできないため書き出しを中止しました。軽量JSONまたは本編のみJSONを利用してください。';
+      content=null;safety();status(backupSizeWarning,true);return;
+    }
+    const name=filename(snapshot.title,json?'json':ext,new Date(),light?'_軽量分岐':mainOnly?'_本編のみ':'');
+    const mime=json?'application/json':ext==='md'?'text/markdown':'text/plain';
+    const result=await writeFile(host,name,content,mime);
+    presentExport(name,content,mime,result);
+    if(json&&result.kind==='share'){backupSizeWarning='';safety();}
+    if(editRev!==savedRev)void saveNow();
+  }catch(e){status('書き出しに失敗しました: '+String(e.message||e)+'。本編のみJSONまたは本文TXTをお試しください。',true);safety();showBranches();}
+  finally{exporting=false;lockUI();}
 }
 async function beforeDestructive(action,{checkpoint=true,scope,branchId}={}){
   if(!store?.hasStorage){status('端末保存ができません。外部JSONバックアップを取ってください。',true);return false;}
@@ -681,9 +718,38 @@ async function rebuildIdb(){
   }catch(e){saveBlocked=true;status('SQLiteの再作成に失敗しました: '+String(e.message||e),true);safety();}
   finally{branchBusy=false;lockUI();}
 }
-async function exportRawRows(){
-  if(!store||busy||branchBusy)return;
+async function exportRescuedBody(){
+  if(!store||busy||branchBusy||exporting||bodyBackupBusy)return;
+  branchBusy=true;clearManualExport();lockUI();
+  try{
+    const sources=await store.rawBodySources();
+    if(!sources.length)throw Error('救出元がありません。');
+    const choices=sources.map((key,i)=>`${i+1}: ${key==='active'?'現在のSQLite':key}`).join('\n');
+    const selected=await textModal('本編TXT救出：番号を選択してください。\n'+choices,'1',{max:10,multiline:false});
+    if(!selected)return;
+    const source=sources[Number(selected.text)-1];
+    if(!source)throw Error('番号が不正です。');
+    const rescued=await store.rawBodyText(source),name=filename('talking-story-rescued-body','txt');
+    const result=await writeFile(host,name,rescued.text,'text/plain');
+    presentExport(name,rescued.text,'text/plain',result,rescued.partial?'部分救出・欠落や未復号断片あり':'救出原稿の内容は目視で確認してください。');
+  }catch(e){status('本編救出に失敗しました: '+String(e.message||e),true);}
+  finally{branchBusy=false;lockUI();}
+}
+async function purgeCorruption(){
+  if(!store||busy||branchBusy||bodyBackupBusy||exporting||saveBlocked||store.mode()!=='SQLite')return;
   branchBusy=true;lockUI();
+  try{
+    if(await modal('古い破損SQLiteデータを永久に削除します。必要な旧データは先に本編TXT救出・SQLite生データ救出で外部保存してください。現在と直前の保存世代・復元点は保持します。削除を実行しますか？',[['yes','古い破損データを削除'],['no','キャンセル']])!=='yes')return;
+    if(!await saveNow())throw Error('現在の保存を確認できません。');
+    await store.flush();
+    const result=await store.purgeCorruptEvidence();
+    status('旧破損データの保護を解除しました。削除行 '+result.removed+' 件、目録 '+result.backups+' 件。SQLite内部の空き領域として再利用されます。');
+  }catch(e){status('旧破損データの整理を中止しました: '+String(e.message||e),true);}
+  finally{branchBusy=false;lockUI();}
+}
+async function exportRawRows(){
+  if(!store||busy||branchBusy||exporting)return;
+  branchBusy=true;clearManualExport();lockUI();
   try{
     const keys=await store.rawRowKeys(),pages=Math.ceil(keys.length/10);
     if(!pages){status('救出できるSQLite行がありません。');return;}
@@ -698,12 +764,15 @@ async function exportRawRows(){
   finally{branchBusy=false;lockUI();}
 }
 async function exportRaw(){
+  if(!store||branchBusy||exporting)return;
+  exporting=true;clearManualExport();lockUI();
   try{
     const raw=await store.rawDump();
     const name=filename('talking-story-raw-recovery','json');
     const result=await writeFile(host,name,raw,'application/json');
     presentExport(name,raw,'application/json',result);
   }catch(e){status('生データを書き出せません: '+String(e.message||e),true);}
+  finally{exporting=false;lockUI();}
 }
 
 function textModal(question,initial,{max=15000,multiline=true,options=[['save','保存'],['cancel','キャンセル']]}={}){
@@ -850,7 +919,7 @@ function setup(){
     '<section class="panel"><h2>生成設定</h2><div id="preference-fields"></div><p class="hint" id="prompt-meta"></p></section>'+
     '<section class="panel"><h2>確定本文の編集</h2><p class="hint">ここが正本です。長編の場合は編集前にJSONをバックアップしてください。</p><p id="edit-count" class="hint"></p><p id="edit-warning" class="safety" hidden>本文を大きく削除しました。誤操作であれば、直ちに「直前の状態を復元」を利用してください。</p><textarea id="edit-body" class="long" rows="12"></textarea></section>'+
     '<section class="panel"><h2>返信のごみ箱</h2><p class="hint">直近20件まで（合計150万文字目安。超過時は古い返信から整理）。復元は未採用候補として行い、現在の本文を上書きしません。</p><div id="reply-trash"></div></section>'+
-    '<section class="panel"><h2>バックアップ・復元</h2><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
+    '<section class="panel"><h2>バックアップ・復元</h2><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-main-json">本編のみJSON（分岐なし）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-body">SQLite本編TXT救出</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button><button id="purge-corrupt" class="warn">古い破損データを削除</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
     '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p class="hint">コピーするか、通常ブラウザではダウンロードを選択してください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="copy-manual">テキストをコピー</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
     '</main><nav class="nav"><button class="primary" id="nav-main">本文へ戻る</button><button id="nav-settings">設定</button><button id="quick-backup">JSON保存</button></nav>'+
     '<div id="modal" class="overlay" hidden role="dialog" aria-modal="true"><div class="modal-card"><p id="modal-content"></p><div id="modal-buttons" class="actions"></div></div></div>';
@@ -879,6 +948,7 @@ function setup(){
   el('jump-bottom').onclick=()=>el('prompt-section').scrollIntoView({block:'start'});
   el('export-json').onclick=()=>void exportAs('json');
   el('export-light-json').onclick=()=>void exportAs('compact-json');
+  el('export-main-json').onclick=()=>void exportAs('main-json');
   el('export-txt').onclick=()=>void exportAs('txt');
   el('export-md').onclick=()=>void exportAs('md');
   el('import').onclick=()=>el('file-picker').click();
@@ -892,10 +962,12 @@ function setup(){
     if(await modal('現在の本文は保持し、送信履歴だけ削除します。元の履歴は復元点に保存します。続行しますか？')!=='yes')return;
     if(await applyStoryChange(s=>clearHistoryAgainstBody(s),'本文を保持して履歴をリセットしました。',{destructive:true}))rebuildSettings();
   };
+  el('raw-body').onclick=()=>void exportRescuedBody();
+  el('purge-corrupt').onclick=()=>void purgeCorruption();
   el('raw-backup').onclick=()=>void exportRaw();
   el('raw-rows').onclick=()=>void exportRawRows();
   el('rebuild-idb').onclick=()=>void rebuildIdb();
-  el('close-manual').onclick=()=>{el('manual-text').value='';el('manual-export').hidden=true;};
+  el('close-manual').onclick=clearManualExport;
   el('open-export-manual').onclick=showManualExport;
   el('download-manual').onclick=()=>{
     const name=el('download-manual').dataset.name||'story.txt';
