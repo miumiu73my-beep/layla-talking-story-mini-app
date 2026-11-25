@@ -380,3 +380,32 @@ test('checkpoint rotation uses dates rather than mixed legacy key names',async()
   assert.equal(sql.map.has('checkpoint/177'),true);
   assert.equal((await st.checkpointList()).length,8);
 });
+
+test('raw rescue identifies missing chunk positions and retains later readable text',async()=>{
+  const sql=fakeSql(),s=freshState();s.body='A'.repeat(90000)+'後半の救出原稿';
+  seed(sql,s);
+  const active=JSON.parse(sql.map.get('active'));
+  sql.map.delete(active.parts[1]);
+  const st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  const dump=JSON.parse(await st.rawDump());
+  assert.equal(dump.activeRootComplete,false);
+  assert.equal(dump.chunkErrors[0].index,1);
+  assert.ok(dump.activeRootRawPrefix.includes('後半の救出原稿'));
+  assert.equal(dump.chunkRanges[1].index,2);
+  assert.ok(dump.activeRootRawPrefix.length<=2000000);
+});
+test('raw rescue can read ACTIVE after startup SELECT failure without changing write permissions',async()=>{
+  const sql=fakeSql(),s=freshState();s.body='読込再試行で救出する原稿';seed(sql,s);
+  const original=sql.executeSql.bind(sql);let failed=false;
+  sql.executeSql=async(q,args)=>{
+    if(!failed&&q.startsWith('SELECT v FROM')&&args[0]==='active'){failed=true;throw Error('temporary');}
+    return original(q,args);
+  };
+  const active=sql.map.get('active');
+  const st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  const dump=JSON.parse(await st.rawDump());
+  assert.ok(dump.activeRootRawPrefix.includes(s.body));
+  assert.equal(st.mode(),'IndexedDB（退避）');
+  await st.save({...freshState(),body:'別原稿'});
+  assert.equal(sql.map.get('active'),active);
+});
