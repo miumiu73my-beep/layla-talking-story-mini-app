@@ -254,7 +254,7 @@ export function makeBodyRecovery(){
       if(fresh)return {snapshot:anchor,reason:'本文編集開始前',large:false};
       return null;
     },
-    completed(plan){if(plan.large)anchor=null;},
+    completed(plan,current){if(plan.large)anchor=cleanState({...current,branches:[]});},
     failed(plan){if(!plan.large&&anchor===plan.snapshot)anchor=null;}
   };
 }
