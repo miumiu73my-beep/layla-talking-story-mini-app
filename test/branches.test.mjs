@@ -240,3 +240,57 @@ test('renaming an already canonical immutable archive preserves the original',()
   assert.equal(renamed.branches[0].name,'新しい名前');
   assert.notEqual(original.branches[0].name,'新しい名前');
 });
+
+test('cumulative 40 percent deletions retain the original active snapshot across saves',async()=>{
+  const {makeBodyRecovery}=await import('../src/branches.js');
+  const r=makeBodyRecovery(),s=freshState();
+  s.body='原'.repeat(10000);r.seed(s);
+  assert.equal(r.plan(s,6000),null);
+  s.body=s.body.slice(0,6000);
+  const plan=r.plan(s,3600);
+  assert.equal(plan.large,true);
+  assert.equal(plan.snapshot.body.length,10000);
+  assert.equal(plan.snapshot.branches.length,0);
+  // An unsuccessful checkpoint does not permit or forget the deletion.
+  r.failed(plan);assert.equal(r.plan(s,3600).snapshot.body.length,10000);
+  r.completed(plan);s.body=s.body.slice(0,3600);
+  const next=r.plan(s,2160);
+  assert.equal(next.large,false);assert.equal(next.snapshot.body.length,3600);
+});
+
+test('first edit after growth and a new work use the correct recovery anchor',async()=>{
+  const {makeBodyRecovery,dailyCheckpointDue}=await import('../src/branches.js');
+  const r=makeBodyRecovery(),s=freshState();
+  s.body='a'.repeat(1000);
+  const first=r.plan(s,900);assert.equal(first.large,false);
+  r.failed(first);assert.equal(r.plan(s,900).snapshot.body.length,1000);
+  s.body='b'.repeat(10000);
+  assert.equal(r.plan(s,6000),null);
+  s.body=s.body.slice(0,6000);
+  assert.equal(r.plan(s,2000).snapshot.body.length,10000);
+  r.reset();s.body='別'.repeat(800);
+  assert.equal(r.plan(s,300).snapshot.body,'別'.repeat(800));
+  assert.equal(dailyCheckpointDue(null,1),true);
+  assert.equal(dailyCheckpointDue(100,86400099),false);
+  assert.equal(dailyCheckpointDue(100,86400100),true);
+});
+
+test('million-character edits preserve unchanged reply hashes and rewind includes appended text',async()=>{
+  const {reconcileBodyEdit}=await import('../src/branches.js');
+  let s=freshState();
+  s=acceptTurn(s,{user:'A',text:'甲'.repeat(500000),sourceDraft:''});
+  s=acceptTurn(s,{user:'B',text:'乙'.repeat(500000),sourceDraft:''});
+  const before=timeline(s),offset=before[0].end;
+  const changed=reconcileBodyEdit(s,s.body.slice(0,offset)+'追記。'+s.body.slice(offset));
+  assert.equal(changed.turns[1].replyHash,s.turns[1].replyHash);
+  assert.equal(timeline(changed)[0].reply.slice(-3),'追記。');
+  assert.equal(rewindAfter(changed,0).body.length,500003);
+  assert.throws(()=>reconcileBodyEdit(s,s.body.slice(0,offset-1)+s.body.slice(before[1].start+1)),/複数ターン|境界/);
+});
+
+test('optimized reconciliation still rejects changed user preludes',async()=>{
+  const {reconcileBodyEdit}=await import('../src/branches.js');
+  let s=freshState();s.prefs.recordInputInBody=true;
+  s=acceptTurn(s,{user:'入力',text:'回答',sourceDraft:''});
+  assert.throws(()=>reconcileBodyEdit(s,s.body.replace('入力','変更')),/併記/);
+});
