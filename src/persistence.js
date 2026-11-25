@@ -518,29 +518,53 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     return true;
   }
   async function rawDump(){
-    const LIMIT=2_000_000;
+    const LIMIT=2_000_000,MAX_PARTS=1200;
     const evidence={schema:'layla-talking-story-recovery-raw',sqliteError:sqlProblem,
       rawManifest:rawEvidence,activeManifest:manifest,limitChars:LIMIT,
-      notice:'救出時のメモリ保護のため、現在の本文JSONチャンクを先頭から最大200万文字だけ含めます。欠落・破損したチャンクは除外せず理由を記録します。'};
+      notice:'救出専用JSONです（通常のバックアップとしては読み込めません）。現在の本文JSONチャンクを最大200万文字まで収録します。欠落箇所はchunkErrors、収録位置はchunkRangesで確認できます。'};
     if(fallback?.state){
       evidence.indexedDbStatus={pending:fallback.pending,at:fallback.at,rev:fallback.rev};
-      try{evidence.indexedDbRawPrefix=JSON.stringify(fallback.state).slice(0,100_000);}
-      catch(e){evidence.indexedDbError=String(e.message||e);}
+      // Avoid serializing every archived branch merely to obtain a short prefix.
+      try{
+        const {title,body}=fallback.state;
+        evidence.indexedDbRawPrefix=JSON.stringify({title:typeof title==='string'?title.slice(0,120):'',body:typeof body==='string'?body.slice(0,100_000):''});
+        evidence.indexedDbBodyTruncated=typeof body==='string'&&body.length>100_000;
+      }catch(e){evidence.indexedDbError=String(e.message||e);}
     }
-    const current=manifest||(()=>{try{return JSON.parse(rawEvidence);}catch{return null;}})();
+    let current=manifest||(()=>{try{return JSON.parse(rawEvidence);}catch{return null;}})();
+    // Retry a failed startup read for rescue only; do not change write permissions.
+    if(!current&&typeof sql==='function'){
+      try{
+        const value=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[ACTIVE]))[0]?.v;
+        if(typeof value==='string'){evidence.rawManifest=value;current=JSON.parse(value);}
+      }catch(e){evidence.manifestReadError=String(e.message||e);}
+    }
     if(Array.isArray(current?.parts)&&typeof sql==='function'){
-      const found=[],errors=[];let total=0;
+      const found=[],errors=[],ranges=[];let total=0,visited=0,truncated=false;
       for(const key of current.parts){
-        if(total>=LIMIT)break;
+        if(total>=LIMIT||visited>=MAX_PARTS){truncated=true;break;}
+        const index=visited++;
         try{
+          if(typeof key!=='string')throw Error('チャンクキーが不正です');
           const part=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]))[0]?.v;
           if(typeof part!=='string')throw Error('チャンクが欠落しています');
-          found.push(part.slice(0,LIMIT-total));total+=Math.min(part.length,LIMIT-total);
-        }catch(e){errors.push({key,error:String(e.message||e)});}
+          let length=Math.min(part.length,LIMIT-total);
+          if(length<part.length){
+            truncated=true;
+            const last=part.charCodeAt(length-1);
+            if(last>=0xd800&&last<=0xdbff)length--;
+          }
+          found.push(part.slice(0,length));
+          ranges.push({index,key,start:total,length,originalLength:part.length});
+          total+=length;
+          if(truncated)break;
+        }catch(e){errors.push({index,key,error:String(e.message||e)});}
       }
       evidence.activeRootRawPrefix=found.join('');
-      evidence.activeRootTruncated=total>=LIMIT;
+      evidence.activeRootTruncated=truncated;
       evidence.chunkErrors=errors;
+      evidence.chunkRanges=ranges;
+      evidence.activeRootComplete=!truncated&&!errors.length&&visited===current.parts.length;
     }else evidence.notice+=' ACTIVEを解析できず本編チャンクを特定できません。';
     return JSON.stringify(evidence);
   }
