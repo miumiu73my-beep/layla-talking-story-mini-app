@@ -411,10 +411,10 @@ async function startGeneration({retry=false,inputOverride=null}={}){
     stopUnconfirmed=false;
   }
   if(candidate&&retry&&candidate.text?.trim()){
-    if(await modal('今の候補は保存されていません。破棄してもう一度生成しますか？')!=='yes')return;
+    if(await modal('今の候補をごみ箱に移して、もう一度生成しますか？')!=='yes')return;
   }
   if(candidate&&!retry){
-    const choice=await modal('未採用候補が残っています。候補を破棄して新しく生成しますか？');
+    const choice=await modal('未採用候補が残っています。ごみ箱に移して新しく生成しますか？');
     if(choice!=='yes')return;
   }
   const requestInput=inputOverride??promptDraft();
@@ -703,7 +703,12 @@ async function applyStoryChange(transform,note,{destructive=false,checkpointScop
     if(!await beforeDestructive(checkpointScope==='branch'?'分岐削除前':'分岐操作',{checkpoint:destructive,scope:checkpointScope,branchId}))return false;
     const changed=await transform(original);
     if(!changed||typeof changed!=='object')throw Error('変更後の状態が不正です。');
-    if(changed.body!==original.body||changed.activeBranch.id!==original.activeBranch.id)resetBodyRecovery();
+    if(changed.activeBranch.id!==original.activeBranch.id)resetBodyRecovery();
+    else if(changed.body!==original.body){
+      // Undo/regeneration already preserve the reply in trash. Reset deletion
+      // baseline but do not consume a new session checkpoint on each trial.
+      bodyRecovery.reset();bodyRecovery.seed(changed);recoveryEpoch++;
+    }
     state=changed;candidate=state.pendingCandidate;
     state.updatedAt=new Date().toISOString();editRev++;
     if(!await saveNow(true)){
