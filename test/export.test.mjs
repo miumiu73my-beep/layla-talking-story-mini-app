@@ -54,3 +54,18 @@ test('UTF-8 Base64 conversion survives chunk boundaries and supplementary charac
   const text='🌸一歌海'.repeat(8000)+'終';
   assert.equal(Buffer.from(utf8ToBase64(text),'base64').toString('utf8'),text);
 });
+
+test('native undefined or null exposes exact manual recovery payload without claiming success',async()=>{
+  for(const value of [undefined,null]){
+    const host={utils:{saveFile:async()=>value}};
+    const result=await writeFile(host,'story.md','原稿😀','text/markdown');
+    assert.equal(result.kind,'unconfirmed');
+    assert.equal(result.text,'原稿😀');
+    assert.equal(result.name,'story.md');
+    assert.equal(result.mime,'text/markdown');
+  }
+});
+test('explicit cancellation wins over a contradictory success flag',async()=>{
+  const result=await writeFile({utils:{saveFile:async()=>({success:true,cancelled:true})}},'story.txt','本文','text/plain');
+  assert.equal(result.kind,'cancelled');
+});
