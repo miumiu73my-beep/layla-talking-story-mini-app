@@ -187,3 +187,25 @@ test('early diverging siblings compress, legacy v2 reads and invalid forward ref
   assert.equal(parseImport('old.json',JSON.stringify(old),s).state.body,'共通本文');
   v.entries[0].base=1;assert.throws(()=>parseImport('bad.json',JSON.stringify(v),s),/参照/);
 });
+
+
+test('small context and exact input boundary never reject short prompts',()=>{
+  for(const contextTokens of [2048,4096,8192]){
+    for(const targetChars of [300,500]){
+      const s=freshState();Object.assign(s.prefs,{contextTokens,targetChars});
+      s.characters='人物'.repeat(15000);s.rules='規則'.repeat(5000);
+      s.memory='古い記憶'.repeat(2000)+'最新';s.body='本文'.repeat(20000);
+      s.turns=[{user:'過去の入力',reply:'過去の返信'}];
+      const short=buildRequest(s,'続けて');
+      assert.equal(short.meta.overBudget,false);
+      assert.ok(short.meta.estimatedTokens+short.meta.outputTokens+160<=contextTokens);
+      const exact='あ'.repeat(short.meta.inputLimit);
+      const request=buildRequest(s,exact);
+      assert.equal(request.meta.overBudget,false);
+      assert.ok(request.messages[1].content.includes(exact));
+      assert.equal(buildRequest(s,exact+'い').meta.overBudget,true);
+    }
+  }
+  const s=freshState();s.prefs.contextTokens=2048;
+  assert.equal(buildRequest(s,'あ'.repeat(200)).meta.overBudget,false);
+});
