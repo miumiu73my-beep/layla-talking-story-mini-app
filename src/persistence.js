@@ -390,6 +390,31 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
     }
   }
+  let legacyMigration=null;
+  function legacyCheckpointIndex(){
+    if(!legacyMigration)legacyMigration=(async()=>{
+      const existing=await idb.get('legacy-checkpoint-index');
+      if(Array.isArray(existing))return existing;
+      const legacy=await idb.get('checkpoints');
+      if(!Array.isArray(legacy)||!legacy.length)return [];
+      const entries=[];
+      for(let i=0;i<legacy.length;i++){
+        const entry=legacy[i];
+        if(!entry||typeof entry.data!=='string')continue;
+        const id='legacy-idb/'+i;
+        await idb.put('legacy-checkpoint-data/'+i,entry.data);
+        entries.push({id,at:entry.at,title:entry.title,chars:entry.chars,
+          reason:entry.reason||'旧IndexedDB復元点'});
+      }
+      // Publish only after every valid entry is written. Retain unreadable
+      // legacy evidence rather than deleting it if conversion was incomplete.
+      await idb.put('legacy-checkpoint-index',entries);
+      if(entries.length===legacy.length&&typeof idb.delete==='function')
+        try{await idb.delete('checkpoints');}catch{}
+      return entries;
+    })().catch(e=>{legacyMigration=null;throw e;});
+    return legacyMigration;
+  }
   async function checkpointList(){
     const all=[];
     if(sqlAvailable){
@@ -403,17 +428,10 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       const indexed=await idb.get('checkpoint-index');
       for(const entry of indexed||[])all.push({id:'idb/'+entry.id,at:entry.at,title:entry.title,chars:entry.chars,
         reason:entry.reason||'IndexedDB復元点'});
-      // Legacy backup is stored in one IDB array; read it only if newer index
-      // is absent. It cannot be indexed without accessing that legacy value.
-      // Old IDB checkpoints must remain visible even after a newer checkpoint
-      // has created the lightweight metadata index. Legacy storage is read only
-      // here; new checkpoint bodies are never eagerly fetched.
-      const legacy=await idb.get('checkpoints');
-      for(let i=0;i<(legacy||[]).length;i++){
-        const entry=legacy[i];
-        all.push({id:'legacy-idb/'+i,at:entry.at,title:entry.title,chars:entry.chars,
-          reason:entry.reason||'旧IndexedDB復元点'});
-      }
+      // Old IDB versions stored every snapshot in one array. Convert once to
+      // individual records; future lists do not load the old manuscript bodies.
+      const legacy=await legacyCheckpointIndex();
+      for(const entry of legacy)all.push(entry);
     }catch(e){notify('IndexedDB復元点の一覧を読み込めません: '+e.message,true);}
     return all.sort((a,b)=>b.at-a.at).slice(0,12);
   }
@@ -428,8 +446,11 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       raw=await idb.get('checkpoint-data/'+id.slice(4));
     }else if(id.startsWith('legacy-idb/')){
       const n=Number(id.slice('legacy-idb/'.length));
-      const legacy=await idb?.get('checkpoints');
-      raw=legacy?.[n]?.data;
+      raw=await idb?.get('legacy-checkpoint-data/'+n);
+      if(typeof raw!=='string'){
+        const legacy=await idb?.get('checkpoints');
+        raw=legacy?.[n]?.data;
+      }
     }else if(/^checkpoint\/[^/]+$/.test(id)){
       const entryText=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[id]))[0]?.v;
       if(typeof entryText!=='string')throw Error('復元点の情報がありません。');
