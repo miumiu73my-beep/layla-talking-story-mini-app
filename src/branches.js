@@ -5,7 +5,7 @@ import {cleanState,bodyFingerprint,acceptTurn,FIELDS,isArchiveReference,remember
 
 export const MAX_ARCHIVED_BRANCHES=30;
 export const SNAPSHOT_FIELDS=[
-  ...FIELDS.map(([key])=>key),'body','turns','draft','pendingCandidate','undo','prefs'
+  ...FIELDS.map(([key])=>key).filter(key=>key!=='modelNote'),'body','turns','draft','pendingCandidate','undo'
 ];
 const copy=x=>x===null||typeof x!=='object'?x:JSON.parse(JSON.stringify(x));
 export function branchMeta(raw={},fallbackId='main',fallbackName='本編'){
