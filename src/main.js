@@ -478,7 +478,7 @@ async function exportAs(ext){
     if(bodyEditBackup)await bodyEditBackup;
     commitPendingBodyEdit();
     const light=ext==='compact-json';
-    const snapshot=(light||ext==='json')?await store.materialize(cleanState(state)):state;
+    const snapshot=(light||ext==='json')&&store?await store.materialize(cleanState(state)):state;
     const content=light?compactBackup(snapshot):ext==='json'?JSON.stringify(snapshot):readableText(snapshot,ext);
     const tooLarge=(ext==='json'||light)&&new TextEncoder().encode(content).length>TRANSFER_MAX_BYTES;
     const warning=tooLarge?'このJSONは50MB超で再読み込みできません。軽量JSONや分岐整理後の再保存が必要です。':'';
