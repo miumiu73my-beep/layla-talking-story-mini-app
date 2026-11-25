@@ -744,3 +744,30 @@ test('cumulative deletion checkpoint restores original body after autosaves and 
     assert.equal(restored.branches[0].id,'archive');
   }
 });
+
+
+test('stream partial candidate and reply trash survive SQLite and IDB-only restart',async()=>{
+  const {acceptTurn,updateStreamText,restoreReplyCandidate}=await import('../src/logic.js');
+  const {rewindLastWithoutFork}=await import('../src/branches.js');
+  for(const withSql of [true,false]){
+    const sql=fakeSql(),idb=fakeIdb(),host=withSql?{db:sql}:{};
+    const opts={idbFactory:idb.factory,validator:cleanState,lazyArchives:true};
+    let store=await openStore(host,()=>{},opts);
+    let s=acceptTurn(freshState(),{user:'入力',text:'前の返信',sourceDraft:''});
+    s=rewindLastWithoutFork(s);
+    s.pendingCandidate=restoreReplyCandidate(s,0);
+    s.pendingCandidate.note='生成中…';s.pendingCandidate.text='';
+    await store.save(s);
+    assert.equal(updateStreamText(s.pendingCandidate,'途中'),true);
+    const saving=store.save(s);
+    updateStreamText(s.pendingCandidate,'途中まで');
+    await saving;
+    store=await openStore(host,()=>{},opts);
+    assert.equal(store.initial.pendingCandidate.text,'途中'); // immutable save snapshot
+    await store.save(s);
+    const reopened=await openStore(host,()=>{},opts);
+    assert.equal(reopened.initial.pendingCandidate.text,'途中まで');
+    assert.deepEqual(reopened.initial.replyTrash,['前の返信']);
+    assert.equal(reopened.initial.branches.length,0);
+  }
+});
