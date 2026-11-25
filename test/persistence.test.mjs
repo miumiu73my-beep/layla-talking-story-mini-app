@@ -536,6 +536,12 @@ test('lazy split store keeps only metadata and does not read or write archived b
   const selected=await reopened.materialize(reopened.initial,'fork29');
   assert.equal(selected.branches[29].body,'枝'.repeat(1000000)+'29');
   assert.equal(selected.branches[0].body,undefined);
+  const restartedBefore=JSON.parse(sql.map.get('active'));
+  writes.length=0;reads.length=0;
+  const next={...reopened.initial,draft:'再起動後の下書き',prefs:{...reopened.initial.prefs,targetChars:600}};
+  await reopened.save(next);
+  assert.deepEqual(JSON.parse(sql.map.get('active')).parts,restartedBefore.parts);
+  assert.deepEqual(writes,['active']);assert.equal(reads.length,0);
   const fallback=await openStore({},()=>{},opts);
   assert.equal(fallback.initial.body,state.body);
   assert.equal((await fallback.materialize(fallback.initial,'fork0')).branches[0].body,'枝'.repeat(1000000)+'0');
@@ -569,4 +575,37 @@ test('lazy branch switch and rename materialize only selected archive and keep o
   await st.save(state);state=st.compactState(state);
   assert.equal(state.body,'一本文');assert.equal(state.branches.find(b=>b.id==='two').body,undefined);
   assert.equal((await st.materialize(state)).branches.find(b=>b.id==='main').body,'本編');
+});
+
+test('lazy overlay candidate and preferences survive restart and previous-generation restore',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={idbFactory:idb.factory,lazyArchives:true};
+  const st=await openStore({db:sql},()=>{},opts);
+  let state=cleanState({...freshState(),body:'本文',draft:'旧下書き',branches:[{id:'one',name:'分岐',body:'分岐本文'}]});
+  await st.save(state);state=st.compactState(state);
+  state.draft='新下書き';state.prefs.targetChars=700;
+  state.pendingCandidate={user:'u',text:'候補',sourceDraft:'u',baseFingerprint:'fp',note:''};
+  await st.save(state);
+  const current=JSON.parse(sql.map.get('active'));
+  assert.ok(current.overlayHash);assert.ok(current.previous.overlayHash);
+  const reopened=await openStore({db:sql},()=>{},opts);
+  assert.equal(reopened.initial.pendingCandidate.text,'候補');
+  assert.equal(reopened.initial.prefs.targetChars,700);
+  const entries=await reopened.checkpoints(),old=entries.map(x=>JSON.parse(x.data)).find(x=>x.draft==='旧下書き');
+  assert.ok(old);assert.equal(old.branches[0].body,'分岐本文');
+  await reopened.checkpoint(reopened.initial,'明示的な復元点');
+  const restored=(await reopened.checkpoints()).map(x=>JSON.parse(x.data)).find(x=>x.draft==='新下書き');
+  assert.ok(restored);assert.equal(restored.branches[0].body,'分岐本文');
+});
+test('corrupted split pending IDB archive cannot replace healthy SQLite',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={idbFactory:idb.factory,lazyArchives:true};
+  const st=await openStore({db:sql},()=>{},opts);
+  let state=cleanState({...freshState(),body:'SQLite本文',branches:[{id:'one',name:'分岐',body:'正しい分岐本文'}]});
+  await st.save(state);state=st.compactState(state);
+  const manifest=sql.map.get('active');
+  sql.setFailWrite(true);state.draft='未同期';await st.save(state);sql.setFailWrite(false);
+  const record=idb.data.get('latest');idb.data.set(record.archives[0].key,'broken');
+  const reopened=await openStore({db:sql},()=>{},opts);
+  assert.equal(reopened.initial.draft,'');
+  assert.equal(sql.map.get('active'),manifest);
+  assert.equal((await reopened.materialize(reopened.initial)).branches[0].body,'正しい分岐本文');
 });
