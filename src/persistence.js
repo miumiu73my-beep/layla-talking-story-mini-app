@@ -592,7 +592,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     }finally{working=false;}
   }
   function save(state){
-    if(readOnly)return Promise.reject(Error('復旧確認が必要なため上書き禁止です。'));
+    if(readOnly||cleaningCorruption)return Promise.reject(Error('復旧確認・整理中のため上書き禁止です。'));
     // Snapshot active mutable fields now; share only canonical immutable archives.
     // Custom validators keep the previous defensive deep-copy contract.
     let raw;try{raw=validator===cleanState?cleanState(state):validator(JSON.parse(JSON.stringify(state)));}catch(e){return Promise.reject(e);}
@@ -986,6 +986,111 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       rebuildPending=false;return selected;
     }catch(e){readOnly=true;rebuildPending=false;throw e;}
   }
+  // Only explicit, verified recovery cleanup may release old corruption evidence.
+  let cleaningCorruption=false;
+  async function corruptionEvidence(){
+    if(typeof sql!=='function')throw Error('SQLite APIを利用できません。');
+    const keys=sqlRows(await run('SELECT k FROM '+TABLE)).map(r=>r.k).filter(k=>typeof k==='string');
+    return {keys,markers:keys.filter(k=>k.startsWith('corrupt-keep/')),
+      backups:keys.filter(k=>k.startsWith('corrupt-backup/')).sort().reverse()};
+  }
+  async function purgeCorruptEvidence(){
+    if(cleaningCorruption||working||queued!==null||readOnly||recoveryRequired||sqliteCorrupt||
+       !sqlAvailable||!sqlInitialized||sqlRetryBlocked||mode!=='SQLite'||!manifest)
+      throw Error('正常なSQLiteへの復旧・保存完了後に実行してください。');
+    cleaningCorruption=true;
+    try{
+      const rows=await readActiveRows(),current=JSON.parse(rows[0]?.v||'null');
+      if(!current||JSON.stringify(current)!==JSON.stringify(manifest))throw Error('現在の保存世代が変化しました。');
+      // Validate every active archive before deleting anything. Preserve the previous
+      // manifest and all its root/branch keys even if it shares old chunks.
+      await readGeneration(current);
+      const retain=new Set();
+      for(const m of [current,current.previous])if(m){
+        if(!Array.isArray(m.parts)||!m.parts.every(k=>typeof k==='string')||
+           (m.branchParts!==undefined&&!Array.isArray(m.branchParts)))
+          throw Error('保存目録が不正です。削除を中止します。');
+        for(const k of m.parts)retain.add(k);
+        for(const b of m.branchParts||[]){
+          if(!Array.isArray(b.parts)||!b.parts.every(k=>typeof k==='string'))throw Error('分岐目録が不正です。');
+          for(const k of b.parts)retain.add(k);
+        }
+      }
+      const {keys,markers,backups}=await corruptionEvidence();
+      // Also release legacy backups without per-row protection markers, but never
+      // touch checkpoint or arbitrary keys. Delete evidence manifests last.
+      const known=new Set(keys),targets=new Set();
+      for(const marker of markers)targets.add(marker.slice('corrupt-keep/'.length));
+      for(const backup of backups){
+        try{
+          const old=JSON.parse(sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[backup]))[0]?.v);
+          for(const m of [old,old?.previous])if(m){
+            for(const k of Array.isArray(m.parts)?m.parts:[])targets.add(k);
+            for(const b of Array.isArray(m.branchParts)?m.branchParts:[])
+              for(const k of Array.isArray(b.parts)?b.parts:[])targets.add(k);
+          }
+        }catch{/* An unparseable backup is represented by the durable markers. */}
+      }
+      let removed=0;
+      for(const k of targets)if(typeof k==='string'&&k.startsWith('g')&&known.has(k)&&!retain.has(k)){
+        await run('DELETE FROM '+TABLE+' WHERE k=?',[k]);removed++;
+      }
+      for(const k of backups)await run('DELETE FROM '+TABLE+' WHERE k=?',[k]);
+      for(const k of markers)await run('DELETE FROM '+TABLE+' WHERE k=?',[k]);
+      return {removed,markers:markers.length,backups:backups.length};
+    }finally{cleaningCorruption=false;}
+  }
+  async function rawBodySources(){
+    const {keys,backups}=await corruptionEvidence();
+    return [...(keys.includes(ACTIVE)?[ACTIVE]:[]),...backups];
+  }
+  async function rawBodyText(source=ACTIVE){
+    if(!(await rawBodySources()).includes(source))throw Error('救出元がありません。');
+    const value=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[source]))[0]?.v;
+    let m;try{m=JSON.parse(value);}catch{throw Error('目録が破損しています。行単位救出をご利用ください。');}
+    if(!Array.isArray(m?.parts)||m.parts.length>1500)throw Error('本編目録が不正です。');
+    // Current section layout can recover body independently of settings and history.
+    let parts=m.parts,section=false;
+    if(Array.isArray(m.rootSections)&&m.rootSections.length===4&&
+       m.rootSections.every(n=>Number.isSafeInteger(n)&&n>0)&&m.rootSections.reduce((a,b)=>a+b,0)===parts.length){
+      parts=parts.slice(m.rootSections[0],m.rootSections[0]+m.rootSections[1]);section=true;
+    }
+    const chunks=[];
+    for(const key of parts){
+      try{
+        if(typeof key!=='string')throw Error('invalid key');
+        const v=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]))[0]?.v;
+        chunks.push(typeof v==='string'?v:null);
+      }catch{chunks.push(null);}
+    }
+    if(!chunks.includes(null)){
+      try{
+        const raw=chunks.join('');
+        const body=JSON.parse(section?'{'+raw.slice(1)+'}':raw).body;
+        if(typeof body==='string')return {text:body,partial:false};
+      }catch{/* fall through to explicitly labelled partial fragments */}
+    }
+    if(!section)throw Error('旧形式の本編を安全に識別できません。行単位救出をご利用ください。');
+    // Never silently concatenate across missing chunks. Decode each contiguous
+    // JSON string fragment when possible; keep undecodable escapes as raw evidence.
+    let text='',runText='',runStart=0,missing=0;
+    const flush=end=>{
+      if(!runText)return;
+      let fragment=runText;
+      if(runStart===0)fragment=fragment.replace(/^,"body":"/,'');
+      if(end===chunks.length)fragment=fragment.replace(/"$/,'');
+      try{text+=JSON.parse('"'+fragment+'"');}
+      catch{text+='\n【JSON断片・エスケープ未復号】\n'+fragment+'\n【断片終端】\n';}
+      runText='';
+    };
+    for(let i=0;i<chunks.length;i++){
+      if(chunks[i]===null){flush(i);missing++;text+='\n【欠落チャンク '+(i+1)+'】\n';}
+      else{if(!runText)runStart=i;runText+=chunks[i];}
+    }
+    flush(chunks.length);
+    if(missing===chunks.length)throw Error('読める本編チャンクがありません。');
+    return {text:'【部分救出・原文の完全性は未確認】\n'+text,partial:true};
+  }
   // Export bounded groups of raw SQLite rows, including archived branches,
   // previous generations, checkpoint chunks and damaged backup evidence.
   async function rawRowKeys(){
@@ -1079,7 +1184,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},
     recoveryInfo:()=>({sqlite:sqlSnapshot?.validated.value?{title:sqlSnapshot.validated.value.title,chars:sqlSnapshot.validated.value.body.length,at:sqlSnapshot.validated.value.updatedAt,turns:sqlSnapshot.validated.value.turns.length}:null,idb:idbValid?.value?{title:idbValid.value.title,chars:idbValid.value.body.length,at:idbValid.value.updatedAt,turns:idbValid.value.turns.length}:null}),
     get canRebuildFromIdb(){return cleanIdb&&readOnly&&!recoveryRequired&&(sqliteCorrupt||rebuildPending);},
-    save,checkpoint,checkpoints,checkpointList,latestAutomaticCheckpointAt,loadCheckpoint,chooseRecovery,allowImportRecovery,rebuildFromIdb,rawDump,rawRowKeys,rawRowPage,materialize,compactState,
+    save,checkpoint,checkpoints,checkpointList,latestAutomaticCheckpointAt,loadCheckpoint,chooseRecovery,allowImportRecovery,rebuildFromIdb,rawDump,rawRowKeys,rawRowPage,rawBodySources,rawBodyText,purgeCorruptEvidence,materialize,compactState,
     flush:()=>new Promise((resolve,reject)=>{
       if(!working&&queued===null)return resolve();
       const wait=()=>{
