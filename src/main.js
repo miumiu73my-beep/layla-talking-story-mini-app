@@ -1,7 +1,7 @@
 import {makeRuntime} from './runtime.js';
 import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning} from './logic.js';
 import {openStore} from './persistence.js';
-import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery,dailyCheckpointDue} from './branches.js';
+import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
 import {writeFile,filename,browserDownload} from './export.js';
 import './style.css';
 
@@ -12,18 +12,27 @@ let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning=
 let lastExport=null,pendingBodyEdit=null,bodyEditTimer=null,bodyEditBackup=null;
 let deletionWarning='',historyWarning='';
 const bodyRecovery=makeBodyRecovery();
-let periodicAt=null,periodicTask=null,periodicWarning='',recoveryEpoch=0;
-function resetBodyRecovery(){bodyRecovery.reset();periodicAt=null;periodicWarning='';recoveryEpoch++;}
+let periodicAt=null,periodicTask=null,periodicWarning='',recoveryEpoch=0,periodicLoaded=false,periodicRetryAt=0;
+function resetBodyRecovery(){bodyRecovery.reset();recoveryEpoch++;}
 async function ensurePeriodicCheckpoint(){
-  if(!store||saveBlocked||!state.body.length)return;
-  if(periodicTask){await periodicTask;return;}
-  if(!dailyCheckpointDue(periodicAt))return;
-  const snapshot=cleanState({...state,branches:[]}),epoch=recoveryEpoch;
+  if(!ready||!store||saveBlocked||busy||branchBusy||bodyBackupBusy||!state.body.length||document.visibilityState==='hidden')return;
+  if(periodicTask||Date.now()<periodicRetryAt)return;
   periodicTask=(async()=>{
     try{
-      await store.checkpoint(snapshot,periodicAt===null?'セッション開始時の自動復元点':'日次自動復元点',{scope:'active'});
-      if(epoch===recoveryEpoch){periodicAt=Date.now();bodyRecovery.seed(snapshot);periodicWarning='';}
-    }catch(e){if(epoch===recoveryEpoch)periodicWarning='自動復元点の作成に失敗しました: '+String(e?.message||e);}
+      if(!periodicLoaded){
+        periodicAt=await store.latestAutomaticCheckpointAt();
+        periodicLoaded=true;
+      }
+      if(periodicAt!==null&&new Date(periodicAt).toDateString()===new Date().toDateString())return;
+      if(saveBlocked||busy||branchBusy||bodyBackupBusy||!state.body.length||document.visibilityState==='hidden')return;
+      const snapshot=cleanState({...state,branches:[]}),epoch=recoveryEpoch;
+      await store.checkpoint(snapshot,'日次自動復元点',{scope:'active'});
+      periodicAt=Date.now();periodicRetryAt=0;periodicWarning='';
+      if(epoch===recoveryEpoch)bodyRecovery.seed(snapshot);
+    }catch(e){
+      periodicRetryAt=Date.now()+3600000;periodicLoaded=false;
+      periodicWarning='自動復元点の作成に失敗しました。1時間後に再試行します。';
+    }
   })();
   try{await periodicTask;}finally{periodicTask=null;}
 }
@@ -91,9 +100,7 @@ async function saveNow(force=false){
   commitPendingBodyEdit();
   clearTimeout(saveTimer);saveTimer=null;
   if(!store||saveBlocked){safety();return false;}
-  // Background/stream saves must reach the persistence queue without waiting
-  // for an expensive daily checkpoint. Foreground idle saves still check it.
-  if(!busy&&document.visibilityState!=='hidden')await ensurePeriodicCheckpoint();
+  // Daily recovery points run separately; foreground and stream saves do not wait.
   if(!force&&editRev===savedRev){safety();return true;}
   const revision=editRev;
   try{
@@ -186,7 +193,7 @@ function showBranches(){
 
 function updateInputWarning(){
   const n=el('input-warning');if(!n)return;
-  const warning=inputLimitWarning(promptDraft());n.textContent=warning;n.hidden=!warning;
+  const warning=inputLimitWarning(promptDraft(),state.prefs);n.textContent=warning;n.hidden=!warning;
 }
 function paint(){
   el('title-view').textContent=state.title||'新しい物語';
@@ -393,13 +400,13 @@ function commitPendingBodyEdit(){
   persist();
 }
 function updatePromptMeta(){
-  const warning=inputLimitWarning(promptDraft());
+  const warning=inputLimitWarning(promptDraft(),state.prefs);
   if(warning){el('prompt-meta').textContent=warning;return;}
   const m=buildRequest(state,promptDraft()).meta;
   el('prompt-meta').textContent='送信予算の目安：約'+m.estimatedTokens+'トークン／設定コンテキスト'+m.contextTokens+
-    '（出力予約'+m.outputTokens+'）。省略した項目：'+(m.omitted.length?m.omitted.map(x=>x.title).join('、'):'なし')+
+    '（出力予約'+m.outputTokens+'）。今回の入力上限：約'+m.inputLimit+'文字。省略した項目：'+(m.omitted.length?m.omitted.map(x=>x.title).join('、'):'なし')+
     '。本文の古い部分：'+m.bodyOmitted+'文字省略。'+
-    (m.overBudget?'入力・固定指示が推定送信予算を超えています。入力を短くするかコンテキストを見直してください。':'')+
+    (m.overBudget?'入力・固定指示が推定送信予算を超えています。入力上限は約'+m.inputLimit+'文字です。':'')+
     (m.outputCapped?'指定max_tokensはコンテキスト長の半分以下へ制限します。':'')+
     (m.outputTooShort?'生成の目安に対して出力トークン数が少なめです。文が途中で切れる場合は設定を見直してください。':'')+
     '※推定値であり実モデルのトークン化とは異なります。';
@@ -446,11 +453,11 @@ async function startGeneration({retry=false,inputOverride=null}={}){
     if(choice!=='yes')return;
   }
   const requestInput=inputOverride??promptDraft();
-  const warning=inputLimitWarning(requestInput);
+  const warning=inputLimitWarning(requestInput,state.prefs);
   if(warning){status(warning,true);updateInputWarning();return;}
   let request,params;
   try{request=buildRequest(state,requestInput);params=samplerParams(state.prefs);}catch(e){status(String(e?.message||e),true);return;}
-  if(request.meta.overBudget){status('推定送信予算を超えています。入力を短くするか設定でコンテキスト長を見直してください。',true);return;}
+  if(request.meta.overBudget){status('推定送信予算を超えています。入力上限は約'+request.meta.inputLimit+'文字です。',true);return;}
   const old=candidate,baseFingerprint=bodyFingerprint(state.body);
   retryFallback=old?.text?.trim()?{...old}:null;
   if(old?.text?.trim())state.replyTrash=rememberReply(state.replyTrash,old.text);
@@ -944,7 +951,7 @@ async function init(){
       else status('準備完了。保存先：'+store.mode());
     }
     safety();
-    if(!saveBlocked&&!store.recoveryRequired)void ensurePeriodicCheckpoint().then(()=>safety());
+    if(!saveBlocked&&!store.recoveryRequired)setTimeout(()=>void ensurePeriodicCheckpoint().then(()=>safety()),0);
   }catch(e){
     ready=true;saveBlocked=true;saveError='初期化に失敗: '+String(e.message||e);
     status(saveError,true);paint();safety();
