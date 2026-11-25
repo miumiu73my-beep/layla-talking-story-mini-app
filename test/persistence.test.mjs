@@ -505,3 +505,68 @@ test('queued saves capture mutable active fields before asynchronous writes',asy
   const reopened=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
   assert.equal(reopened.initial.body,'保存対象');assert.equal(reopened.initial.draft,'最初');
 });
+
+test('lazy split store keeps only metadata and does not read or write archived bodies on a draft save',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),host={db:sql},opts={idbFactory:idb.factory,lazyArchives:true};
+  const st=await openStore(host,()=>{},opts);
+  let state=cleanState({...freshState(),body:'本'.repeat(1000000),
+    branches:Array.from({length:30},(_,i)=>({id:'fork'+i,name:'分岐'+i,body:'枝'.repeat(1000000)+i}))});
+  await st.save(state);state=st.compactState(state);
+  assert.equal(state.branches.length,30);
+  assert.equal(state.branches[0].body,undefined);
+  assert.equal(state.branches[0].chars,1000001);
+  assert.throws(()=>JSON.stringify(state),/分岐/);
+  const sqlBefore=JSON.parse(sql.map.get('active')),idbBefore=idb.data.get('latest');
+  assert.equal(idbBefore.format,2);
+  assert.equal(idbBefore.state.body,undefined);
+  assert.equal(idbBefore.archives.length,30);
+  const writes=[],reads=[],execute=sql.executeSql.bind(sql);
+  sql.executeSql=async(q,a=[])=>{if(q.startsWith('INSERT'))writes.push(a[0]);if(q.startsWith('SELECT v FROM'))reads.push(a[0]);return execute(q,a);};
+  state.draft='下書きのみ';state.updatedAt='updated';
+  await st.save(state);
+  const sqlAfter=JSON.parse(sql.map.get('active')),idbAfter=idb.data.get('latest');
+  assert.deepEqual(sqlAfter.parts,sqlBefore.parts);
+  assert.deepEqual(sqlAfter.branchParts,sqlBefore.branchParts);
+  assert.deepEqual(idbAfter.core,idbBefore.core);
+  assert.deepEqual(idbAfter.archives,idbBefore.archives);
+  assert.deepEqual(writes,['active']);assert.equal(reads.length,0);
+  const reopened=await openStore(host,()=>{},opts);
+  assert.equal(reopened.initial.draft,'下書きのみ');
+  assert.equal(reopened.initial.branches[29].body,undefined);
+  const selected=await reopened.materialize(reopened.initial,'fork29');
+  assert.equal(selected.branches[29].body,'枝'.repeat(1000000)+'29');
+  assert.equal(selected.branches[0].body,undefined);
+  const fallback=await openStore({},()=>{},opts);
+  assert.equal(fallback.initial.body,state.body);
+  assert.equal((await fallback.materialize(fallback.initial,'fork0')).branches[0].body,'枝'.repeat(1000000)+'0');
+});
+test('lazy archive remains available after SQLite fails and IDB becomes primary',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={idbFactory:idb.factory,lazyArchives:true};
+  let st=await openStore({db:sql},()=>{},opts);
+  let state=cleanState({...freshState(),body:'本編',branches:[{id:'fork',name:'分岐',body:'分岐本文'}]});
+  await st.save(state);state=st.compactState(state);
+  const idbBefore=idb.data.get('latest');
+  sql.setFailWrite(true);state.draft='退避中';await st.save(state);
+  assert.equal(st.mode(),'IndexedDB（未同期退避）');
+  assert.deepEqual(idb.data.get('latest').archives,idbBefore.archives);
+  const fallback=await openStore({},()=>{},opts);
+  assert.equal(fallback.initial.draft,'退避中');
+  assert.equal((await fallback.materialize(fallback.initial)).branches[0].body,'分岐本文');
+  sql.setFailWrite(false);st=await openStore({db:sql},()=>{},opts);
+  assert.equal(st.initial.draft,'退避中');
+  assert.equal((await st.materialize(st.initial)).branches[0].body,'分岐本文');
+});
+test('lazy branch switch and rename materialize only selected archive and keep other refs',async()=>{
+  const {switchBranch,renameBranch}=await import('../src/branches.js');
+  const sql=fakeSql(),idb=fakeIdb(),opts={idbFactory:idb.factory,lazyArchives:true};
+  const st=await openStore({db:sql},()=>{},opts);
+  let state=cleanState({...freshState(),body:'本編',branches:[{id:'one',name:'一',body:'一本文'},{id:'two',name:'二',body:'二本文'}]});
+  await st.save(state);state=st.compactState(state);
+  state=renameBranch(await st.materialize(state,'one'),'one','改名');
+  await st.save(state);state=st.compactState(state);
+  assert.equal(state.branches[0].name,'改名');assert.equal(state.branches[0].body,undefined);
+  state=switchBranch(await st.materialize(state,'one'),'one');
+  await st.save(state);state=st.compactState(state);
+  assert.equal(state.body,'一本文');assert.equal(state.branches.find(b=>b.id==='two').body,undefined);
+  assert.equal((await st.materialize(state)).branches.find(b=>b.id==='main').body,'本編');
+});
