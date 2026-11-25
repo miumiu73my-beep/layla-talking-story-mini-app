@@ -76,7 +76,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   // A session must never overwrite SQLite it failed to fully read on startup.
   let sqlInitialized=false,sqlRetryBlocked=false;
   const branchCache=new WeakMap();
-  let rootCache=null,idbRootCache=null,idbLatest=null;
+  let rootCache=null,idbRootCache=null,idbLatest=null,sqlSavesSinceGc=9;
   const refData=new WeakMap(),storedRefs=new WeakMap(),archiveIssues=new WeakMap(),unknownSummaries=new WeakSet();
   // The app opts into lazy storage; legacy callers still receive full snapshots.
   const lazy=lazyArchives&&validator===cleanState;
@@ -86,13 +86,30 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const {draft,pendingCandidate,prefs,updatedAt,branches,...core}=state;
     return {core:{...core,branches:[]},overlay:{draft,pendingCandidate,prefs,updatedAt}};
   };
-  const coreSignature=core=>JSON.stringify({...core,body:''});
+  // Stable independent root sections: changes in settings never shift body or history chunks.
+  const sectionNames=['settings','body','turns','extras'];
+  function coreSections(core){
+    const {body,turns,undo,replyTrash,...settings}=core;
+    return [settings,{body},{turns},{undo,replyTrash}];
+  }
+  function sectionChunks(core){
+    return coreSections(core).map((section,i)=>splitChunks(
+      (i===0?'{':',')+JSON.stringify(section).slice(1,-1)+(i===3?'}':'')));
+  }
+  function cachedSections(m,core,raw){
+    if(!Array.isArray(m.rootSections)||m.rootSections.length!==4)return null;
+    const groups=sectionChunks(core);
+    if(groups.some((g,i)=>g.length!==m.rootSections[i])||
+       groups.flat().join('')!==raw||groups.flat().length!==m.parts.length)return null;
+    let offset=0;
+    return groups.map(chunks=>{const keys=m.parts.slice(offset,offset+chunks.length);offset+=chunks.length;return {chunks,keys};});
+  }
+  const mirrorEntries=record=>record?.coreParts?[record.core,...record.coreParts]:record?.core?[record.core]:[];
   function checkOverlay(overlay,hash){
     if(hash!==undefined&&checksum(JSON.stringify(overlay))!==hash)
       throw Error('下書き・生成設定のチェックサムが一致しません。');
     return overlay||{};
   }
-  const sameCore=(cache,core,signature)=>cache&&cache.body===core.body&&cache.signature===signature;
   function reference(b,source,entry,summary=null){
     let ref=isArchiveReference(b)?b:storedRefs.get(b);
     if(!ref){ref=archiveReference(summary||meta(b));storedRefs.set(b,ref);refData.set(ref,{});}
@@ -223,32 +240,45 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     }
   }
   async function readSplitIdb(record){
-    const rootRaw=await idb.get(record.core.key);
-    const core=checkedJson(rootRaw,record.core);
+    const entries=mirrorEntries(record);
+    if(record.coreParts!==undefined&&(!Array.isArray(record.coreParts)||entries.length!==4||
+      entries.some((entry,i)=>entry?.section!==sectionNames[i])))
+      throw Error('IndexedDBルート目録が不正です。');
+    const raws=[],core={};
+    for(const entry of entries){
+      const raw=await idb.get(entry.key);
+      const value=checkedJson(raw,entry);
+      if(!value||typeof value!=='object'||Array.isArray(value))throw Error('IndexedDBルート部品が不正です。');
+      for(const key of Object.keys(value)){
+        if(Object.prototype.hasOwnProperty.call(core,key))throw Error('IndexedDBルート部品が重複しています。');
+      }
+      Object.assign(core,value);raws.push(raw);
+    }
+    if(!entries.length)throw Error('IndexedDBルート目録がありません。');
     if(!Array.isArray(record.archives)||record.archives.length>30)throw Error('IndexedDB分岐目録が不正です。');
     const branches=[];
     for(const entry of record.archives){
       branches.push(await decodeArchiveEntry(entry,'idb',lazy));
     }
-    if(lazy)idbRootCache={entry:record.core,body:core.body,signature:coreSignature(core)};
+    if(lazy)idbRootCache=entries.length===4?{entries,raws}:null;
     return {...core,...checkOverlay(record.state,record.overlayHash),branches};
   }
   async function writeMirror(saved){
     if(!lazy){await idb.put('latest',saved);return;}
     const {state,...header}=saved,{core,overlay}=coreOf(state);
-    const signature=coreSignature(core);
+    const raws=coreSections(core).map(section=>JSON.stringify(section));
     const generation='snapshot/'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
     const previous=idbLatest?.format===2?idbLatest:null;
-    const previousKeys=previous?[previous.core.key,...previous.archives.map(e=>e.key)]:[];
+    const previousKeys=previous?[...mirrorEntries(previous).map(e=>e.key),...previous.archives.map(e=>e.key)]:[];
     const eligible=new Set([...previousKeys,...(previous?.previousKeys||[])]);
     const created=[];
-    let coreEntry,archives=[];
+    const entries=[],archives=[];
     try{
-      if(sameCore(idbRootCache,core,signature)&&eligible.has(idbRootCache.entry.key)){
-        coreEntry=idbRootCache.entry;
-      }else{
-        const raw=JSON.stringify(core),key=generation+'/root';
-        coreEntry={key,hash:checksum(raw),size:raw.length};
+      for(let i=0;i<raws.length;i++){
+        const raw=raws[i],old=idbRootCache?.entries[i];
+        if(old&&eligible.has(old.key)&&idbRootCache.raws[i]===raw){entries.push(old);continue;}
+        const key=generation+'/root/'+sectionNames[i];
+        entries.push({section:sectionNames[i],key,hash:checksum(raw),size:raw.length});
         created.push(key);await idb.put(key,raw);
       }
       for(const b of state.branches){
@@ -263,12 +293,12 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         }
         archives.push(entry.summary?entry:summaryEntry(entry,b));
       }
-      const record={...header,format:2,state:overlay,overlayHash:checksum(JSON.stringify(overlay)),core:coreEntry,archives,previousKeys,generation};
+      const record={...header,format:2,state:overlay,overlayHash:checksum(JSON.stringify(overlay)),core:entries[0],coreParts:entries.slice(1),archives,previousKeys,generation};
       // Manifest last: interrupted writes cannot replace the last valid snapshot.
       await idb.put('latest',record);
-      idbLatest=record;idbRootCache={entry:coreEntry,body:core.body,signature};
+      idbLatest=record;idbRootCache={entries,raws};
       for(let i=0;i<state.branches.length;i++)reference(state.branches[i],'idb',archives[i]);
-      const keep=new Set([coreEntry.key,...archives.map(e=>e.key),...previousKeys]);
+      const keep=new Set([...entries.map(e=>e.key),...archives.map(e=>e.key),...previousKeys]);
       for(const key of previous?.previousKeys||[])if(!keep.has(key)){
         try{await idb.delete?.(key);}catch{/* keep extra recovery data */}
       }
@@ -395,9 +425,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     // A fresh session can reuse unchanged root chunks too. This layout is
     // produced by splitChunks; legacy roots are migrated on the next save.
     if(refs&&m===manifest&&m.overlay){
-      const chunks=splitChunks(raw);
-      if(chunks.length===m.parts.length)
-        rootCache={manifest:m,chunks,body:core.body,signature:coreSignature(core)};
+      const sections=cachedSections(m,core,raw);
+      if(sections)rootCache={manifest:m,sections};
     }
     // Old v1 manifest contains ALL branches inside root; new v1 stores immutable
     // archived branch blobs independently to avoid rewriting them on every edit.
@@ -419,19 +448,20 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const generation='g'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
     const {core,overlay}=coreOf(state);
     const rootState=lazy?core:{...state,branches:[]};
-    const signature=lazy?coreSignature(core):null;
-    const reusable=lazy&&rootCache?.manifest===manifest&&sameCore(rootCache,core,signature);
-    const rootJson=reusable?null:JSON.stringify(rootState);
-    const chunks=reusable?rootCache.chunks:splitChunks(rootJson);
+    const groups=lazy?sectionChunks(core):[splitChunks(JSON.stringify(rootState))];
+    const chunks=groups.flat(),rootJson=chunks.join('');
     if(chunks.length>1000)throw Error('SQLiteの容量上限（約4000万文字）を超えました。JSON保存を推奨します。');
-    const keys=[];
-    for(let i=0;i<chunks.length;i++){
-      // Exact equality, not just a checksum: immutable chunks can be reused.
-      if(rootCache?.manifest===manifest&&rootCache.chunks[i]===chunks[i]&&manifest.parts[i]){
-        keys.push(manifest.parts[i]);continue;
+    const keys=[],sections=[];
+    for(let g=0;g<groups.length;g++){
+      const group=groups[g],old=rootCache?.manifest===manifest?rootCache.sections?.[g]:null;
+      const sectionKeys=[];
+      for(let i=0;i<group.length;i++){
+        // Exact equality within each section, even when preceding lengths change.
+        if(old?.chunks[i]===group[i]&&old.keys[i]){sectionKeys.push(old.keys[i]);continue;}
+        const key=generation+'/root/'+g+'/'+i;sectionKeys.push(key);
+        await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[key,group[i]]);
       }
-      const key=generation+'/root/'+i;keys.push(key);
-      await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[key,chunks[i]]);
+      keys.push(...sectionKeys);sections.push({chunks:group,keys:sectionKeys});
     }
     const previousBranches=new Map((manifest?.branchParts||[]).map(b=>[b.id,b]));
     const branchParts=[];
@@ -457,17 +487,21 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       ...(manifest.hash?{hash:manifest.hash}:{}),
       ...(manifest.size!==undefined?{size:manifest.size}:{}),
       ...(manifest.branchParts?{branchParts:manifest.branchParts}:{}),
+      ...(manifest.rootSections?{rootSections:manifest.rootSections}:{}),
       ...(manifest.overlay?{overlay:manifest.overlay,...(manifest.overlayHash!==undefined?{overlayHash:manifest.overlayHash}:{})}:{}),
       rev:manifest.rev||0
     }:null;
     const next={version:1,parts:keys,branchParts,at:Date.now(),rev:++seq,
-      hash:reusable?manifest.hash:checksum(rootJson),size:reusable?manifest.size:rootJson.length,previous,
-      ...(lazy?{overlay,overlayHash:checksum(JSON.stringify(overlay))}:{})};
+      hash:checksum(rootJson),size:rootJson.length,previous,
+      ...(lazy?{rootSections:groups.map(g=>g.length),overlay,overlayHash:checksum(JSON.stringify(overlay))}:{})};
     await run('INSERT OR REPLACE INTO '+TABLE+' (k,v) VALUES (?,?)',[ACTIVE,JSON.stringify(next)]);
-    manifest=next;rootCache={manifest:next,chunks,body:core.body,signature};rawEvidence=null;
+    manifest=next;rootCache={manifest:next,sections};rawEvidence=null;
     if(lazy)for(let i=0;i<state.branches.length;i++)reference(state.branches[i],'sql',branchParts[i]);
     // Retain active and previous immutable branches. GC only unreferenced
-    // generations; never remove checkpoint chunks.
+    // generations; never remove checkpoint chunks. Scan at most once per ten
+    // successful saves (first save per session also reclaims abandoned rows).
+    if(++sqlSavesSinceGc<10)return;
+    sqlSavesSinceGc=0;
     try{
       const retain=new Set([ACTIVE,...keys,...(previous?.parts||[])]);
       for(const b of [...branchParts,...(previous?.branchParts||[])])for(const key of b.parts)retain.add(key);
@@ -492,7 +526,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         if(typeof key==='string'&&key.startsWith('g')&&!retain.has(key))
           await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
       }
-    }catch(e){notify('保存世代の整理を次回へ延期しました: '+e.message,true);}
+    }catch(e){sqlSavesSinceGc=9;notify('保存世代の整理を次回へ延期しました: '+e.message,true);}
   }
   async function commit(state){
     if(readOnly)throw Error('読み取り専用です。復旧元を確認するかJSONバックアップを利用してください。');
