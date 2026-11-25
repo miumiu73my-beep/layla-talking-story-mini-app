@@ -542,8 +542,10 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
           const current=JSON.parse(String(rows[0].v));
           if(!manifest||JSON.stringify(current)!==JSON.stringify(manifest))
             throw Error('SQLite保存世代が変化しています。自動上書きを禁止しました。');
-          // A matching manifest is not sufficient if its chunks became unreadable.
-          await readGeneration(current);
+          // Validate the root and archive directory without loading every modern branch.
+          // Old entries without summaries still need their original full validation.
+          const checked=validate(await decodeGeneration(current,lazy),validator);
+          if(checked.error||branchProblem(checked.value))throw Error('SQLite保存部品を検証できません。自動上書きを禁止しました。');
         }else if(manifest){
           throw Error('SQLiteの既存ACTIVEが見つかりません。自動上書きを禁止しました。');
         }
@@ -842,7 +844,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       for(const {key,entry} of parents)
         all.push({id:key,at:Number(entry.at)||0,title:entry.title,chars:entry.chars,reason:entry.reason||'旧復元点',scope:entry.scope||'full',hash:entry.hash,size:entry.size});
       if(manifest?.previous)all.push({id:'previous',at:manifest.previous.at||0,
-        title:'直前の保存世代',chars:null,reason:'直前の保存世代'});
+        title:'直前の自動保存（短期救出用）',chars:null,reason:'直前の自動保存世代・操作前復元点とは別'});
     }
     if(idb)try{
       const indexed=await idb.get('checkpoint-index');
@@ -984,7 +986,13 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       await save(selected);
       if(mode!=='SQLite')throw Error('SQLiteへの書き込みを確認できません。');
       rebuildPending=false;return selected;
-    }catch(e){readOnly=true;rebuildPending=false;throw e;}
+    }catch(e){
+      // A failed SQL write may have cleared sqliteCorrupt and manifest while the
+      // old ACTIVE still exists. Explicit retry must protect it again, not use
+      // blind auto-reconnect. Keep read-only until a verified SQLite write succeeds.
+      readOnly=true;rebuildPending=true;sqliteCorrupt=true;sqlAvailable=false;
+      throw e;
+    }
   }
   // Only explicit, verified recovery cleanup may release old corruption evidence.
   let cleaningCorruption=false;

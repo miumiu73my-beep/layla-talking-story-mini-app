@@ -946,3 +946,25 @@ test('explicit corruption cleanup preserves healthy generations and checkpoints 
   assert.equal(st.initial.body,'健全な現在の原稿');
   assert.ok((await st.checkpointList()).some(x=>x.reason==='手動復元点'));
 });
+
+test('failed rebuild after protection remains read-only and retries SQLite without restart',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),host={db:sql};
+  let st=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+  const s=freshState();s.body='復旧対象'.repeat(12000);
+  await st.save(s);
+  const m=JSON.parse(sql.map.get('active'));sql.map.delete(m.parts[0]);
+  st=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+  assert.equal(st.canRebuildFromIdb,true);
+  const execute=sql.executeSql.bind(sql);let fail=true;
+  sql.executeSql=async(q,p=[])=>{
+    if(fail&&q.startsWith('INSERT')&&String(p[0]).includes('/root/')){fail=false;throw Error('temporary root write failure');}
+    return execute(q,p);
+  };
+  await assert.rejects(st.rebuildFromIdb());
+  assert.equal(st.readOnly,true);assert.equal(st.canRebuildFromIdb,true);
+  await assert.rejects(st.save(freshState()));
+  const recovered=await st.rebuildFromIdb();
+  assert.equal(recovered.body,s.body);assert.equal(st.mode(),'SQLite');assert.equal(st.readOnly,false);
+  const reopened=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+  assert.equal(reopened.initial.body,s.body);
+});

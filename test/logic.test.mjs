@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {FORMAT,VERSION,BODY_LIMIT,LIMITS,freshState,cleanState,warningsForState,buildRequest,buildMessages,
-  samplerParams,parseImport,readableText,compactBackup,acceptTurn,undoTurn} from '../src/logic.js';
+  samplerParams,parseImport,readableText,compactBackup,acceptTurn,undoTurn,rememberReply} from '../src/logic.js';
 
 test('existing character-book notation and plain Japanese are preserved',()=>{
   const s=freshState();s.characters='[海:名称≡<虎田海>]\n優しい人物。';
@@ -39,9 +39,10 @@ test('accept and undo do not duplicate full body in turns',()=>{
   assert.ok(a.body.includes('彼は笑い返した。'));
   assert.equal(a.turns[0].reply,undefined);
   assert.equal(a.turns[0].preview,'彼は笑い返した。');
-  assert.equal(a.undo.beforeBody,undefined);
-  assert.equal(undoTurn(a).body,'昔の出来事');
-  assert.throws(()=>undoTurn({...a,body:'改稿'+a.body.slice(2)}));
+  assert.equal(a.undo,null);
+  const legacy=cleanState({...a,undo:{beforeBody:s.body,afterBody:a.body,beforeTurns:0,input:'笑う'}});
+  assert.equal(undoTurn(legacy).body,'昔の出来事');
+  assert.throws(()=>undoTurn({...legacy,body:'改稿'+legacy.body.slice(2)}));
 });
 test('legacy full reply is preserved in v1 JSON',()=>{
   const s=freshState();s.turns=[{user:'発言',reply:'長い古い返答',at:'date'}];
@@ -221,7 +222,7 @@ test('regenerated candidate preserves next draft across save and adoption',()=>{
 test('synthetic input is omitted from body and recent history even with nonempty sourceDraft',()=>{
   const s=freshState();s.prefs.recordInputInBody=true;
   const a=acceptTurn(s,{user:'この場面を自然に続きを進める',text:'続き。',sourceDraft:'この場面を自然に続きを進める'});
-  assert.equal(a.body,'続き。');assert.equal(undoTurn(a).draft,'');
+  assert.equal(a.body,'続き。');assert.equal(a.undo,null);
   const req=buildRequest(a,'次へ');
   assert.ok(req.messages[0].content.includes('見出し「【あなたの入力】」は出力しない'));
   assert.ok(!req.messages[0].content.includes('この場面を自然に続きを進める'));
@@ -232,4 +233,9 @@ test('recent user history only omits input already transmitted in body tail',()=
   assert.equal(buildRequest(a,'次へ').messages[0].content.split('屋上で会おう').length-1,1);
   a.body+='長'.repeat(13000);
   assert.ok(buildRequest(a,'次へ').messages[0].content.includes('屋上で会おう'));
+});
+
+test('reply trash deduplicates exact replies before retention',()=>{
+  assert.deepEqual(rememberReply(['A','B','A'],'B'),['B','A']);
+  assert.deepEqual(rememberReply(['A','B'],'A'),['A','B']);
 });

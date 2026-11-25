@@ -64,12 +64,12 @@ header .status.error{color:#a33224;font-weight:700}
 input.modal-editor{min-height:0;height:45px}
 #modal .modal-card{max-height:85dvh;overflow-y:auto}
 
-/* Recovery notice is outside the sticky header, preserving keyboard viewport. */
-#safety{max-width:740px;margin:6px auto 12px;max-height:170px;overflow-y:auto}
+/* Keep persistence warnings in the sticky header, with a bounded scrollable area. */
+#safety{max-width:740px;margin:4px auto 6px;max-height:min(96px,18dvh);overflow-y:auto;overflow-wrap:anywhere}
 #recover-now{display:block;margin:0 auto 7px;max-width:calc(100% - 24px)}
 header .status{max-height:34px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 #modal .modal-validation{margin-top:8px}
-@media(max-width:500px){#safety{margin:4px 10px 10px;max-height:108px}}
+@media(max-width:500px){#safety{margin:4px 10px 6px;max-height:min(76px,16dvh)}}
 
 /* Keep full error details readable, but avoid using the entire keyboard viewport. */
 header .status.error{

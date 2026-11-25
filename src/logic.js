@@ -15,7 +15,7 @@ export function inputLimitWarning(text,prefs){
 // reply intact rather than silently truncating it.
 export function rememberReply(trash,text){
   if(typeof text!=='string'||!text.trim())return [...trash];
-  const entries=[text,...trash].slice(0,REPLY_TRASH_LIMIT);
+  const entries=[...new Set([text,...trash])].slice(0,REPLY_TRASH_LIMIT);
   let total=entries[0].length;
   return entries.filter((entry,i)=>{if(i===0)return true;total+=entry.length;return total<=BODY_LIMIT;});
 }
@@ -334,17 +334,19 @@ export function acceptTurn(state,candidate){
   const bodySegment=prelude+text;
   if(d.body.length+prefix.length+bodySegment.length>BODY_LIMIT)
     throw Error('本文の入力上限を超えています。先にJSONを保存してください。');
-  const before=d.body,beforeTurns=d.turns.length;
+  const before=d.body;
   d.body+=prefix+bodySegment;
   d.turns.push({user:input,...(prelude?{userPrelude:prelude}:{}),
     preview:bodySegment.slice(0,240),replyHash:bodyFingerprint(bodySegment),
     at:new Date().toISOString(),bodyStart:before.length+prefix.length,bodyEnd:d.body.length});
-  d.undo={beforeLength:before.length,added:prefix+bodySegment,afterHash:checksum(d.body),beforeTurns,input};
+  // Latest-turn undo uses the validated timeline and reply trash, not a duplicate reply.
+  d.undo=null;
   d.pendingCandidate=null;
   d.draft=!candidate.preserveDraft&&d.draft===candidate.sourceDraft?'':d.draft;
   d.branches=state.branches||[];
   return d;
 }
+// Legacy-only helper: old v1 undo records remain readable; the UI uses rewindLastWithoutFork.
 export function undoTurn(state){
   const d=cleanState({...state,branches:[]}),u=d.undo;
   if(!u||d.body.length!==u.beforeLength+u.added.length||!d.body.endsWith(u.added)||checksum(d.body)!==u.afterHash||d.turns.length!==u.beforeTurns+1)throw Error('本文が編集されているため安全に取り消せません。');

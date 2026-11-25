@@ -521,10 +521,11 @@ let activeStop=null;
 function stopGeneration(){
   if(!busy)return;
   const finalizing=activeGenerationFinished;
+  const generationStarted=Boolean(stream||finalizing);
   const requestedAt=Date.now();
   const stopMarker=++activeId;
   try{stream?.abort();}catch(e){status('停止指示のエラー: '+String(e.message||e),true);}
-  stopUntil=requestedAt+5000; // Ignore late stream callbacks and earlier stop confirmations.
+  stopUntil=generationStarted?requestedAt+5000:0; // Ignore late stream callbacks and earlier stop confirmations.
   busy=false;stream=null;lockUI();
   let retryFallbackWasUsed=false;
   if(!candidate?.text?.trim()){
@@ -538,6 +539,10 @@ function stopGeneration(){
   }
   state.pendingCandidate=candidate;showCandidate();persist(0);
   if(typeof activeStop==='function'){const cancel=activeStop;activeStop=null;cancel();}
+  if(!generationStarted){
+    activeGenerationFinished=null;stopUnconfirmed=false;lockUI();
+    status('生成開始前に停止しました。');return;
+  }
   status('停止指示を送信しました。Laylaの終了応答を確認中です。');
   let released=false;
   const release=confirmed=>{
@@ -891,7 +896,7 @@ async function branchAction(action,id){
 function setup(){
   app.innerHTML=
     '<header><div class="bar"><img class="logo" src="./icon.jpg" alt="緑の時計"><div class="titles"><div class="subtitle">LAYLA MINI-APP · LOCAL STORY</div><div class="brand" id="title-view">新しい物語</div></div><span class="badge">物語</span></div>'+
-    '<div id="status" class="status" role="status" aria-live="polite">データ読み込み中…</div><button id="recover-now" hidden class="small warn">復旧元を選択</button><button id="open-export-manual" hidden class="small ghost">共有できない場合：手動で救出</button></header><div id="safety" class="safety error" role="alert">初期化中</div>'+
+    '<div id="status" class="status" role="status" aria-live="polite">データ読み込み中…</div><button id="recover-now" hidden class="small warn">復旧元を選択</button><button id="open-export-manual" hidden class="small ghost">共有できない場合：手動で救出</button><div id="safety" class="safety error" role="alert">初期化中</div></header>'+
     '<main><div id="screen-main">'+
     '<section class="panel"><div class="split" style="justify-content:space-between"><h2>確定した物語</h2><span class="mini" id="counter"></span></div><p id="meta" class="hint"></p><div class="story" id="body-view"></div><div class="actions"><button id="view-full">全文を表示</button><button id="jump-bottom">入力欄へ移動</button><button id="undo">直前のターンを取り消す</button></div></section>'+
     '<section class="panel" id="prompt-section"><h2>あなたの台詞・行動</h2><p class="hint">本人が話す台詞・取る行動、次の場面の希望を記入してください。</p><textarea id="user-input" rows="5" maxlength="15000" placeholder="例：『おはよう』と笑って、隣に座る。"></textarea><p id="input-warning" class="safety" role="alert" hidden></p><div class="actions"><button id="generate" class="primary">続きを生成</button><button id="stop" class="warn" disabled>生成停止</button></div><div id="candidate-box" hidden><label for="candidate-edit">未採用の候補（編集可能）</label><textarea id="candidate-edit" rows="9"></textarea><p id="candidate-status" class="hint"></p><div class="actions"><button id="accept" class="primary">この文章を採用</button><button id="retry">もう一度生成</button><button id="discard" class="warn">破棄</button></div></div></section>'+
