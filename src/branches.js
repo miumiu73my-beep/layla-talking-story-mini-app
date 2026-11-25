@@ -154,10 +154,16 @@ export function reconcileBodyEdit(state,nextBody){
   const d=cleanState({...state,branches:[]}),newBody=String(nextBody);
   if(newBody===d.body){d.branches=state.branches||[];return d;}
   const positions=timeline(d),oldBody=d.body;
+  // Compare unchanged spans in blocks; only inspect individual code units
+  // inside the two boundary blocks (UTF-16 offsets match textarea positions).
+  const block=4096,limit=Math.min(oldBody.length,newBody.length);
   let left=0,right=0;
-  while(left<oldBody.length&&left<newBody.length&&oldBody[left]===newBody[left])left++;
-  while(right<oldBody.length-left&&right<newBody.length-left&&
-    oldBody[oldBody.length-1-right]===newBody[newBody.length-1-right])right++;
+  while(left+block<=limit&&oldBody.slice(left,left+block)===newBody.slice(left,left+block))left+=block;
+  while(left<limit&&oldBody[left]===newBody[left])left++;
+  const remaining=limit-left;
+  while(right+block<=remaining&&
+    oldBody.slice(oldBody.length-right-block,oldBody.length-right)===newBody.slice(newBody.length-right-block,newBody.length-right))right+=block;
+  while(right<remaining&&oldBody[oldBody.length-1-right]===newBody[newBody.length-1-right])right++;
   const oldEnd=oldBody.length-right;
   const delta=newBody.length-oldBody.length;
   const insertion=left===oldEnd;
@@ -182,6 +188,8 @@ export function reconcileBodyEdit(state,nextBody){
     else if(old.start>=oldEnd){t.bodyStart+=delta;t.bodyEnd+=delta;}
     if(change?.index===i){
       const reply=d.body.slice(t.bodyStart,t.bodyEnd);
+      if(t.userPrelude&&(!reply.startsWith(t.userPrelude)||t.userPrelude.length>=reply.length))
+        throw Error('ユーザー入力併記部分が編集済みです。履歴を再設定してください。');
       t.preview=reply.slice(0,240);
       t.replyHash=bodyFingerprint(reply);
       if(typeof t.reply==='string')t.reply=reply; // legacy v1 backup
@@ -189,7 +197,15 @@ export function reconcileBodyEdit(state,nextBody){
     return t;
   });
   d.undo=null;
-  timeline(d); // reject unsafe reconciliation rather than silently shifting turns
+  // The original timeline was fully verified. Outside the changed range the
+  // bytes are identical, so only the edited reply needs a new fingerprint.
+  // Check the resulting offsets without re-slicing/re-hashing every reply.
+  let previousEnd=0;
+  for(const t of d.turns){
+    if(t.bodyStart<previousEnd||t.bodyEnd<t.bodyStart||t.bodyEnd>newBody.length)
+      throw Error('補正後の本文位置が一致しません。');
+    previousEnd=t.bodyEnd;
+  }
   d.branches=state.branches||[];
   return d;
 }
@@ -214,3 +230,27 @@ export function clearHistoryAgainstBody(state){
   d.turns=[];d.undo=null;d.pendingCandidate=null;
   return d;
 }
+
+// Session-local recovery anchor: a validated active-only snapshot. Do not
+// advance it on a series of small deletions or on ordinary autosaves.
+export function makeBodyRecovery(){
+  let anchor=null;
+  return {
+    reset(){anchor=null;},
+    seed(state){if(!anchor&&state.body.length)anchor=cleanState({...state,branches:[]});},
+    plan(state,nextLength){
+      if(!state.body.length)return null;
+      const shrinking=nextLength<state.body.length;
+      const fresh=!anchor;
+      if(fresh||(shrinking&&state.body.length>anchor.body.length))
+        anchor=cleanState({...state,branches:[]});
+      const large=anchor.body.length>500&&nextLength<anchor.body.length*0.5;
+      if(large)return {snapshot:anchor,reason:'本文の累積・大幅削除前',large:true};
+      if(fresh)return {snapshot:anchor,reason:'本文編集開始前',large:false};
+      return null;
+    },
+    completed(plan){if(plan.large)anchor=null;},
+    failed(plan){if(!plan.large&&anchor===plan.snapshot)anchor=null;}
+  };
+}
+export const dailyCheckpointDue=(last,now=Date.now())=>last===null||now-last>=86400000;
