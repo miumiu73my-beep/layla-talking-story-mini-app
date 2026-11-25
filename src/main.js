@@ -220,13 +220,13 @@ function showCandidate(message){
   }
   lockUI();
 }
-function showMain(){
+function showMain({scroll=true}={}){
   if(!ready||branchBusy||bodyBackupBusy)return;
   commitPendingBodyEdit();
   el('screen-main').hidden=false;el('screen-settings').hidden=true;
   el('nav-main').classList.add('primary');el('nav-settings').classList.remove('primary');
   paint();if(editRev!==savedRev)void saveNow();
-  window.scrollTo(0,0);
+  if(scroll)window.scrollTo(0,0);
 }
 function showSettings(){
   if(!ready||busy||branchBusy||bodyBackupBusy||!el('screen-settings').hidden)return;
@@ -620,8 +620,9 @@ async function beforeDestructive(action,{checkpoint=true,scope,branchId}={}){
   }
 }
 async function handleImport(file){
-  if(!file||!ready||busy||bodyBackupBusy)return;
+  if(!file||!ready||busy||branchBusy||bodyBackupBusy||exporting)return;
   try{
+    if(!store||(!store.hasStorage&&!store.corrupt))throw Error('保存先がありません。ファイルを読み込めません。既存の作品は変更していません。保存先を復旧してから再試行してください。');
     if(file.size>TRANSFER_MAX_BYTES)throw Error('50MB以下のファイルを選んでください。');
     const parsed=parseImport(file.name,await file.text(),state);
     const type=parsed.full?'設定・記憶・本文・履歴すべて':'本文と履歴のみ';
@@ -830,7 +831,7 @@ async function actOnTurn(index,action){
     );
     if(!decision)return;
     if(await applyStoryChange(s=>editUserAt(s,index,decision.text),'過去の入力を編集した分岐を作成しました')){
-      showMain();
+      showMain({scroll:false});
       if(decision.action==='generate'){
         el('prompt-section').scrollIntoView({block:'start'});
         await startGeneration({inputOverride:decision.text.trim()});
@@ -856,7 +857,7 @@ async function actOnTurn(index,action){
     const input=turn.user;
     const preserveDraft=latest&&state.draft.length>0;
     if(await applyStoryChange(s=>regenerateAt(s,index),latest?'直前の返信をごみ箱へ移しました。':'再生成用の分岐を作成しました')){
-      showMain();el('prompt-section').scrollIntoView({block:'start'});await startGeneration({inputOverride:input,preserveDraft});
+      showMain({scroll:false});el('prompt-section').scrollIntoView({block:'start'});await startGeneration({inputOverride:input,preserveDraft});
     }
     return;
   }
@@ -872,7 +873,7 @@ async function actOnTurn(index,action){
       action==='restart'?forkAt(s,{index:0,after:false,label:'第1ターンの前からやり直す'}):
       rewindAfter(s,index),
     '指定位置へ戻した分岐を作成しました');
-    if(changed){showMain();el('prompt-section').scrollIntoView({block:'start'});}
+    if(changed){showMain({scroll:false});el('prompt-section').scrollIntoView({block:'start'});}
   }
 }
 async function branchAction(action,id){
@@ -909,7 +910,7 @@ function setup(){
     '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p class="hint">コピーするか、通常ブラウザではダウンロードを選択してください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="copy-manual">テキストをコピー</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
     '</main><nav class="nav"><button class="primary" id="nav-main">本文へ戻る</button><button id="nav-settings">設定</button><button id="quick-backup">JSON保存</button></nav>'+
     '<div id="modal" class="overlay" hidden role="dialog" aria-modal="true"><div class="modal-card"><p id="modal-content"></p><div id="modal-buttons" class="actions"></div></div></div>';
-  el('nav-main').onclick=showMain;el('nav-settings').onclick=showSettings;
+  el('nav-main').onclick=()=>showMain();el('nav-settings').onclick=showSettings;
   el('quick-backup').onclick=()=>void exportAs('json');
   el('generate').onclick=()=>void startGeneration();
   el('stop').onclick=stopGeneration;
