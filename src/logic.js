@@ -35,7 +35,15 @@ export function freshState(){
       presence_penalty:'',max_tokens:''}};
 }
 // Only canonical, deeply immutable archived snapshots can bypass revalidation.
-const canonicalArchives=new WeakSet();
+const canonicalArchives=new WeakSet(), archiveReferences=new WeakSet();
+// References are internal capabilities, never accepted from imported JSON.
+export function archiveReference(meta){
+  const ref={id:meta.id,name:meta.name,createdAt:meta.createdAt,parentId:meta.parentId,forkTurn:meta.forkTurn,
+    chars:meta.chars,turnCount:meta.turnCount,kind:'archive-reference'};
+  Object.defineProperty(ref,'toJSON',{value(){throw Error('未読込の分岐をJSONにする前に分岐本文を読み込んでください。');}});
+  archiveReferences.add(ref);return Object.freeze(ref);
+}
+export const isArchiveReference=value=>archiveReferences.has(value);
 function freezeArchive(value){
   if(value&&typeof value==='object'&&!Object.isFrozen(value)){
     for(const child of Object.values(value))freezeArchive(child);
@@ -124,7 +132,8 @@ export function cleanState(raw){
       if(!b||typeof b!=='object'||Array.isArray(b)||typeof b.id!=='string'||
         !/^[A-Za-z0-9_-]{1,100}$/.test(b.id)||used.has(b.id))throw Error('分岐IDが不正または重複しています。');
       used.add(b.id);
-      if(canonicalArchives.has(b))return b;
+      if(isArchiveReference(b)||canonicalArchives.has(b))return b;
+      if(b.kind==='archive-reference')throw Error('分岐本文を含まない参照形式はインポートできません。');
       const clean=cleanState({...b,activeBranch:null,branches:[]});
       const entry={
         id:b.id,name:typeof b.name==='string'&&b.name.trim()?b.name.slice(0,90):'無題の分岐',
@@ -286,6 +295,7 @@ export function readableText(state,format){
 // The normal app state and SQLite layout remain the original v1 schema.
 export function compactBackup(state){
   const d=cleanState(state);
+  if(d.branches.some(isArchiveReference))throw Error('軽量JSONの作成前に分岐を読み込んでください。');
   const bodies=[d.body,...d.branches.map(b=>b.body)];
   const base=bodies.reduce((a,b)=>b.length>a.length?b:a,'');
   const pack=body=>{
