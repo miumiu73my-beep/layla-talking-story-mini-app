@@ -39,12 +39,13 @@ export async function writeFile(host,name,text,mime){
   if(typeof host?.utils?.saveFile==='function'){
     try{
       const r=await host.utils.saveFile(name,utf8ToBase64(text),true);
-      if(r?.success===true||r===true)
-        return {kind:'share',message:'Layla側で保存・共有を開始しました。「ファイル」に保存されたことを確認してください。'};
       if(r?.cancelled||/cancel|キャンセル/i.test(String(r?.message||'')))
         return {kind:'cancelled',message:'保存をキャンセルしました。'};
+      if(r?.success===true||r===true)
+        return {kind:'share',message:'Layla側で保存・共有を開始しました。「ファイル」に保存されたことを確認してください。'};
       if(r===undefined||r===null)
-        return {kind:'unconfirmed',message:'Laylaから保存結果が返っていません。実際にファイルがあるか確認し、必要なら「共有できない場合：手動で救出」を押してください。'};
+        // The first share sheet may already have opened. Offer manual rescue instead of opening a second one.
+        return {kind:'unconfirmed',message:'Laylaから保存結果が返っていません。実際にファイルがあるか確認してください。保存されていなければ手動で救出できます。',text,name,mime};
       reason=String(r?.message||'Layla保存APIが成功を返しませんでした。');
     }catch(err){
       if(err?.name==='AbortError'||/cancel|キャンセル/i.test(String(err?.message||'')))
