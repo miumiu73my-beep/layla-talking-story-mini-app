@@ -94,6 +94,11 @@ test('both storage channels unavailable are reported as unavailable',async()=>{
   const store=await openStore({},()=>{},{idbFactory:async()=>{throw Error('no idb');}});
   assert.equal(store.hasStorage,false);assert.equal(store.mode(),'保存不可');
   await assert.rejects(store.save(freshState()));
+  const before=store.initial;
+  await assert.rejects(store.allowImportRecovery(),/ファイルを読み込めません/);
+  assert.equal(store.hasStorage,false);
+  assert.equal(store.initial,before);
+  assert.equal(store.mode(),'保存不可');
 });
 test('broken sqlite manifest is kept read-only and raw dump is retrievable',async()=>{
   const sql=fakeSql();sql.map.set('active','{"version":1,"parts":["missing"]}');
