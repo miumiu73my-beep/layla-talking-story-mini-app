@@ -3,9 +3,10 @@ export const FORMAT='layla-talking-story-backup',VERSION=1;
 export const BODY_LIMIT=1500000,TRANSFER_MAX_BYTES=50000000;
 export const REPLY_TRASH_LIMIT=20;
 export const PROMPT_INPUT_LIMIT=6000;
-export function inputLimitWarning(text){
+export function inputLimitWarning(text,prefs){
   const n=String(text||'').length;
-  return n>PROMPT_INPUT_LIMIT?'今回の入力は'+n+'文字です。送信上限'+PROMPT_INPUT_LIMIT+'文字を超えています。短くするまで生成できません（原文は保存されます）。':'';
+  const limit=prefs?promptFrame(cleanState({prefs}).prefs).inputLimit:PROMPT_INPUT_LIMIT;
+  return n>limit?'今回の入力は'+n+'文字です。送信上限は約'+limit+'文字です。入力を短くするかコンテキスト長・出力予約を見直してください（原文は保存されます）。':'';
 }
 // Keep recent replies, not entire story snapshots. Retain a single oversized
 // reply intact rather than silently truncating it.
@@ -216,14 +217,10 @@ export function samplerParams(prefs){
   }
   return out;
 }
-export function buildRequest(state,userText){
-  const d=cleanState({...state,branches:[]}),p=d.prefs;
+function promptFrame(p){
   const desiredTokens=Number(p.max_tokens)||Math.min(4096,Math.ceil(p.targetChars*2.2)+128);
   const outputTokens=Math.max(1,Math.min(desiredTokens,Math.floor(p.contextTokens/2)));
-  const inputBudget=Math.max(600,Math.floor((p.contextTokens-Math.min(outputTokens,Math.floor(p.contextTokens*0.5))-160)*0.66));
-  const input=String(userText||'');
-  const warning=inputLimitWarning(input);
-  if(warning)throw Error(warning);
+  const inputBudget=Math.max(0,Math.floor((p.contextTokens-outputTokens-160)*0.66));
   const directives=[
     'あなたはユーザーが参加する対話型日本語フィクションの語り手です。本文だけを書いてください。',
     'ユーザー本人の新しい台詞・行動・感情・思考・決断は勝手に創作してはいけません。入力された行動・台詞はそのまま物語の因果に取り込んでください。',
@@ -233,16 +230,20 @@ export function buildRequest(state,userText){
     '展開速度：'+p.pace+'。視点：'+p.pov+'。生成の目安：約'+p.targetChars+'文字。',
     p.recordInputInBody?'ユーザー入力はアプリ側で確定本文へ原文を追加します。あなたは入力文を繰り返さず、他の人物の反応と物語の続きを描写してください。入力されていない本人の台詞・行動・内心は創作しないでください。':p.includeInput?'今回の入力でユーザーが実際に記載した言葉・行動だけを本文へ必要に応じて自然に含めてください。記載のない本人の台詞・行動・内心は加えないでください。':'今回の入力内容を確定した事実として扱い、本人の入力を長々と繰り返さず相手の反応から描写してください。記載のない本人の台詞・行動・内心は創作しないでください。'
   ].join('\n');
-  const final='今回の入力：\n'+input+'\n\n【最重要】ユーザー本人の新しい台詞・行動・内心を代筆しない。禁止ワード・展開を守る。設定記法を出力しない。物語本文のみ続ける。';
-  let available=Math.max(150,inputBudget-directives.length-final.length-200);
-  // Keep previous USER intentions without re-sending assistant prose or stacking user roles.
-  // The root body is still the authoritative narrative.
+  const prefix='今回の入力：\n',suffix='\n\n【最重要】ユーザー本人の新しい台詞・行動・内心を代筆しない。禁止ワード・展開を守る。設定記法を出力しない。物語本文のみ続ける。';
+  return {desiredTokens,outputTokens,inputBudget,directives,prefix,suffix,
+    inputLimit:Math.max(0,Math.min(PROMPT_INPUT_LIMIT,inputBudget-directives.length-prefix.length-suffix.length))};
+}
+export function buildRequest(state,userText){
+  const d=cleanState({...state,branches:[]}),p=d.prefs;
+  const {desiredTokens,outputTokens,inputBudget,directives,prefix,suffix,inputLimit}=promptFrame(p);
+  const input=String(userText||'');
+  const warning=inputLimitWarning(input);
+  if(warning)throw Error(warning);
+  const final=prefix+input+suffix;
+  let remaining=Math.max(0,inputBudget-directives.length-final.length);
   const recent=d.turns.slice(-5).map(t=>t.user.trim()).filter(Boolean);
-  let userHistory=recent.map((v,i)=>String(i+1)+'. '+v.slice(0,300)).join('\n');
-  userHistory=safeTail(userHistory,Math.min(700,Math.floor(available*0.15)));
-  available=Math.max(0,available-userHistory.length);
-  const bodyReserve=d.body?Math.min(d.body.length,p.contextChars,Math.floor(available*0.40)):0;
-  let remaining=Math.max(0,available-bodyReserve);
+  const historyText=recent.map((v,i)=>String(i+1)+'. '+v.slice(0,300)).join('\n');
   const sections=[
     ['ユーザーの役割','player',false],
     ['絶対に守るルール','rules',false],
@@ -255,10 +256,21 @@ export function buildRequest(state,userText){
     ['物語のゴール','goal',false]
   ];
   const entries=sections.filter(([,key])=>d[key].trim()).map(([title,key,latest])=>({
-    title,key,latest,quota:0,length:d[key].length
+    title,key,latest,quota:0,length:d[key].length,header:'\n\n【'+title+'】\n'
   }));
-  // Water filling: short fields free their unused share for longer ones.
-  let active=entries.filter(e=>e.length);
+  // Count actual headings and separators. No minimum optional quota.
+  const selected=[];
+  for(const e of entries){
+    if(remaining>=e.header.length+1){remaining-=e.header.length+1;e.quota=1;selected.push(e);}
+  }
+  const historyHeader='\n\n【直近のユーザー入力・行動（確定済み）】\n';
+  const bodyHeader='\n\n【確定本文の末尾】\n';
+  const bodyQuota=d.body&&remaining>=300?Math.min(d.body.length+bodyHeader.length,p.contextChars+bodyHeader.length,Math.floor(remaining*0.40)):0;
+  if(bodyQuota>bodyHeader.length)remaining-=bodyQuota;
+  const historyQuota=historyText&&remaining>=200?Math.min(historyText.length+historyHeader.length,700,Math.floor(remaining*0.15)):0;
+  const historyBudget=Math.max(0,historyQuota-historyHeader.length);
+  if(historyBudget)remaining-=historyQuota;
+  let active=selected.filter(e=>e.quota<e.length);
   while(remaining>0&&active.length){
     const share=Math.max(1,Math.floor(remaining/active.length));
     for(const item of active){
@@ -268,20 +280,32 @@ export function buildRequest(state,userText){
     }
     active=active.filter(e=>e.quota<e.length);
   }
-  const allocations=entries.map(e=>({
-    title:e.title,key:e.key,omitted:e.length-e.quota,
-    text:e.latest?safeTail(d[e.key],e.quota):d[e.key].slice(0,e.quota)
-  }));
-  const body=safeTail(d.body,Math.min(p.contextChars,bodyReserve+remaining));
-  const parts=allocations.filter(a=>a.text).map(a=>'【'+a.title+'】\n'+a.text);
-  if(userHistory)parts.push('【直近のユーザー入力・行動（すでに確定済み。返信本文は確定本文にあります）】\n'+userHistory);
-  if(body)parts.push('【確定本文の末尾】\n'+body);
-  else parts.push('【開始場面】\nまだ本文がありません。今回の入力と設定に合った物語の導入を描写してください。');
-  const system=directives+'\n\n'+parts.join('\n\n');
+  function head(s,n){
+    let end=Math.min(s.length,n);
+    if(end>0&&end<s.length&&s.charCodeAt(end)>=0xdc00&&s.charCodeAt(end)<=0xdfff)end--;
+    return s.slice(0,end);
+  }
+  const allocations=entries.map(e=>{
+    const text=e.quota?(e.latest?safeTail(d[e.key],e.quota):head(d[e.key],e.quota)):'';
+    return {title:e.title,key:e.key,omitted:e.length-text.length,text,header:e.header};
+  });
+  let system=directives;
+  for(const e of allocations)if(e.text)system+=e.header+e.text;
+  let space=Math.max(0,inputBudget-system.length-final.length);
+  const userHistory=safeTail(historyText,historyBudget);
+  if(userHistory&&space>=historyHeader.length+userHistory.length){
+    system+=historyHeader+userHistory;space-=historyHeader.length+userHistory.length;
+  }
+  const body=safeTail(d.body,Math.max(0,Math.min(p.contextChars,space-bodyHeader.length)));
+  if(body)system+=bodyHeader+body;
+  else if(!d.body){
+    const intro='\n\n【開始場面】\nまだ本文がありません。今回の入力と設定に合った物語の導入を描写してください。';
+    if(space>=intro.length)system+=intro;
+  }
   return {
     messages:[{role:'system',content:system},{role:'user',content:final}],
     meta:{characters:system.length+final.length,estimatedTokens:Math.ceil((system.length+final.length)/0.66),
-      contextTokens:p.contextTokens,outputTokens,omitted:allocations.filter(a=>a.omitted>0),
+      contextTokens:p.contextTokens,outputTokens,inputLimit,inputBudget,omitted:allocations.filter(a=>a.omitted>0),
       bodyOmitted:Math.max(0,d.body.length-body.length),
       overBudget:system.length+final.length>inputBudget,
       outputCapped:desiredTokens>outputTokens,
