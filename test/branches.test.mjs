@@ -117,7 +117,7 @@ test('older full-reply v1 turns without explicit offsets can be branched',()=>{
   assert.equal(timelineAt(fork,1).reply,'新しい応答2。');
 });
 test('branch IDs cannot silently collide on JSON restore',()=>{
-  const s=rewindAfter(story(),0);s.branches[0].id=s.activeBranch.id;
+  const s=rewindAfter(story(),0);s.branches[0]={...s.branches[0],id:s.activeBranch.id};
   assert.throws(()=>cleanState(s),/重複/);
 });
 test('branch count limit fails safely without discarding originals',()=>{
@@ -231,4 +231,12 @@ test('rewinding a corrected legacy turn retains start and end additions',async()
   const last=reconcileBodyEdit(first,first.body.slice(0,pos.end)+'末尾。'+first.body.slice(pos.end));
   assert.equal(timeline(last)[1].reply,'冒頭。旧応答B。末尾。');
   assert.equal(rewindAfter(last,1).body,'旧応答A。\n\n冒頭。旧応答B。末尾。');
+});
+
+test('renaming an already canonical immutable archive preserves the original',()=>{
+  const original=cleanState(rewindAfter(story(),0));
+  const id=original.branches[0].id;
+  const renamed=renameBranch(original,id,'新しい名前');
+  assert.equal(renamed.branches[0].name,'新しい名前');
+  assert.notEqual(original.branches[0].name,'新しい名前');
 });
