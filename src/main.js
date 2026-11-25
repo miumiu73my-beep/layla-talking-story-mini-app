@@ -12,18 +12,18 @@ let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning=
 let lastExport=null,pendingBodyEdit=null,bodyEditTimer=null,bodyEditBackup=null;
 let deletionWarning='',historyWarning='';
 const bodyRecovery=makeBodyRecovery();
-let periodicAt=null,periodicTask=null,periodicWarning='';
-function resetBodyRecovery(){bodyRecovery.reset();periodicAt=null;periodicWarning='';}
+let periodicAt=null,periodicTask=null,periodicWarning='',recoveryEpoch=0;
+function resetBodyRecovery(){bodyRecovery.reset();periodicAt=null;periodicWarning='';recoveryEpoch++;}
 async function ensurePeriodicCheckpoint(){
   if(!store||saveBlocked||!state.body.length)return;
   if(periodicTask){await periodicTask;return;}
   if(!dailyCheckpointDue(periodicAt))return;
-  const snapshot=cleanState({...state,branches:[]});
+  const snapshot=cleanState({...state,branches:[]}),epoch=recoveryEpoch;
   periodicTask=(async()=>{
     try{
       await store.checkpoint(snapshot,periodicAt===null?'セッション開始時の自動復元点':'日次自動復元点',{scope:'active'});
-      periodicAt=Date.now();bodyRecovery.seed(snapshot);periodicWarning='';
-    }catch(e){periodicWarning='自動復元点の作成に失敗しました: '+String(e?.message||e);}
+      if(epoch===recoveryEpoch){periodicAt=Date.now();bodyRecovery.seed(snapshot);periodicWarning='';}
+    }catch(e){if(epoch===recoveryEpoch)periodicWarning='自動復元点の作成に失敗しました: '+String(e?.message||e);}
   })();
   try{await periodicTask;}finally{periodicTask=null;}
 }
@@ -205,7 +205,7 @@ function showMain(){
   window.scrollTo(0,0);
 }
 function showSettings(){
-  if(!ready||busy||branchBusy)return;
+  if(!ready||busy||branchBusy||bodyBackupBusy||!el('screen-settings').hidden)return;
   el('screen-main').hidden=true;el('screen-settings').hidden=false;
   el('nav-main').classList.remove('primary');el('nav-settings').classList.add('primary');
   rebuildSettings();lockUI();window.scrollTo(0,0);
@@ -320,8 +320,7 @@ function rebuildSettings(){
     pendingBodyEdit=text;
     bodyEditTimer=setTimeout(commitPendingBodyEdit,400);
   };
-  edit.oninput=event=>{if(!event.isComposing)queueBodyEdit();};
-  edit.oncompositionend=queueBodyEdit;
+  edit.oninput=queueBodyEdit;
   edit.onblur=()=>{if(!bodyBackupBusy){queueBodyEdit();if(!bodyBackupBusy)commitPendingBodyEdit();}};
   updatePromptMeta();
 }
@@ -840,6 +839,11 @@ function setup(){
     else if(document.visibilityState==='visible'&&ready&&!busy&&!branchBusy&&!bodyBackupBusy)void ensurePeriodicCheckpoint().then(()=>safety());
   });
   window.addEventListener('pagehide',()=>{if(ready){state.pendingCandidate=candidate;void saveNow();}});
+  // No background execution is assumed; check daily while the app is open.
+  setInterval(()=>{
+    if(ready&&document.visibilityState==='visible'&&!busy&&!branchBusy&&!bodyBackupBusy)
+      void ensurePeriodicCheckpoint().then(()=>safety());
+  },60000);
   el('modal').hidden=true;paint();
 }
 async function init(){
