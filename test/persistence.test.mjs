@@ -686,3 +686,31 @@ test('failed corrupt protection does not authorize replacing the old ACTIVE',asy
   await assert.rejects(st.save(freshState()));
   assert.equal(sql.map.get('active'),original);
 });
+
+
+test('whole-work checkpoint archive pool deduplicates unchanged branches and survives rotation',async()=>{
+  for(const sql of [fakeSql(),null]){
+    const idb=fakeIdb(),host=sql?{db:sql}:{};
+    const st=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+    const s=freshState();s.body='本編';s.branches=[{id:'fork',name:'分岐',body:'枝'.repeat(120000)}];
+    await st.save(s);
+    const current=st.compactState(cleanState(s));
+    await st.checkpoint(current,'reset');
+    const map=sql?sql.map:idb.data;
+    const poolKeys=()=>[...map.keys()].filter(k=>k.startsWith('checkpoint-archive/')).sort();
+    const first=poolKeys();assert.ok(first.length>0);
+    await st.checkpoint({...current,body:'変更'},'import');
+    assert.deepEqual(poolKeys(),first);
+    for(let i=0;i<10;i++)await st.checkpoint(current,'通常'+i);
+    const list=await st.checkpointList();
+    const selected=list.find(x=>x.reason==='reset');
+    assert.ok(selected);assert.ok(selected.size<10000);
+    const restored=await st.loadCheckpoint(selected.id);
+    assert.equal(restored.body,'本編');
+    assert.equal(restored.branches[0].body,'枝'.repeat(120000));
+    // Replace the entire work and reopen; the checkpoint has its own retained archive.
+    await st.save({...freshState(),body:'新作品'});
+    const reopened=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
+    assert.equal((await reopened.loadCheckpoint(selected.id)).branches[0].body,'枝'.repeat(120000));
+  }
+});
