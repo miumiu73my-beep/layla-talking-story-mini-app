@@ -547,7 +547,10 @@ async function restoreCheckpoint(){
     const selected=await store.loadCheckpoint(versions[n].id,state);
     // A full restore replaces all archives; preserve the whole current work first.
     const scope=versions[n].scope;
-    if(!await beforeDestructive('選択した復元点を開く',{scope:scope==='active'||scope==='branch'?'active':'full'}))return;
+    // Cross-branch restoration may replace an archived version of that branch.
+    // Keep the complete old work in that case, too.
+    const crossBranch=scope==='active'&&selected.activeBranch.id!==state.activeBranch.id;
+    if(!await beforeDestructive('選択した復元点を開く',{scope:!crossBranch&&(scope==='active'||scope==='branch')?'active':'full'}))return;
     state=selected;candidate=state.pendingCandidate;fullBody=false;
     editRev++;paint();rebuildSettings();
     if(await saveNow(true))status('第'+(n+1)+'候補の復元点へ戻しました。');
