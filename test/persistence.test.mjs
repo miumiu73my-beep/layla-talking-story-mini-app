@@ -327,3 +327,56 @@ test('legacy IndexedDB checkpoints remain selectable after new metadata index ex
   const restored=await st.loadCheckpoint('legacy-idb/0');
   assert.equal(restored.body,original.body);
 });
+
+test('checkpoint shared-prefix encoding restores every branch without full duplicate bodies',async()=>{
+  const sql=fakeSql(),st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  const s=freshState();const base='共通本文'.repeat(30000);s.body=base+'本編';
+  s.branches=[{id:'fork',name:'分岐',body:base+'別の展開'}];
+  const expected=cleanState(s);
+  await st.checkpoint(s,'共有本文の復元点');
+  const selected=(await st.checkpointList()).find(x=>x.reason==='共有本文の復元点');
+  const meta=JSON.parse(sql.map.get(selected.id));
+  assert.equal(meta.format,'shared-prefix-v2');
+  assert.ok(meta.size<JSON.stringify(expected).length*0.75);
+  assert.deepEqual(await st.loadCheckpoint(selected.id),expected);
+});
+test('concurrent checkpoints never delete each others in-progress chunks',async()=>{
+  const sql=fakeSql(),st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  const a=freshState(),b=freshState();a.body='あ'.repeat(90000);b.body='い'.repeat(90000);
+  await Promise.all([st.checkpoint(a,'並列A'),st.checkpoint(b,'並列B')]);
+  const list=await st.checkpointList();
+  assert.equal((await st.loadCheckpoint(list.find(x=>x.reason==='並列A').id)).body,a.body);
+  assert.equal((await st.loadCheckpoint(list.find(x=>x.reason==='並列B').id)).body,b.body);
+});
+test('partial checkpoint write is reclaimed, unreadable parent chunks are preserved',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),st=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  sql.map.set('checkpoint/broken','not JSON');
+  sql.map.set('checkpoint/broken/part/0','救出できる本文');
+  const original=sql.executeSql.bind(sql);let failed=false;
+  sql.executeSql=async(q,args=[])=>{
+    if(!failed&&q.startsWith('INSERT')&&String(args[0]).endsWith('/part/1')){
+      failed=true;throw Error('interrupted checkpoint');
+    }
+    return original(q,args);
+  };
+  const s=freshState();s.body='あ'.repeat(120000);
+  await st.checkpoint(s,'退避');
+  assert.equal(failed,true);
+  assert.deepEqual([...sql.map.keys()].filter(k=>k.includes('/part/')),['checkpoint/broken/part/0']);
+  await st.checkpoint(s,'正常');
+  assert.equal(sql.map.get('checkpoint/broken/part/0'),'救出できる本文');
+  const list=await st.checkpointList();
+  assert.equal((await st.loadCheckpoint(list.find(x=>x.reason==='退避').id)).body,s.body);
+});
+test('checkpoint rotation uses dates rather than mixed legacy key names',async()=>{
+  const sql=fakeSql(),st=await openStore({db:sql},()=>{},{idbFactory:fakeIdb().factory});
+  const s=freshState();s.body='保存内容';
+  for(let i=0;i<8;i++){
+    const key=i===0?'checkpoint/zzzz':'checkpoint/17'+i;
+    sql.map.set(key,JSON.stringify({at:1000+i,title:s.title,chars:s.body.length,data:JSON.stringify(s)}));
+  }
+  await st.checkpoint(s,'最新');
+  assert.equal(sql.map.has('checkpoint/zzzz'),false);
+  assert.equal(sql.map.has('checkpoint/177'),true);
+  assert.equal((await st.checkpointList()).length,8);
+});
