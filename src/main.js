@@ -61,7 +61,7 @@ function lockUI(){
   if(el('raw-rows'))el('raw-rows').disabled=!ready||busy||branchBusy;
   if(el('rebuild-idb'))el('rebuild-idb').disabled=!ready||busy||branchBusy||!store?.canRebuildFromIdb;
   if(el('reset-history'))el('reset-history').disabled=disabled;
-  for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy||bodyBackupBusy;
+  for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy||(bodyBackupBusy&&input.id!=='edit-body');
   el('stop').disabled=!busy;
   for(const id of ['accept','retry','discard','candidate-edit'])if(el(id))
     el(id).disabled=disabled||!candidate||(id==='accept'&&!candidate?.text?.trim())||(id==='retry'&&cooling);
@@ -87,7 +87,7 @@ function persist(delay=600){
   status('編集中… 自動保存待機');
 }
 async function saveNow(force=false){
-  if(bodyEditBackup)await bodyEditBackup;
+  while(bodyEditBackup)await bodyEditBackup;
   commitPendingBodyEdit();
   clearTimeout(saveTimer);saveTimer=null;
   if(!store||saveBlocked){safety();return false;}
@@ -302,9 +302,12 @@ function rebuildSettings(){
   deletionWarning='';historyWarning='';renderBodyEditWarnings();
   const count=el('edit-count');count.textContent=state.body.length+' / '+BODY_LIMIT+'文字';
   const queueBodyEdit=()=>{
-    if(bodyBackupBusy||saveBlocked)return;
+    if(saveBlocked)return;
     const text=edit.value;
     count.textContent=text.length+' / '+BODY_LIMIT+'文字';
+    // Keep the focused textarea editable; its value buffers keystrokes while
+    // the previous edit is being protected. Never apply unprotected changes.
+    if(bodyBackupBusy)return;
     clearTimeout(bodyEditTimer);bodyEditTimer=null;
     if(text===state.body){pendingBodyEdit=null;return;}
     // Retain the original baseline across small deletions and autosaves.
@@ -314,20 +317,32 @@ function rebuildSettings(){
       pendingBodyEdit=null;
       bodyBackupBusy=true;lockUI();
       bodyEditBackup=(async()=>{
+        let succeeded=false;
         try{
           await store.checkpoint(plan.snapshot,plan.reason,{scope:'active'});
-          bodyRecovery.completed(plan);
           if(plan.large)deletionWarning='本文を累積で大幅に削除しました。削除前の本文は重要復元点に保存されています。';
           pendingBodyEdit=text;
           renderBodyEditWarnings();
           commitPendingBodyEdit();
+          // Large deletions establish a new baseline only after the protected
+          // edit has been applied, including the empty-body case.
+          bodyRecovery.completed(plan,state);
+          succeeded=true;
         }catch(e){
           bodyRecovery.failed(plan);
-          edit.value=state.body;pendingBodyEdit=null;
-          count.textContent=state.body.length+' / '+BODY_LIMIT+'文字';
-          status('編集前の復元点を作れなかったため変更を取り消しました: '+e.message,true);
+          // Keep typed text in the editor for a retry/copy, but not in the
+          // persisted manuscript. Do not silently apply an unprotected edit.
+          pendingBodyEdit=null;
+          status('編集前の復元点を作れませんでした。本文は未反映です。入力を保持しました。再編集して再試行してください: '+e.message,true);
         }finally{
           bodyBackupBusy=false;bodyEditBackup=null;lockUI();
+          count.textContent=edit.value.length+' / '+BODY_LIMIT+'文字';
+          // Re-evaluate buffered changes against the new protected baseline.
+          // A second large deletion must get its own checkpoint.
+          if(succeeded&&edit.value!==state.body){
+            queueBodyEdit();
+            if(!bodyBackupBusy&&document.activeElement!==edit)commitPendingBodyEdit();
+          }
         }
       })();
       return;
@@ -545,7 +560,7 @@ function presentExport(name,content,mime,result,warning=''){
 async function exportAs(ext){
   if(!ready)return;
   try{
-    if(bodyEditBackup)await bodyEditBackup;
+    while(bodyEditBackup)await bodyEditBackup;
     commitPendingBodyEdit();
     const light=ext==='compact-json';
     const snapshot=(light||ext==='json')&&store?await store.materialize(cleanState(state)):state;
