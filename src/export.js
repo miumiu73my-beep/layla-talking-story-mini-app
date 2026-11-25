@@ -27,17 +27,39 @@ export function browserDownload(name,blob){
 // Layla SDK's native saveFile expects *raw base64*, not a Blob or data URL.
 // Encode in blocks divisible by three to avoid corrupting base64 padding.
 export function utf8ToBase64(text){
-  const bytes=new TextEncoder().encode(text),block=24576,out=[];
-  for(let i=0;i<bytes.length;i+=block){
-    const part=bytes.subarray(i,Math.min(i+block,bytes.length));
+  const encoder=new TextEncoder(),block=8192,out=[];
+  let carry=new Uint8Array(0);
+  for(let i=0;i<text.length;){
+    let end=Math.min(i+block,text.length);
+    if(end<text.length&&/[\uD800-\uDBFF]/.test(text[end-1]))end--;
+    const encoded=encoder.encode(text.slice(i,end));i=end;
+    const bytes=new Uint8Array(carry.length+encoded.length);bytes.set(carry);bytes.set(encoded,carry.length);
+    const n=bytes.length-bytes.length%3;
+    const part=bytes.subarray(0,n);carry=bytes.slice(n);
     const chars=new Array(part.length);
     for(let j=0;j<part.length;j++)chars[j]=String.fromCharCode(part[j]);
     out.push(btoa(chars.join('')));
   }
+  if(carry.length)out.push(btoa(String.fromCharCode(...carry)));
   return out.join('');
 }
+// Count UTF-8 without allocating a second full-size byte buffer.
+export function utf8ByteLength(text){
+  let n=0;
+  for(let i=0;i<text.length;i++){
+    const c=text.charCodeAt(i);
+    if(c<128)n++;else if(c<2048)n+=2;
+    else if(c>=0xd800&&c<=0xdbff&&text.charCodeAt(i+1)>=0xdc00&&text.charCodeAt(i+1)<=0xdfff){n+=4;i++;}
+    else n+=3;
+  }
+  return n;
+}
+export const MANUAL_EXPORT_LIMIT=250000;
+export function manualExportPayload(text,result){
+  return (result.kind==='manual'||result.kind==='unconfirmed')&&text.length<=MANUAL_EXPORT_LIMIT?text:null;
+}
 export async function writeFile(host,name,text,mime){
-  const blob=new Blob([text],{type:mime+';charset=utf-8'});
+  const fallback=()=>text.length<=MANUAL_EXPORT_LIMIT?{text,name,mime}:{name,mime};
   let reason='';
   if(typeof host?.utils?.saveFile==='function'){
     try{
@@ -48,7 +70,7 @@ export async function writeFile(host,name,text,mime){
         return {kind:'share',message:'Layla側で保存・共有を開始しました。「ファイル」に保存されたことを確認してください。'};
       if(r===undefined||r===null)
         // The first share sheet may already have opened. Offer manual rescue instead of opening a second one.
-        return {kind:'unconfirmed',message:'Laylaから保存結果が返っていません。実際にファイルがあるか確認してください。保存されていなければ手動で救出できます。',text,name,mime};
+        return {kind:'unconfirmed',message:'Laylaから保存結果が返っていません。実際にファイルがあるか確認してください。保存されていなければ手動で救出できます。',...fallback()};
       reason=String(r?.message||'Layla保存APIが成功を返しませんでした。');
     }catch(err){
       if(err?.name==='AbortError'||/cancel|キャンセル/i.test(String(err?.message||'')))
@@ -57,10 +79,12 @@ export async function writeFile(host,name,text,mime){
     }
   }
   try{
-    const file=new File([blob],name,{type:mime+';charset=utf-8'});
-    if(typeof navigator!=='undefined'&&navigator.canShare?.({files:[file]})&&typeof navigator.share==='function'){
+    if(typeof navigator!=='undefined'&&typeof navigator.canShare==='function'&&typeof navigator.share==='function'){
+      const file=new File([text],name,{type:mime+';charset=utf-8'});
+      if(navigator.canShare({files:[file]})){
       await navigator.share({files:[file],title:name});
       return {kind:'share',message:'共有操作を開始しました。実際のファイル保存を確認してください。'};
+      }
     }
   }catch(err){
     if(err?.name==='AbortError')return {kind:'cancelled',message:'共有をキャンセルしました。'};
@@ -70,5 +94,5 @@ export async function writeFile(host,name,text,mime){
   // a native WKWebView <a download> may silently do nothing.
   return {kind:'manual',
     message:'自動書き出しできませんでした'+(reason?'（'+reason+'）':'')+'。内容をコピーするか、ブラウザ用ダウンロードを選んでください。',
-    text,name,mime};
+    ...fallback()};
 }
