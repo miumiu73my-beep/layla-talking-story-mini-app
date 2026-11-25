@@ -9,7 +9,8 @@ const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getE
 const node=(tag,cls,value)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=value;return e;};
 let state=freshState(),store=null,ready=false,saveBlocked=true,busy=false,stream=null,activeId=0;
 let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning='',notice='',lastAcceptedMessage='';
-let lastExport=null,pendingBodyEdit=null,bodyEditTimer=null;
+let lastExport=null,pendingBodyEdit=null,bodyEditTimer=null,bodyEditBackup=null;
+let deletionWarning='',historyWarning='';
 let historyOffset=0,branchBusy=false,bodyBackupBusy=false,editRev=0,savedRev=0,stopUntil=0,retryFallback=null;
 let activeGenerationFinished=null,stopUnconfirmed=false;
 const HISTORY_PAGE_SIZE=30;
@@ -38,7 +39,7 @@ function lockUI(){
   if(el('recover-now')){el('recover-now').hidden=!store?.recoveryRequired;el('recover-now').disabled=!ready||busy;}
   if(el('raw-backup'))el('raw-backup').disabled=!ready;
   if(el('reset-history'))el('reset-history').disabled=disabled;
-  for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy;
+  for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy||bodyBackupBusy;
   el('stop').disabled=!busy;
   for(const id of ['accept','retry','discard','candidate-edit'])if(el(id))
     el(id).disabled=disabled||!candidate||(id==='accept'&&!candidate?.text?.trim())||(id==='retry'&&cooling);
@@ -62,6 +63,7 @@ function persist(delay=600){
   status('編集中… 自動保存待機');
 }
 async function saveNow(force=false){
+  if(bodyEditBackup)await bodyEditBackup;
   commitPendingBodyEdit();
   clearTimeout(saveTimer);saveTimer=null;
   if(!store||saveBlocked){safety();return false;}
@@ -262,52 +264,61 @@ function rebuildSettings(){
   pref.append(detail);
   const edit=el('edit-body');edit.value=state.body;edit.maxLength=BODY_LIMIT;
   pendingBodyEdit=null;clearTimeout(bodyEditTimer);bodyEditTimer=null;
-  el('edit-warning').hidden=true;
-  el('edit-warning').textContent='本文を大幅変更しました。元の本文は復元点に保存されています。';
+  deletionWarning='';historyWarning='';renderBodyEditWarnings();
   const count=el('edit-count');count.textContent=state.body.length+' / '+BODY_LIMIT+'文字';
-  let preDeletePromise=null,lastProtectedBody=null,inputSerial=0;
-  edit.oninput=async()=>{
-    const serial=++inputSerial;
+  let composing=false;
+  const queueBodyEdit=()=>{
+    if(bodyBackupBusy||saveBlocked)return;
     const text=edit.value;
-    const bigDeletion=text.length<state.body.length*0.5&&state.body.length>500;
-    if(bigDeletion){
-      el('edit-warning').hidden=false;
-      if(lastProtectedBody!==state.body&&!preDeletePromise){
-        bodyBackupBusy=true;lockUI();
-        preDeletePromise=store.checkpoint(state,'本文を大きく削除する前');
-      }
-      if(preDeletePromise){
+    count.textContent=text.length+' / '+BODY_LIMIT+'文字';
+    clearTimeout(bodyEditTimer);bodyEditTimer=null;
+    // Do not let an older debounce fire while the pre-deletion snapshot is written.
+    if(text.length<state.body.length*0.5&&state.body.length>500){
+      pendingBodyEdit=null;
+      bodyBackupBusy=true;lockUI();
+      bodyEditBackup=(async()=>{
         try{
-          await preDeletePromise;lastProtectedBody=state.body;
+          await store.checkpoint(state,'本文を大きく削除する前');
+          deletionWarning='本文を大幅に削除しました。削除前の本文は復元点に保存されています。';
+          pendingBodyEdit=text;
+          renderBodyEditWarnings();
+          commitPendingBodyEdit();
         }catch(e){
           edit.value=state.body;pendingBodyEdit=null;
+          count.textContent=state.body.length+' / '+BODY_LIMIT+'文字';
           status('削除前の復元点を作れなかったため変更を取り消しました: '+e.message,true);
-          bodyBackupBusy=false;preDeletePromise=null;lockUI();return;
+        }finally{
+          bodyBackupBusy=false;bodyEditBackup=null;lockUI();
         }
-        bodyBackupBusy=false;preDeletePromise=null;lockUI();
-      }
+      })();
+      return;
     }
-    if(serial!==inputSerial)return; // an older async input must not overwrite a newer keystroke
-    pendingBodyEdit=edit.value;
-    count.textContent=pendingBodyEdit.length+' / '+BODY_LIMIT+'文字';
-    clearTimeout(bodyEditTimer);
-    bodyEditTimer=setTimeout(commitPendingBodyEdit,330);
+    pendingBodyEdit=text;
+    if(!composing)bodyEditTimer=setTimeout(commitPendingBodyEdit,330);
   };
-  edit.onblur=()=>{if(!bodyBackupBusy)commitPendingBodyEdit();};
+  edit.oncompositionstart=()=>{composing=true;clearTimeout(bodyEditTimer);bodyEditTimer=null;};
+  edit.oncompositionend=()=>{composing=false;queueBodyEdit();};
+  edit.oninput=()=>{if(composing){count.textContent=edit.value.length+' / '+BODY_LIMIT+'文字';return;}queueBodyEdit();};
+  edit.onblur=()=>{if(!bodyBackupBusy){composing=false;queueBodyEdit();if(!bodyBackupBusy)commitPendingBodyEdit();}};
   updatePromptMeta();
+}
+function renderBodyEditWarnings(){
+  const warning=el('edit-warning');
+  if(warning){warning.textContent=[deletionWarning,historyWarning].filter(Boolean).join('／');warning.hidden=!deletionWarning&&!historyWarning;}
 }
 function commitPendingBodyEdit(){
   clearTimeout(bodyEditTimer);bodyEditTimer=null;
   if(pendingBodyEdit===null)return;
   const text=pendingBodyEdit;pendingBodyEdit=null;
+  if(text===state.body)return;
   try{
     state=reconcileBodyEdit(state,text);
-    // A successful history reconciliation must not hide a deletion warning.
+    historyWarning='';
   }catch(e){
     state.body=text;state.undo=null;
-    el('edit-warning').hidden=false;
-    el('edit-warning').textContent='本文は保持しましたが履歴の再設定が必要です。 '+e.message;
+    historyWarning='本文は保持しましたが履歴の再設定が必要です。 '+e.message;
   }
+  renderBodyEditWarnings();
   if(el('edit-count'))el('edit-count').textContent=state.body.length+' / '+BODY_LIMIT+'文字';
   persist();
 }
@@ -452,6 +463,8 @@ function stopGeneration(){
 async function exportAs(ext){
   if(!ready)return;
   try{
+    if(bodyEditBackup)await bodyEditBackup;
+    commitPendingBodyEdit();
     const light=ext==='compact-json';
     const content=light?compactBackup(state):ext==='json'?JSON.stringify(state):readableText(state,ext);
     const tooLarge=(ext==='json'||light)&&new TextEncoder().encode(content).length>TRANSFER_MAX_BYTES;
@@ -516,7 +529,7 @@ async function restoreCheckpoint(){
       new Date(v.at).toLocaleString('ja-JP')+'／'+(v.reason||'保存点')+'／'+(v.chars??'不明')+'文字']);
     choices.push(['cancel','キャンセル']);
     const selection=await modal('復元する時点を選んでください。復元前の現在の状態も保存点に退避します。',choices);
-    if(selection==='cancel')return;
+    if(typeof selection!=='string'||!/^\d+$/.test(selection))return;
     const n=Number(selection);
     if(!Number.isSafeInteger(n)||n<0||n>=versions.length)return;
     const selected=await store.loadCheckpoint(versions[n].id);
@@ -601,6 +614,7 @@ function textModal(question,initial,{max=15000,multiline=true,options=[['save','
 async function applyStoryChange(transform,note,{destructive=false}={}){
   if(!ready||busy||branchBusy||bodyBackupBusy||saveBlocked)return false;
   branchBusy=true;lockUI();
+  commitPendingBodyEdit();
   const original=state,oldCandidate=candidate;
   try{
     if(!await beforeDestructive('分岐操作',{checkpoint:destructive}))return false;
