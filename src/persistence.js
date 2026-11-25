@@ -77,7 +77,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   let sqlInitialized=false,sqlRetryBlocked=false;
   const branchCache=new WeakMap();
   let rootCache=null,idbRootCache=null,idbLatest=null;
-  const refData=new WeakMap(),storedRefs=new WeakMap();
+  const refData=new WeakMap(),storedRefs=new WeakMap(),archiveIssues=new WeakMap(),unknownSummaries=new WeakSet();
   // The app opts into lazy storage; legacy callers still receive full snapshots.
   const lazy=lazyArchives&&validator===cleanState;
   const meta=b=>({id:b.id,name:b.name,createdAt:b.createdAt,parentId:b.parentId,forkTurn:b.forkTurn,
@@ -93,13 +93,73 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     return overlay||{};
   }
   const sameCore=(cache,core,signature)=>cache&&cache.body===core.body&&cache.signature===signature;
-  function reference(b,source,entry){
+  function reference(b,source,entry,summary=null){
     let ref=isArchiveReference(b)?b:storedRefs.get(b);
-    if(!ref){ref=archiveReference(meta(b));storedRefs.set(b,ref);refData.set(ref,{});}
+    if(!ref){ref=archiveReference(summary||meta(b));storedRefs.set(b,ref);refData.set(ref,{});}
     const data=refData.get(ref);
     if(!data)throw Error('別の保存先の分岐参照です。');
     data[source]=entry;
     return ref;
+  }
+  const summaryOf=b=>isArchiveReference(b)?{id:b.id,name:b.name,createdAt:b.createdAt,parentId:b.parentId,forkTurn:b.forkTurn,chars:b.chars,turnCount:b.turnCount}:meta(b);
+  function summaryEntry(entry,b){
+    const summary=summaryOf(b);
+    return {...entry,summary,summaryHash:checksum(JSON.stringify(summary))};
+  }
+  function checkedSummary(entry){
+    const m=entry.summary;
+    if(!m||m.id!==entry.id||typeof m.name!=='string'||!m.name.trim()||m.name.length>90||
+      typeof m.createdAt!=='string'||!(m.parentId===null||typeof m.parentId==='string')||
+      !(m.forkTurn===null||Number.isSafeInteger(m.forkTurn))||
+      !Number.isSafeInteger(m.chars)||m.chars<0||!Number.isSafeInteger(m.turnCount)||m.turnCount<0||
+      checksum(JSON.stringify(m))!==entry.summaryHash)throw Error('分岐の要約情報が不正です。');
+    return m;
+  }
+  function entryReference(entry,source,summary,error=null,unknown=false){
+    const ref=archiveReference(summary);
+    refData.set(ref,{[source]:entry});
+    if(error)archiveIssues.set(ref,String(error.message||error));
+    if(unknown)unknownSummaries.add(ref);
+    return ref;
+  }
+  async function decodeArchiveEntry(entry,source,refs,knownKeys=null){
+    if(!entry||typeof entry.id!=='string'||!/^[A-Za-z0-9_-]{1,100}$/.test(entry.id))
+      throw Error('分岐IDが不正です。');
+    let summary=null;
+    try{
+      if(refs&&entry.summary!==undefined){
+        summary=checkedSummary(entry);
+        if(source==='sql'&&(!Array.isArray(entry.parts)||!entry.parts.length||entry.parts.length>1500||
+          entry.parts.some(k=>typeof k!=='string'||(knownKeys&&!knownKeys.has(k)))))
+          throw Error('分岐チャンクが欠落しています。');
+        if(source==='idb'&&typeof entry.key!=='string')throw Error('分岐の保存キーが不正です。');
+        return entryReference(entry,source,summary);
+      }
+      // Legacy manifests lack summaries: read once, then upgrade on next save.
+      const full=await readEntry(entry,source);
+      return refs?reference(full,source,entry):full;
+    }catch(e){
+      if(!refs)throw e;
+      return entryReference(entry,source,summary||{id:entry.id,name:'読込不能の分岐 ('+entry.id+')',
+        createdAt:'',parentId:null,forkTurn:null,chars:0,turnCount:0},e,!summary);
+    }
+  }
+  async function readEntry(entry,source){
+    const raw=source==='idb'?await idb.get(entry.key):await readParts(entry.parts,entry.hash,entry.size);
+    return validatedArchive(checkedJson(raw,entry),entry.id);
+  }
+  async function verifySource(state,source){
+    for(const b of state.branches){
+      if(!isArchiveReference(b))continue;
+      const entry=refData.get(b)?.[source];
+      if(!entry)throw Error('分岐の保存参照がありません。');
+      const full=await readEntry(entry,source);
+      if(unknownSummaries.has(b)||JSON.stringify(meta(full))!==JSON.stringify(summaryOf(b)))
+        throw Error('分岐の要約情報が一致しません。');
+    }
+  }
+  function branchProblem(state){
+    return state?.branches?.find(b=>archiveIssues.has(b));
   }
   function compactState(state){
     if(!lazy)return state;
@@ -124,14 +184,19 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     for(const type of ['idb','sql']){
       const entry=source[type];if(!entry)continue;
       try{
-        const raw=type==='idb'?await idb.get(entry.key):await readParts(entry.parts,entry.hash,entry.size);
-        const full=validatedArchive(checkedJson(raw,entry),b.id);
-        if(JSON.stringify(meta(full))!==JSON.stringify({...b,kind:undefined}))
+        const full=await readEntry(entry,type);
+        if(!unknownSummaries.has(b)&&JSON.stringify(meta(full))!==JSON.stringify(summaryOf(b)))
           throw Error('分岐の要約情報が一致しません。');
         return full;
       }catch(e){failure=e;}
     }
-    throw Error('分岐「'+b.name+'」を読み込めません: '+(failure?.message||'保存先なし'));
+    const message='分岐「'+b.name+'」を読み込めません: '+(failure?.message||'保存先なし');
+    archiveIssues.set(b,message);
+    // Stop all mutation/GC on discovery; the root and original manifest survive.
+    readOnly=true;
+    if(source.sql){sqliteCorrupt=true;sqlProblem=message;rawEvidence=rawEvidence||JSON.stringify(manifest);}
+    notify(message+'。本編は表示を維持し、上書きを停止しました。',true);
+    throw Error(message);
   }
   async function materialize(state,onlyId=null){
     const branches=[];
@@ -163,8 +228,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     if(!Array.isArray(record.archives)||record.archives.length>30)throw Error('IndexedDB分岐目録が不正です。');
     const branches=[];
     for(const entry of record.archives){
-      const full=validatedArchive(checkedJson(await idb.get(entry.key),entry),entry.id);
-      branches.push(lazy?reference(full,'idb',entry):full);
+      branches.push(await decodeArchiveEntry(entry,'idb',lazy));
     }
     if(lazy)idbRootCache={entry:record.core,body:core.body,signature:coreSignature(core)};
     return {...core,...checkOverlay(record.state,record.overlayHash),branches};
@@ -197,7 +261,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
           entry={id:b.id,key,hash:checksum(raw),size:raw.length};
           created.push(key);await idb.put(key,raw);
         }
-        archives.push(entry);
+        archives.push(entry.summary?entry:summaryEntry(entry,b));
       }
       const record={...header,format:2,state:overlay,overlayHash:checksum(JSON.stringify(overlay)),core:coreEntry,archives,previousKeys,generation};
       // Manifest last: interrupted writes cannot replace the last valid snapshot.
@@ -250,6 +314,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         const loaded=await decodeGeneration(manifest,lazy);
         sqlSnapshot={state:loaded,validated:validate(loaded,validator),rev:Number(manifest.rev)||0};
         seq=Math.max(seq,sqlSnapshot.rev);
+        const damaged=branchProblem(sqlSnapshot.validated.value);
+        if(damaged)throw Error('分岐「'+damaged.name+'」の保存部品が不正です。本編を読取専用で救出しました。');
         if(sqlSnapshot.validated.error)throw Error('SQLite保存内容の検証失敗: '+sqlSnapshot.validated.error.message+
           (sqlSnapshot.validated.rescued?'。正常な本文と分岐を読取専用で救出しました。':'') );
         rawEvidence=null;
@@ -270,7 +336,15 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   else if(fallback?.state){
     idbValid=validate(fallback.state,validator);
     if(idbValid.error)notify('IndexedDBの退避データが不正です。SQLiteへ自動復旧しません: '+idbValid.error.message,true);
-    else seq=Math.max(seq,Number(fallback.rev)||0);
+    else {
+      // Pending mirrors may replace SQLite, and recovery mirrors may rebuild it.
+      // Validate their own bytes before granting that authority, never via SQL fallback.
+      try{
+        if(branchProblem(idbValid.value))throw Error('IndexedDB分岐の保存部品が不正です。');
+        if(lazy&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))await verifySource(idbValid.value,'idb');
+        seq=Math.max(seq,Number(fallback.rev)||0);
+      }catch(e){idbValid.error=e;notify('IndexedDBの分岐を検証できません: '+e.message,true);}
+    }
   }
   const cleanIdb=Boolean(idbValid?.value&&!idbValid.error);
   if(cleanIdb&&!sqlSnapshot?.validated.error)linkMirrors(sqlSnapshot?.validated.value,idbValid.value);
@@ -296,7 +370,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }else if(idbValid?.error&&!sqlSnapshot){
     readOnly=true;
   }
-  if(sqliteCorrupt)readOnly=true;
+  if(sqliteCorrupt||(!sqlSnapshot?.validated.value&&idbValid?.error))readOnly=true;
   if(!sqlAvailable&&!idb)mode='保存不可';
   else if(sqlAvailable)mode='SQLite';
   else mode=idb?'IndexedDB（退避）':'保存不可';
@@ -328,14 +402,12 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     // Old v1 manifest contains ALL branches inside root; new v1 stores immutable
     // archived branch blobs independently to avoid rewriting them on every edit.
     if(Array.isArray(m.branchParts)){
+      if(m.branchParts.length>MAX_ARCHIVED_BRANCHES)throw Error('分岐目録が不正です。');
       const branches=[];
-      for(const b of m.branchParts){
-        const data=await readParts(b.parts,b.hash,b.size);
-        const branch=JSON.parse(data);
-        if(branch.id!==b.id)throw Error('分岐IDが一致しません。');
-        // Verify one archive at a time on startup; keep only its summary.
-        branches.push(refs?reference(validatedArchive(branch,b.id),'sql',b):branch);
-      }
+      // One key-only scan detects missing chunks without loading any branch body.
+      const knownKeys=refs&&m.branchParts.some(b=>b?.summary!==undefined)?
+        new Set(sqlRows(await run('SELECT k FROM '+TABLE)).map(row=>row.k)):null;
+      for(const b of m.branchParts)branches.push(await decodeArchiveEntry(b,'sql',refs,knownKeys));
       root.branches=branches;
     }
     return root;
@@ -366,18 +438,18 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     for(const b of state.branches||[]){
       const old=previousBranches.get(b.id);
       const ref=isArchiveReference(b)?b:storedRefs.get(b);
-      if(old&&(branchCache.get(b)===old||refData.get(ref)?.sql===old)){branchParts.push(old);continue;}
+      if(old&&(branchCache.get(b)===old||refData.get(ref)?.sql===old)){branchParts.push(old.summary?old:summaryEntry(old,b));continue;}
       const full=lazy?await readArchive(b):b;
       const json=JSON.stringify(full),hash=checksum(json);
       if(old&&old.hash===hash&&old.size===json.length){
-        branchParts.push(old);if(validator===cleanState)branchCache.set(b,old);continue;
+        const entry=old.summary?old:summaryEntry(old,full);branchParts.push(entry);if(validator===cleanState)branchCache.set(b,entry);continue;
       }
       const parts=splitChunks(json),bkeys=[];
       for(let i=0;i<parts.length;i++){
         const key=generation+'/branch/'+b.id+'/'+i;bkeys.push(key);
         await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[key,parts[i]]);
       }
-      const entry={id:b.id,parts:bkeys,hash,size:json.length};
+      const entry=summaryEntry({id:b.id,parts:bkeys,hash,size:json.length},full);
       branchParts.push(entry);if(validator===cleanState)branchCache.set(b,entry);
     }
     const previous=manifest?{
@@ -850,6 +922,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   async function rebuildFromIdb(){
     if(!cleanIdb||recoveryRequired||!readOnly||(!sqliteCorrupt&&!rebuildPending))throw Error('検証済みIndexedDBからの再作成は利用できません。');
     const selected=idbValid.value;
+    if(lazy)await verifySource(selected,'idb');
     rebuildPending=true;
     try{
       await allowImportRecovery();
@@ -946,7 +1019,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   return {
     initial:preferred,sqlInitial:sqlSnapshot?.validated.value||null,
-    get readOnly(){return readOnly;},corrupt:sqliteCorrupt,
+    get readOnly(){return readOnly;},get corrupt(){return sqliteCorrupt;},
+    archiveIssue:b=>archiveIssues.get(b)||'',
     get recoveryRequired(){return recoveryRequired;},get hasStorage(){return Boolean(sqlAvailable||idb);},
     mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},
     recoveryInfo:()=>({sqlite:sqlSnapshot?.validated.value?{title:sqlSnapshot.validated.value.title,chars:sqlSnapshot.validated.value.body.length,at:sqlSnapshot.validated.value.updatedAt,turns:sqlSnapshot.validated.value.turns.length}:null,idb:idbValid?.value?{title:idbValid.value.title,chars:idbValid.value.body.length,at:idbValid.value.updatedAt,turns:idbValid.value.turns.length}:null}),
