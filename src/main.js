@@ -1,5 +1,5 @@
 import {makeRuntime} from './runtime.js';
-import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText} from './logic.js';
+import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning} from './logic.js';
 import {openStore} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery,dailyCheckpointDue} from './branches.js';
 import {writeFile,filename,browserDownload} from './export.js';
@@ -74,7 +74,8 @@ function persist(delay=600){
   state.updatedAt=new Date().toISOString();
   editRev++;
   // Full validation of all branches on every keystroke is expensive.
-  if(el('safety')&&(saveError||saveBlocked||backupSizeWarning))el('safety').hidden=false;
+  if(el('safety'))safety();
+  updateInputWarning();
   if(el('screen-settings')&&!el('screen-settings').hidden)schedulePromptMeta();
   if(saveBlocked){status('現在は未保存です。復旧確認または外部JSONバックアップが必要です。',true);return;}
   clearTimeout(saveTimer);
@@ -178,6 +179,10 @@ function showBranches(){
   }
 }
 
+function updateInputWarning(){
+  const n=el('input-warning');if(!n)return;
+  const warning=inputLimitWarning(promptDraft());n.textContent=warning;n.hidden=!warning;
+}
 function paint(){
   el('title-view').textContent=state.title||'新しい物語';
   const long=state.body.length>20000&&!fullBody;
@@ -189,7 +194,7 @@ function paint(){
   el('view-full').hidden=state.body.length<=20000;
   el('view-full').textContent=fullBody?'末尾のみ表示':'全文を表示';
   el('meta').textContent='モデルはLayla本体で選択 · '+(store?store.mode():'読み込み中');
-  el('user-input').value=state.draft;
+  el('user-input').value=state.draft;updateInputWarning();
   showHistory();showBranches();showCandidate();lockUI();safety();
 }
 function showCandidate(message){
@@ -368,10 +373,13 @@ function commitPendingBodyEdit(){
   persist();
 }
 function updatePromptMeta(){
+  const warning=inputLimitWarning(promptDraft());
+  if(warning){el('prompt-meta').textContent=warning;return;}
   const m=buildRequest(state,promptDraft()).meta;
   el('prompt-meta').textContent='送信予算の目安：約'+m.estimatedTokens+'トークン／設定コンテキスト'+m.contextTokens+
     '（出力予約'+m.outputTokens+'）。省略した項目：'+(m.omitted.length?m.omitted.map(x=>x.title).join('、'):'なし')+
     '。本文の古い部分：'+m.bodyOmitted+'文字省略。'+
+    (m.overBudget?'入力・固定指示が推定送信予算を超えています。入力を短くするかコンテキストを見直してください。':'')+
     (m.outputCapped?'指定max_tokensはコンテキスト長の半分以下へ制限します。':'')+
     (m.outputTooShort?'生成の目安に対して出力トークン数が少なめです。文が途中で切れる場合は設定を見直してください。':'')+
     '※推定値であり実モデルのトークン化とは異なります。';
@@ -418,6 +426,11 @@ async function startGeneration({retry=false,inputOverride=null}={}){
     if(choice!=='yes')return;
   }
   const requestInput=inputOverride??promptDraft();
+  const warning=inputLimitWarning(requestInput);
+  if(warning){status(warning,true);updateInputWarning();return;}
+  let request,params;
+  try{request=buildRequest(state,requestInput);params=samplerParams(state.prefs);}catch(e){status(String(e?.message||e),true);return;}
+  if(request.meta.overBudget){status('推定送信予算を超えています。入力を短くするか設定でコンテキスト長を見直してください。',true);return;}
   const old=candidate,baseFingerprint=bodyFingerprint(state.body);
   retryFallback=old?.text?.trim()?{...old}:null;
   if(old?.text?.trim())state.replyTrash=rememberReply(state.replyTrash,old.text);
@@ -429,7 +442,6 @@ async function startGeneration({retry=false,inputOverride=null}={}){
   const aborted=new Promise(resolve=>{stopResolver=resolve;});
   const canUpdate=()=>thisId===activeId&&!finished;
   try{
-    const request=buildRequest(state,requestInput),params=samplerParams(state.prefs);
     if(params.max_tokens===undefined)params.max_tokens=request.meta.outputTokens;
     else params.max_tokens=Math.min(params.max_tokens,request.meta.outputTokens);
     if(request.meta.omitted.length)status('コンテキスト予算により設定の一部を省略しています。設定で内訳を確認できます。');
@@ -451,12 +463,14 @@ async function startGeneration({retry=false,inputOverride=null}={}){
     }else if(result.kind==='error'){
       throw result.error;
     }else{
-      candidate.text=String(result.value||candidate.text||'').trim();
+      candidate.text=String(result.value?.text||candidate.text||'').trim();
+      const lengthLimited=result.value?.finishReason==='length';
       if(!candidate.text)throw Error('モデルの応答が空です。');
       const forbidden=state.avoidWords.split(/[,、，\n]/).map(t=>t.trim()).filter(Boolean);
       const hit=forbidden.find(t=>candidate.text.includes(t));
       candidate.note=hit?'禁止ワード「'+hit+'」が含まれています。内容を確認してください。':'生成が完了しました。編集・再生成・採用を選べます。';
-      if(state.prefs.autoAdopt&&!hit&&bodyFingerprint(state.body)===baseFingerprint){
+      if(lengthLimited)candidate.note='出力上限に達したため途中で切れた可能性があります。文章を確認・編集してから採用してください。'+(hit?'／禁止ワード「'+hit+'」を含みます。':'');
+      if(state.prefs.autoAdopt&&!hit&&!lengthLimited&&bodyFingerprint(state.body)===baseFingerprint){
         finished=true;busy=false;await useCandidate();return;
       }
     }
@@ -535,7 +549,7 @@ async function exportAs(ext){
     const warning=tooLarge?'このJSONは50MB超で再読み込みできません。軽量JSONや分岐整理後の再保存が必要です。':'';
     if(warning)backupSizeWarning=warning;
     safety();
-    const name=filename(state.title+(light?'_軽量分岐':''),light?'json':ext);
+    const name=filename(state.title,light?'json':ext,new Date(),light?'_軽量分岐':'');
     const mime=(ext==='json'||light)?'application/json':ext==='md'?'text/markdown':'text/plain';
     const result=await writeFile(host,name,content,mime);
     presentExport(name,content,mime,result,warning);
@@ -803,7 +817,7 @@ function setup(){
     '<div id="status" class="status" role="status" aria-live="polite">データ読み込み中…</div><button id="recover-now" hidden class="small warn">復旧元を選択</button><button id="open-export-manual" hidden class="small ghost">共有できない場合：手動で救出</button></header><div id="safety" class="safety error" role="alert">初期化中</div>'+
     '<main><div id="screen-main">'+
     '<section class="panel"><div class="split" style="justify-content:space-between"><h2>確定した物語</h2><span class="mini" id="counter"></span></div><p id="meta" class="hint"></p><div class="story" id="body-view"></div><div class="actions"><button id="view-full">全文を表示</button><button id="jump-bottom">入力欄へ移動</button><button id="undo">直前のターンを取り消す</button></div></section>'+
-    '<section class="panel" id="prompt-section"><h2>あなたの台詞・行動</h2><p class="hint">本人が話す台詞・取る行動、次の場面の希望を記入してください。</p><textarea id="user-input" rows="5" maxlength="15000" placeholder="例：『おはよう』と笑って、隣に座る。"></textarea><div class="actions"><button id="generate" class="primary">続きを生成</button><button id="stop" class="warn" disabled>生成停止</button></div><div id="candidate-box" hidden><label for="candidate-edit">未採用の候補（編集可能）</label><textarea id="candidate-edit" rows="9"></textarea><p id="candidate-status" class="hint"></p><div class="actions"><button id="accept" class="primary">この文章を採用</button><button id="retry">もう一度生成</button><button id="discard" class="warn">破棄</button></div></div></section>'+
+    '<section class="panel" id="prompt-section"><h2>あなたの台詞・行動</h2><p class="hint">本人が話す台詞・取る行動、次の場面の希望を記入してください。</p><textarea id="user-input" rows="5" maxlength="15000" placeholder="例：『おはよう』と笑って、隣に座る。"></textarea><p id="input-warning" class="safety" role="alert" hidden></p><div class="actions"><button id="generate" class="primary">続きを生成</button><button id="stop" class="warn" disabled>生成停止</button></div><div id="candidate-box" hidden><label for="candidate-edit">未採用の候補（編集可能）</label><textarea id="candidate-edit" rows="9"></textarea><p id="candidate-status" class="hint"></p><div class="actions"><button id="accept" class="primary">この文章を採用</button><button id="retry">もう一度生成</button><button id="discard" class="warn">破棄</button></div></div></section>'+
     '<section class="panel" id="history-section"><details><summary>会話履歴を編集・再生成・巻き戻す</summary><p class="hint">本文の軽い手直しでは履歴位置を自動補正します。複数ターンを一度に書き換えた場合は、復元点作成後に履歴をリセットできます。</p><button id="reset-history" class="small warn">本文を保持して履歴だけ再設定</button><div class="history-toolbar"><button id="turn-older" class="small ghost">前の30件</button><span id="turn-range" class="hint"></span><button id="turn-newer" class="small ghost">次の30件</button></div><div class="history-toolbar"><label for="turn-number">ターン番号</label><input id="turn-number" type="number" inputmode="numeric" min="1" placeholder="番号"><button id="turn-go" class="small ghost">移動</button><button id="turn-start" class="small warn">第1ターンの前に戻す</button></div><div id="turn-log" class="history-log"></div></details></section><section class="panel" id="branches-section"><h2>ストーリー分岐</h2><p class="hint">元の展開はここからいつでも開けます。分岐ごとの本文・設定・記憶・下書きを保存します。</p><strong id="branch-current"></strong><p id="branch-count" class="hint"></p><div id="branch-list"></div></section></div>'+
     '<div id="screen-settings" hidden><section class="panel"><h2>作品設定</h2><p class="hint">日本語の文章と [海:名称≡&lt;虎田海&gt;] 形式は混在できます。</p><div id="settings-fields"></div></section>'+
     '<section class="panel"><h2>生成設定</h2><div id="preference-fields"></div><p class="hint" id="prompt-meta"></p></section>'+
