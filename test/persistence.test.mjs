@@ -905,3 +905,44 @@ test('daily checkpoints keep three distinct dates and never evict manual or impo
     }
   }finally{Date.now=realNow;}
 });
+
+test('body rescue combines readable section chunks and explicitly marks missing data',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={idbFactory:idb.factory,lazyArchives:true};
+  let st=await openStore({db:sql},()=>{},opts);
+  const s=freshState();s.body='海😀\n'.repeat(25000);
+  await st.save(s);
+  const manifest=JSON.parse(sql.map.get('active'));
+  const parts=manifest.parts.slice(manifest.rootSections[0],manifest.rootSections[0]+manifest.rootSections[1]);
+  assert.ok(parts.length>=3);
+  assert.deepEqual(await st.rawBodyText('active'),{text:s.body,partial:false});
+  sql.map.delete(parts[1]);
+  st=await openStore({db:sql},()=>{},opts);
+  const rescue=await st.rawBodyText('active');
+  assert.equal(rescue.partial,true);assert.match(rescue.text,/欠落チャンク 2/);assert.match(rescue.text,/海/);
+  await assert.rejects(st.purgeCorruptEvidence());
+});
+test('explicit corruption cleanup preserves healthy generations and checkpoints after recovery',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={idbFactory:idb.factory,lazyArchives:true};
+  let st=await openStore({db:sql},()=>{},opts);
+  const old=freshState();old.body='旧原稿'.repeat(30000);
+  await st.save(old);await st.checkpoint(old,'手動復元点');
+  const corrupt=JSON.parse(sql.map.get('active'));corrupt.hash='bad';sql.map.set('active',JSON.stringify(corrupt));
+  st=await openStore({db:sql},()=>{},opts);assert.equal(st.readOnly,true);
+  await assert.rejects(st.purgeCorruptEvidence());
+  await st.allowImportRecovery();
+  const fresh=freshState();fresh.body='健全な新しい原稿';
+  await st.save(fresh);await st.save({...fresh,body:'健全な現在の原稿'});
+  const current=JSON.parse(sql.map.get('active'));
+  const keep=[...current.parts,...current.previous.parts];
+  const sources=await st.rawBodySources();
+  assert.ok(sources.some(k=>k.startsWith('corrupt-backup/')));
+  const rescued=await st.rawBodyText(sources.find(k=>k.startsWith('corrupt-backup/')));
+  assert.equal(rescued.text,old.body);
+  const result=await st.purgeCorruptEvidence();
+  assert.ok(result.removed>0);assert.ok(result.markers>0);
+  assert.ok(keep.every(k=>sql.map.has(k)));
+  assert.ok(![...sql.map.keys()].some(k=>k.startsWith('corrupt-keep/')||k.startsWith('corrupt-backup/')));
+  st=await openStore({db:sql},()=>{},opts);
+  assert.equal(st.initial.body,'健全な現在の原稿');
+  assert.ok((await st.checkpointList()).some(x=>x.reason==='手動復元点'));
+});
