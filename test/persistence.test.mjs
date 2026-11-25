@@ -409,3 +409,70 @@ test('raw rescue can read ACTIVE after startup SELECT failure without changing w
   await st.save({...freshState(),body:'別原稿'});
   assert.equal(sql.map.get('active'),active);
 });
+
+test('startup CREATE failure and malformed ACTIVE result keep SQLite untouched after retry deadline',async()=>{
+  const scenarios=[
+    {label:'CREATE',fail:(q)=>q.startsWith('CREATE TABLE'),response:()=>{throw Error('CREATE timeout');}},
+    ...[{}, {rows:[{}]}, {rows:{length:-1}}, {rows:{length:NaN}}, {rows:[['v']]}, {rows:[{v:3}]}].map((bad,i)=>({label:'malformed '+i,fail:(q,a)=>q.startsWith('SELECT v FROM')&&a[0]==='active',response:()=>bad}))
+  ];
+  for(const scenario of scenarios){
+    const sql=fakeSql(),host={db:sql},idb=fakeIdb();
+    const original=freshState();original.body='既存原稿';
+    const initial=await openStore(host,()=>{},{idbFactory:idb.factory});
+    await initial.save(original);
+    const snapshot=[...sql.map];
+    const execute=sql.executeSql.bind(sql);let once=true,sqlWrites=0;
+    sql.executeSql=async(q,a=[])=>{
+      if(once&&scenario.fail(q,a)){once=false;return scenario.response();}
+      if(/^(INSERT|DELETE)/.test(q))sqlWrites++;
+      return execute(q,a);
+    };
+    const fallback=await openStore(host,()=>{},{idbFactory:idb.factory});
+    const realNow=Date.now;
+    try{
+      Date.now=()=>realNow()+60000;
+      await fallback.save({...original,body:'退避編集1'});
+      await fallback.save({...original,body:'退避編集2'});
+    }finally{Date.now=realNow;}
+    assert.equal(sqlWrites,0,scenario.label);
+    assert.deepEqual([...sql.map],snapshot,scenario.label);
+    assert.equal(idb.data.get('latest').baseRev,null,scenario.label);
+    assert.equal(idb.data.get('latest').state.body,'退避編集2',scenario.label);
+    const reopened=await openStore(host,()=>{},{idbFactory:idb.factory});
+    assert.equal(reopened.recoveryRequired,true,scenario.label);
+    assert.deepEqual([...sql.map],snapshot,scenario.label);
+  }
+});
+test('unknown startup base revision never fast-forwards a legacy revision-zero SQLite on restart',async()=>{
+  const sql=fakeSql(),original=freshState();original.body='旧形式の原稿';
+  seed(sql,original,{rev:0});
+  const idb=fakeIdb(),before=[...sql.map],execute=sql.executeSql.bind(sql);
+  let once=true;
+  sql.executeSql=async(q,a=[])=>{
+    if(once&&q.startsWith('SELECT v FROM')&&a[0]==='active'){once=false;throw Error('timeout');}
+    return execute(q,a);
+  };
+  const st=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  await st.save({...original,body:'未知の基準で編集'});
+  assert.equal(idb.data.get('latest').baseRev,null);
+  const reopened=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  assert.equal(reopened.recoveryRequired,true);
+  assert.deepEqual([...sql.map],before);
+  // Older app versions recorded unknown bases as zero. Fail closed for these too.
+  idb.data.get('latest').baseRev=0;
+  const legacy=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  assert.equal(legacy.recoveryRequired,true);
+  assert.deepEqual([...sql.map],before);
+});
+test('failed startup read without IndexedDB rejects save and retains all SQLite rows',async()=>{
+  const sql=fakeSql(),original=freshState();original.body='保存済み';
+  seed(sql,original,{rev:12});const before=[...sql.map];
+  const execute=sql.executeSql.bind(sql);let once=true;
+  sql.executeSql=async(q,a=[])=>{
+    if(once&&q.startsWith('SELECT v FROM')&&a[0]==='active'){once=false;throw Error('timeout');}
+    return execute(q,a);
+  };
+  const st=await openStore({db:sql},()=>{},{idbFactory:async()=>{throw Error('IDB unavailable');}});
+  await assert.rejects(st.save({...original,body:'上書き不可'}),/保存できません/);
+  assert.deepEqual([...sql.map],before);
+});
