@@ -511,7 +511,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     // Replacing an entire work or resolving storage conflicts must preserve all
     // archives. Ordinary points preserve only the active branch.
     if(scope==='active'&&(/^(import|reset)$|復旧元|自動復旧前/.test(reason)))scope='full';
-    let normalized,raw,format;
+    let normalized,raw,format,fullArchives=null;
     if(scope==='branch'){
       const b=snapshot.branches.find(x=>x.id===branchId);
       if(!b)throw Error('削除する分岐が見つかりません。');
@@ -522,34 +522,79 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       normalized=validator({...snapshot,branches:[]});
       raw=JSON.stringify({scope:'active',state:normalized});format='scoped-v1';
     }else if(scope==='full'){
-      normalized=lazy?await materialize(snapshot):snapshot;
-      const compact=Boolean(normalized.branches?.length);
-      raw=compact?compactBackup(normalized):JSON.stringify(normalized);
-      format=compact?'shared-prefix-v2':'v1';
+      if(lazy){
+        // Whole-work replacement is rare but must keep every archived branch.
+        // Store each immutable archive separately, deduplicated across full points.
+        normalized=validator({...snapshot,branches:[]});
+        fullArchives=snapshot.branches;raw=JSON.stringify(normalized);
+        format='full-index-v1';
+      }else{
+        normalized=snapshot;
+        const compact=Boolean(normalized.branches?.length);
+        raw=compact?compactBackup(normalized):JSON.stringify(normalized);
+        format=compact?'shared-prefix-v2':'v1';
+      }
     }else throw Error('復元点の範囲が不正です。');
     const at=lastCheckpointAt=Math.max(Date.now(),lastCheckpointAt+1);
     const id='checkpoint/'+at.toString(36)+'-'+Math.random().toString(36).slice(2,8);
     const entry={id,at,title:normalized.title,chars:normalized.body.length,reason,
       format,scope,hash:checksum(raw),size:raw.length};
     // A concurrent checkpoint must never prune another's unfinished chunks.
-    const task=checkpointTail.then(()=>writeCheckpoint(entry,raw));
+    const task=checkpointTail.then(()=>writeCheckpoint(entry,raw,fullArchives));
     checkpointTail=task.catch(()=>{});
     return task;
   }
-  async function writeCheckpoint(entry,raw){
+  async function checkpointArchive(b,storage,created){
+    const full=await readArchive(b),raw=JSON.stringify(full),hash=checksum(raw),size=raw.length;
+    const base='checkpoint-archive/'+b.id+'/'+hash+'-'+size;
+    // The checksum is not cryptographic: reuse only after exact content equality.
+    for(let attempt=0;attempt<100;attempt++){
+      const key=base+(attempt?'-'+attempt:'');
+      if(storage==='sql'){
+        const existing=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]))[0]?.v;
+        if(typeof existing==='string'){
+          try{const old=JSON.parse(existing);if(await readParts(old.parts,old.hash,old.size)===raw)return {id:b.id,key,...old};}catch{}
+          continue;
+        }
+        const parts=splitChunks(raw),names=parts.map((_,i)=>key+'/part/'+i);
+        for(let i=0;i<parts.length;i++)await run('INSERT OR REPLACE INTO '+TABLE+' (k,v) VALUES (?,?)',[names[i],parts[i]]);
+        const descriptor={parts:names,hash,size};
+        await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[key,JSON.stringify(descriptor)]);
+        return {id:b.id,key,...descriptor};
+      }
+      const existing=await idb.get(key);
+      if(existing===raw)return {id:b.id,key,hash,size};
+      if(existing!==null&&existing!==undefined)continue;
+      await idb.put(key,raw);created.push(key);
+      return {id:b.id,key,hash,size};
+    }
+    throw Error('復元点の分岐を安全に保存できません。');
+  }
+  async function fullCheckpointPayload(entry,raw,archives,storage,created=[]){
+    if(archives===null)return {entry,raw};
+    const archiveEntries=[];
+    for(const b of archives)archiveEntries.push(await checkpointArchive(b,storage,created));
+    // Keep the root payload and archive descriptors separate. The parent stores
+    // keys for GC; their actual values are fetched only when selected.
+    const payload=JSON.stringify({scope:'full-index',state:JSON.parse(raw),archives:archiveEntries});
+    return {entry:{...entry,hash:checksum(payload),size:payload.length,
+      archiveKeys:archiveEntries.flatMap(a=>[a.key,...(a.parts||[])])},raw:payload};
+  }
+  async function writeCheckpoint(entry,raw,fullArchives=null){
     if(readOnly)throw Error('復旧中のため復元点を作成できません。');
     const {id}=entry;
     let sqlFailure=null;
     if(sqlAvailable){
       try{
-        const parts=splitChunks(raw),names=[];
+        const prepared=await fullCheckpointPayload(entry,raw,fullArchives,'sql');
+        const parts=splitChunks(prepared.raw),names=[];
         if(parts.length>1200)throw Error('復元点のチャンクが多すぎます。');
         for(let i=0;i<parts.length;i++){
           const key=id+'/part/'+i;
           await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[key,parts[i]]);
           names.push(key);
         }
-        await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[id,JSON.stringify({...entry,parts:names})]);
+        await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[id,JSON.stringify({...prepared.entry,parts:names})]);
         try{await pruneSqlCheckpoints(id);}catch(e){notify('古い復元点の整理は次回行います: '+e.message,true);}
         return;
       }catch(e){
@@ -569,14 +614,28 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     }
     if(idb){
       // Only index metadata is read to show the restore picker.
-      await idb.put('checkpoint-data/'+id,raw);
-      const list=(await idb.get('checkpoint-index'))||[];
-      const sorted=[entry,...list].sort((a,b)=>(Number(b.at)||0)-(Number(a.at)||0));
+      const created=[];
+      let prepared,list;
+      try{
+        list=(await idb.get('checkpoint-index'))||[];
+        prepared=await fullCheckpointPayload(entry,raw,fullArchives,'idb',created);
+        await idb.put('checkpoint-data/'+id,prepared.raw);
+      }catch(e){
+        for(const key of created)try{await idb.delete?.(key);}catch{}
+        throw e;
+      }
+      const sorted=[prepared.entry,...list].sort((a,b)=>(Number(b.at)||0)-(Number(a.at)||0));
       const kept=retention(sorted),keepIds=new Set(kept.map(x=>x.id));
       try{await idb.put('checkpoint-index',kept);}
-      catch(e){if(typeof idb.delete==='function')try{await idb.delete('checkpoint-data/'+id);}catch{}throw e;}
+      catch(e){
+        // If index publication was uncertain, retain the payload and archives.
+        throw e;
+      }
       for(const old of sorted.filter(x=>!keepIds.has(x.id)))if(typeof idb.delete==='function')
         try{await idb.delete('checkpoint-data/'+old.id);}catch(e){notify('古いIndexedDB復元点の清掃を延期します: '+e.message,true);}
+      const retainedArchiveKeys=new Set(kept.flatMap(x=>x.archiveKeys||[]));
+      for(const old of sorted.filter(x=>!keepIds.has(x.id)))for(const key of old.archiveKeys||[])
+        if(!retainedArchiveKeys.has(key))try{await idb.delete?.(key);}catch{}
       return;
     }
     throw sqlFailure||Error('復元点を保存できません。');
@@ -605,6 +664,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     // Include every committed parent part in the keep-set. Remove uncommitted
     // orphan /part rows as well as parts of evicted snapshots.
     const keptParts=new Set(keep.flatMap(p=>Array.isArray(p.entry.parts)?p.entry.parts:[]));
+    const keptArchives=new Set(keep.flatMap(p=>p.entry.archiveKeys||[]));
     const keys=sqlRows(await run('SELECT k FROM '+TABLE)).map(r=>r.k);
     const readable=new Set(parents.map(p=>p.key));
     const unknown=new Set(keys.filter(k=>typeof k==='string'&&/^checkpoint\/[^/]+$/.test(k)&&!readable.has(k)));
@@ -612,7 +672,12 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     // evicted parents first, so an interrupted GC never leaves a broken parent.
     for(const p of drop)await run('DELETE FROM '+TABLE+' WHERE k=?',[p.key]);
     for(const key of keys){
-      if(typeof key!=='string'||!key.startsWith('checkpoint/')||!key.includes('/part/'))continue;
+      if(typeof key!=='string')continue;
+      if(key.startsWith('checkpoint-archive/')){
+        if(!unknown.size&&!keptArchives.has(key))await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
+        continue;
+      }
+      if(!key.startsWith('checkpoint/')||!key.includes('/part/'))continue;
       const owner=key.slice(0,key.indexOf('/part/'));
       if(!keptParts.has(key)&&!unknown.has(owner))
         await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
@@ -691,6 +756,15 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     if(metadata&&(metadata.hash&&checksum(raw)!==metadata.hash||metadata.size!==undefined&&raw.length!==metadata.size))
       throw Error('IndexedDB復元点のチェックサムが一致しません。');
     const parsed=JSON.parse(raw);
+    if(parsed.scope==='full-index'){
+      if(!Array.isArray(parsed.archives)||parsed.archives.length>MAX_ARCHIVED_BRANCHES)throw Error('復元点の分岐目録が不正です。');
+      const branches=[];
+      for(const a of parsed.archives){
+        const branchRaw=id.startsWith('idb/')?await idb.get(a.key):await readParts(a.parts,a.hash,a.size);
+        branches.push(validatedArchive(checkedJson(branchRaw,a),a.id));
+      }
+      return validator({...parsed.state,branches});
+    }
     if(parsed.scope==='branch'){
       if(!current)throw Error('分岐の復元には現在の作品が必要です。');
       const d=validator(current),b=validatedArchive(parsed.branch,parsed.branch?.id);
@@ -731,8 +805,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       readOnly=false;
       // Retain both versions before switching; all steps must finish.
       const other=which==='idb'?sqlSnapshot?.validated.value:idbValid?.value;
-      if(other)await checkpoint(other,'選ばなかった復旧元');
-      await checkpoint(selected,'復旧前に選択した保存元');
+      if(other)await checkpoint(other,'選ばなかった復旧元',{scope:'full'});
+      await checkpoint(selected,'復旧前に選択した保存元',{scope:'full'});
       nextSqlRetry=0; // An explicit user recovery always retries SQLite immediately.
       await save(selected);
       if(sqlSnapshot?.validated.value&&mode!=='SQLite')
@@ -782,7 +856,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       await save(selected);
       if(mode!=='SQLite')throw Error('SQLiteへの書き込みを確認できません。');
       rebuildPending=false;return selected;
-    }catch(e){readOnly=true;throw e;}
+    }catch(e){readOnly=true;rebuildPending=false;throw e;}
   }
   // Export bounded groups of raw SQLite rows, including archived branches,
   // previous generations, checkpoint chunks and damaged backup evidence.
@@ -859,7 +933,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   if(safeFastForward&&cleanIdb){
     try{
       // No concurrent SQLite edits: advance the pending IDB changes safely.
-      await checkpoint(sqlSnapshot.validated.value,'IndexedDB自動復旧前のSQLite');
+      await checkpoint(sqlSnapshot.validated.value,'IndexedDB自動復旧前のSQLite',{scope:'full'});
       await save(idbValid.value);
       if(mode!=='SQLite')throw Error('SQLiteへ同期できませんでした。');
       preferred=idbValid.value;
