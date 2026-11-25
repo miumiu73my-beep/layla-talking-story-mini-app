@@ -74,6 +74,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   let preferred=null,mode='保存不可',seq=0,backupWarning='',nextSqlRetry=0,skipCleanupOnce=false;
   // A session must never overwrite SQLite it failed to fully read on startup.
   let sqlInitialized=false,sqlRetryBlocked=false;
+  const branchCache=new WeakMap();
+  let rootCache=null;
   const sql=host?.db?.executeSql;
   const run=async(q,args=[])=>host.db.executeSql(q,args);
   // An empty result is only safe if the returned row container is valid.
@@ -188,22 +190,29 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     if(chunks.length>1000)throw Error('SQLiteの容量上限（約4000万文字）を超えました。JSON保存を推奨します。');
     const keys=[];
     for(let i=0;i<chunks.length;i++){
+      // Exact equality, not just a checksum: immutable chunks can be reused.
+      if(rootCache?.manifest===manifest&&rootCache.chunks[i]===chunks[i]&&manifest.parts[i]){
+        keys.push(manifest.parts[i]);continue;
+      }
       const key=generation+'/root/'+i;keys.push(key);
       await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[key,chunks[i]]);
     }
     const previousBranches=new Map((manifest?.branchParts||[]).map(b=>[b.id,b]));
     const branchParts=[];
     for(const b of state.branches||[]){
-      const json=JSON.stringify(b),hash=checksum(json),old=previousBranches.get(b.id);
+      const old=previousBranches.get(b.id);
+      if(validator===cleanState&&old&&branchCache.get(b)===old){branchParts.push(old);continue;}
+      const json=JSON.stringify(b),hash=checksum(json);
       if(old&&old.hash===hash&&old.size===json.length){
-        branchParts.push(old);continue; // Immutable archived branch: no writes.
+        branchParts.push(old);if(validator===cleanState)branchCache.set(b,old);continue;
       }
       const parts=splitChunks(json),bkeys=[];
       for(let i=0;i<parts.length;i++){
         const key=generation+'/branch/'+b.id+'/'+i;bkeys.push(key);
         await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[key,parts[i]]);
       }
-      branchParts.push({id:b.id,parts:bkeys,hash,size:json.length});
+      const entry={id:b.id,parts:bkeys,hash,size:json.length};
+      branchParts.push(entry);if(validator===cleanState)branchCache.set(b,entry);
     }
     const previous=manifest?{
       version:1,parts:manifest.parts,at:manifest.at,
@@ -215,7 +224,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const next={version:1,parts:keys,branchParts,at:Date.now(),rev:++seq,
       hash:checksum(rootJson),size:rootJson.length,previous};
     await run('INSERT OR REPLACE INTO '+TABLE+' (k,v) VALUES (?,?)',[ACTIVE,JSON.stringify(next)]);
-    manifest=next;rawEvidence=null;
+    manifest=next;rootCache={manifest:next,chunks};rawEvidence=null;
     // Retain active and previous immutable branches. GC only unreferenced
     // generations; never remove checkpoint chunks.
     try{
@@ -230,9 +239,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       }
     }catch(e){notify('保存世代の整理を次回へ延期しました: '+e.message,true);}
   }
-  async function commit(raw){
+  async function commit(state){
     if(readOnly)throw Error('読み取り専用です。復旧元を確認するかJSONバックアップを利用してください。');
-    const state=validator(JSON.parse(raw));
     const saved={state,rev:seq+1,at:Date.now(),baseRev:sqlInitialized&&!sqlRetryBlocked?(manifest?.rev||0):null,pending:true};
     if(!sqlAvailable&&!sqliteCorrupt&&sqlInitialized&&!sqlRetryBlocked&&
        typeof sql==='function'&&Date.now()>=nextSqlRetry){
@@ -296,7 +304,9 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   function save(state){
     if(readOnly)return Promise.reject(Error('復旧確認が必要なため上書き禁止です。'));
-    let raw;try{raw=JSON.stringify(state);}catch(e){return Promise.reject(e);}
+    // Snapshot active mutable fields now; share only canonical immutable archives.
+    // Custom validators keep the previous defensive deep-copy contract.
+    let raw;try{raw=validator===cleanState?cleanState(state):validator(JSON.parse(JSON.stringify(state)));}catch(e){return Promise.reject(e);}
     return new Promise((resolve,reject)=>{
       queued=raw;waiters.push({resolve,reject});
       if(!working)void processQueue();
@@ -516,7 +526,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[
           'corrupt-backup/'+Date.now(),recoveredManifest
         ]);
-        manifest=null;sqlAvailable=true;sqlInitialized=true;sqlRetryBlocked=false;skipCleanupOnce=true;
+        manifest=null;rootCache=null;sqlAvailable=true;sqlInitialized=true;sqlRetryBlocked=false;skipCleanupOnce=true;
         sqliteCorrupt=false;sqlProblem='';
       }catch(e){
         notify('SQLite復旧準備に失敗しました。IndexedDBへ退避します: '+e.message,true);
