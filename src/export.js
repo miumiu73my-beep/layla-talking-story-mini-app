@@ -96,3 +96,44 @@ export async function writeFile(host,name,text,mime){
     message:'自動書き出しできませんでした'+(reason?'（'+reason+'）':'')+'。内容をコピーするか、ブラウザ用ダウンロードを選んでください。',
     ...fallback()};
 }
+
+// Bounded serializer for v1 and existing v2 branch-prefix backups. Keep only
+// the active body and preceding archive body, rather than materializing every
+// archive. Each prefix refers to an earlier entry (v2 reader supports this).
+export async function serializeBackup(snapshot,loadBranch,{compact=false,maxBytes=50000000}={}){
+  const {branches,...root}=snapshot;
+  const pieces=[],entries=[],payload=[];
+  let bytes=0;
+  function add(list,value){
+    const part=JSON.stringify(value);
+    bytes+=utf8ByteLength(part)+(list.length?1:0);
+    if(bytes>maxBytes)return false;
+    list.push(part);return true;
+  }
+  const prefix=(a,b)=>{
+    let i=0;while(i<a.length&&i<b.length&&a.charCodeAt(i)===b.charCodeAt(i))i++;
+    return i;
+  };
+  const head=JSON.stringify(compact?{...root,body:0}:root).slice(0,-1)+',"branches":[';
+  bytes=utf8ByteLength(head)+2;
+  if(compact){
+    bytes+=utf8ByteLength('{"schema":"layla-talking-story-backup","version":2,"kind":"branch-prefix","entries":[],"payload":}');
+    if(!add(entries,{base:null,prefix:0,suffix:root.body}))return null;
+  }
+  if(bytes>maxBytes)return null;
+  let previous=root.body;
+  for(let i=0;i<branches.length;i++){
+    const branch=await loadBranch(branches[i]);
+    if(compact){
+      const a=prefix(root.body,branch.body),b=prefix(previous,branch.body);
+      const count=Math.max(a,b),base=count?(b>a?i:0):null;
+      if(!add(entries,{base,prefix:count,suffix:branch.body.slice(count)})||
+         !add(payload,{...branch,body:i+1}))return null;
+      previous=branch.body;
+    }else if(!add(payload,branch))return null;
+  }
+  pieces.push(head,payload.join(','),']}');
+  const body=pieces.join('');
+  const result=compact?'{"schema":"layla-talking-story-backup","version":2,"kind":"branch-prefix","entries":['+entries.join(',')+'],"payload":'+body+'}':body;
+  return utf8ByteLength(result)<=maxBytes?result:null;
+}
