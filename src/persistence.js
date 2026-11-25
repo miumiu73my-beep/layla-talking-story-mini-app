@@ -605,10 +605,30 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   // Old single-row SQL and IDB checkpoints remain readable.
   let checkpointTail=Promise.resolve(),lastCheckpointAt=0;
   const protectedReason=reason=>/^(import|reset)$|取込|読み込|新規作成|新しい作品|本文.*(削除|大幅)/.test(reason||'');
+  const automaticReason=reason=>/^(セッション開始時の自動復元点|日次自動復元点)$/.test(reason||'');
+  const day=at=>new Date(at).toDateString();
   function retention(entries){
-    const regular=entries.filter(e=>!protectedReason(e.reason)),important=entries.filter(e=>protectedReason(e.reason));
-    // Independent quota: ordinary operations never evict the last three important points.
-    return [...regular.slice(0,8),...important.slice(0,3)];
+    const regular=entries.filter(e=>!protectedReason(e.reason)&&!automaticReason(e.reason));
+    const important=entries.filter(e=>protectedReason(e.reason));
+    const days=new Set(),automatic=[];
+    for(const e of entries.filter(e=>automaticReason(e.reason))){
+      const date=day(e.at);
+      if(!days.has(date)&&automatic.length<3){days.add(date);automatic.push(e);}
+    }
+    return [...regular.slice(0,8),...important.slice(0,3),...automatic];
+  }
+  // The committed checkpoint metadata is the persistent daily timestamp.
+  // Fail closed on metadata I/O errors instead of repeatedly creating backups.
+  async function latestAutomaticCheckpointAt(){
+    const entries=[];
+    if(sqlAvailable)for(const {entry} of await sqlCheckpointParents())entries.push(entry);
+    if(idb){
+      const index=await idb.get('checkpoint-index');
+      if(index!==null&&index!==undefined&&!Array.isArray(index))throw Error('復元点一覧の形式が不正です。');
+      entries.push(...(index||[]));
+    }
+    const dates=entries.filter(e=>automaticReason(e.reason)&&Number.isFinite(Number(e.at))&&Number(e.at)>0).map(e=>Number(e.at));
+    return dates.length?Math.max(...dates):null;
   }
   async function checkpoint(state,reason='操作前',{scope=lazy?'active':'full',branchId=null}={}){
     if(readOnly)throw Error('復旧中のため復元点を作成できません。');
@@ -1059,7 +1079,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},
     recoveryInfo:()=>({sqlite:sqlSnapshot?.validated.value?{title:sqlSnapshot.validated.value.title,chars:sqlSnapshot.validated.value.body.length,at:sqlSnapshot.validated.value.updatedAt,turns:sqlSnapshot.validated.value.turns.length}:null,idb:idbValid?.value?{title:idbValid.value.title,chars:idbValid.value.body.length,at:idbValid.value.updatedAt,turns:idbValid.value.turns.length}:null}),
     get canRebuildFromIdb(){return cleanIdb&&readOnly&&!recoveryRequired&&(sqliteCorrupt||rebuildPending);},
-    save,checkpoint,checkpoints,checkpointList,loadCheckpoint,chooseRecovery,allowImportRecovery,rebuildFromIdb,rawDump,rawRowKeys,rawRowPage,materialize,compactState,
+    save,checkpoint,checkpoints,checkpointList,latestAutomaticCheckpointAt,loadCheckpoint,chooseRecovery,allowImportRecovery,rebuildFromIdb,rawDump,rawRowKeys,rawRowPage,materialize,compactState,
     flush:()=>new Promise((resolve,reject)=>{
       if(!working&&queued===null)return resolve();
       const wait=()=>{
