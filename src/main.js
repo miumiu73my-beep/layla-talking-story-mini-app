@@ -55,7 +55,7 @@ function persist(delay=600){
   state.updatedAt=new Date().toISOString();
   editRev++;
   // Full validation of all branches on every keystroke is expensive.
-  if(el('safety'))el('safety').hidden=!saveError&&!saveBlocked;
+  if(el('safety')&&(saveError||saveBlocked||backupSizeWarning))el('safety').hidden=false;
   if(el('screen-settings')&&!el('screen-settings').hidden)schedulePromptMeta();
   if(saveBlocked){status('現在は未保存です。復旧確認または外部JSONバックアップが必要です。',true);return;}
   clearTimeout(saveTimer);
@@ -457,6 +457,20 @@ function stopGeneration(){
   }
   setTimeout(()=>release(false),5000);
 }
+function showManualExport(){
+  if(!lastExport)return;
+  el('manual-export').hidden=false;el('manual-name').textContent=lastExport.name+(lastExport.warning?'／'+lastExport.warning:'');
+  el('manual-text').value=lastExport.text;
+  el('download-manual').dataset.name=lastExport.name;
+  el('download-manual').dataset.mime=lastExport.mime;
+  el('manual-export').scrollIntoView({block:'nearest'});
+}
+function presentExport(name,content,mime,result,warning=''){
+  lastExport={name,text:content,mime,warning};
+  el('open-export-manual').hidden=false;
+  status((warning?warning+'／':'')+result.message,Boolean(warning)||result.kind==='manual'||result.kind==='unconfirmed');
+  if(result.kind==='manual'||result.kind==='unconfirmed'||!el('manual-export').hidden)showManualExport();
+}
 async function exportAs(ext){
   if(!ready)return;
   try{
@@ -465,19 +479,15 @@ async function exportAs(ext){
     const light=ext==='compact-json';
     const content=light?compactBackup(state):ext==='json'?JSON.stringify(state):readableText(state,ext);
     const tooLarge=(ext==='json'||light)&&new TextEncoder().encode(content).length>TRANSFER_MAX_BYTES;
-    backupSizeWarning=tooLarge?'このJSONは50MB超で再読み込みできません。軽量JSONや分岐整理後の再保存が必要です。':'';
+    const warning=tooLarge?'このJSONは50MB超で再読み込みできません。軽量JSONや分岐整理後の再保存が必要です。':'';
+    if(warning)backupSizeWarning=warning;
     safety();
     const name=filename(state.title+(light?'_軽量分岐':''),light?'json':ext);
     const mime=(ext==='json'||light)?'application/json':ext==='md'?'text/markdown':'text/plain';
     const result=await writeFile(host,name,content,mime);
-    lastExport={name,text:content,mime};
-    el('open-export-manual').hidden=false;
-    status((backupSizeWarning?backupSizeWarning+'／':'')+result.message,tooLarge||result.kind==='manual'||result.kind==='unconfirmed');
-    if(result.kind==='manual'){
-      el('manual-export').hidden=false;el('manual-name').textContent=name;
-      el('manual-text').value=result.text;el('download-manual').dataset.name=name;
-      el('download-manual').dataset.mime=mime;
-      el('manual-export').scrollIntoView({block:'nearest'});
+    presentExport(name,content,mime,result,warning);
+    if((ext==='json'||light)&&!warning&&result.kind==='share'){
+      backupSizeWarning='';safety();
     }
     if(editRev!==savedRev)void saveNow(); // Never overwrite an identical saved generation.
   }catch(e){status('書き出しに失敗しました: '+String(e.message||e),true);}
@@ -563,19 +573,9 @@ async function recoverChoice(){
 async function exportRaw(){
   try{
     const raw=await store.rawDump();
-    const result=await writeFile(host,filename('talking-story-raw-recovery','json'),raw,'application/json');
-    lastExport={name:filename('talking-story-raw-recovery','json'),text:raw,mime:'application/json'};
-    el('open-export-manual').hidden=false;
-    status(result.message,result.kind==='manual');
-    if(result.kind==='manual'){
-      el('manual-export').hidden=false;
-      const name=filename('talking-story-raw-recovery','json');
-      el('manual-name').textContent=name;
-      el('manual-text').value=result.text;
-      el('download-manual').dataset.name=name;
-      el('download-manual').dataset.mime='application/json';
-      el('manual-export').scrollIntoView({block:'nearest'});
-    }
+    const name=filename('talking-story-raw-recovery','json');
+    const result=await writeFile(host,name,raw,'application/json');
+    presentExport(name,raw,'application/json',result);
   }catch(e){status('生データを書き出せません: '+String(e.message||e),true);}
 }
 
@@ -759,14 +759,7 @@ function setup(){
   };
   el('raw-backup').onclick=()=>void exportRaw();
   el('close-manual').onclick=()=>{el('manual-text').value='';el('manual-export').hidden=true;};
-  el('open-export-manual').onclick=()=>{
-    if(!lastExport)return;
-    el('manual-export').hidden=false;el('manual-name').textContent=lastExport.name;
-    el('manual-text').value=lastExport.text;
-    el('download-manual').dataset.name=lastExport.name;
-    el('download-manual').dataset.mime=lastExport.mime;
-    el('manual-export').scrollIntoView({block:'center'});
-  };
+  el('open-export-manual').onclick=showManualExport;
   el('download-manual').onclick=()=>{
     const name=el('download-manual').dataset.name||'story.txt';
     const mime=el('download-manual').dataset.mime||'text/plain';
