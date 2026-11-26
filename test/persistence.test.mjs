@@ -1082,10 +1082,23 @@ test('bounded synchronized mirror omits oversized aggregate branches without tre
   outage=await openStore({},()=>{},opts);
   await outage.save({...outage.initial,draft:'再起動後の未同期'});
   assert.equal(idb.data.get('latest').archives[1].omitted,true);
+  assert.equal(idb.data.get('latest').baseRev,null);
   st=await openStore({db:sql},()=>{},opts);
   assert.equal(st.initial.draft,'再起動後の未同期');
+  assert.equal(st.readOnly,true);
+  assert.equal(st.recoveryRequired,true);
+  assert.equal(st.recoveryInfo().omissionConflict,true);
+  await assert.rejects(st.chooseRecovery('idb'));
+  const recovered=await st.chooseRecovery('sqlite');
   assert.equal(st.readOnly,false);
-  assert.equal((await st.materialize(st.initial,'b')).branches[1].body,s.branches[1].body);
+  assert.equal(st.recoveryRequired,false);
+  assert.equal((await st.materialize(recovered,'b')).branches[1].body,s.branches[1].body);
+  const rescue=(await st.checkpointList()).find(e=>e.reason.includes('省略衝突の未同期救出'));
+  assert.ok(rescue);
+  assert.equal((await st.loadCheckpoint(rescue.id)).draft,'再起動後の未同期');
+  st=await openStore({db:sql},()=>{},opts);
+  assert.equal(st.recoveryRequired,false);
+  assert.equal(st.readOnly,false);
 });
 test('IDB-only storage keeps all newly saved archives despite synchronized mirror budget',async()=>{
   const idb=fakeIdb(),opts={lazyArchives:true,idbFactory:idb.factory};
@@ -1231,4 +1244,32 @@ test('unreadable archive blocks reset and replace with isolation guidance; isola
   await st.checkpoint(state,'reset',{scope:'full'});
   assert.equal(await doImport(),true);
   assert.equal((await openStore(host,()=>{},opts)).initial.body,'新本編');
+});
+
+
+test('omitted pending archive with mismatched SQLite revision permits explicit SQLite recovery and rescues pending root',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={lazyArchives:true,idbFactory:idb.factory};
+  let st=await openStore({db:sql},()=>{},opts);
+  const original=cleanState({...freshState(),body:'SQLite本文',branches:[
+    {id:'a',name:'A',body:'あ'.repeat(1100000)},{id:'b',name:'B',body:'い'.repeat(1100000)}]});
+  await st.save(original);
+  const outdated=await openStore({},()=>{},opts);
+  await outdated.save({...outdated.initial,body:'未同期の本編'});
+  const pending=idb.data.get('latest');
+  assert.equal(pending.baseRev,null);
+  pending.baseRev=999;
+  const before=sql.map.get('active');
+  st=await openStore({db:sql},()=>{},opts);
+  assert.equal(st.recoveryRequired,true);
+  assert.equal(st.readOnly,true);
+  assert.equal(sql.map.get('active'),before);
+  const selected=await st.chooseRecovery('sqlite');
+  assert.equal(selected.body,'SQLite本文');
+  const point=(await st.checkpointList()).find(e=>e.reason.includes('省略衝突の未同期救出'));
+  assert.ok(point);
+  assert.equal((await st.loadCheckpoint(point.id)).body,'未同期の本編');
+  await st.save({...selected,body:'復旧後の編集'});
+  st=await openStore({db:sql},()=>{},opts);
+  assert.equal(st.initial.body,'復旧後の編集');
+  assert.equal(st.recoveryRequired,false);
 });
