@@ -856,7 +856,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   // A checkpoint's parent key holds small metadata; its data is in chunks.
   // Old single-row SQL and IDB checkpoints remain readable.
   let checkpointTail=Promise.resolve(),lastCheckpointAt=0;
-  const protectedReason=reason=>/^(import|reset)$|取込|読み込|新規作成|新しい作品|本文.*(削除|大幅)|省略衝突の未同期救出/.test(reason||'');
+  const protectedReason=reason=>/^(import|reset)$|取込|読み込|新規作成|新しい作品|本文.*(削除|大幅)|省略衝突の未同期救出|復旧元|保存元/.test(reason||'');
   const automaticReason=reason=>/^(セッション開始時の自動復元点|日次自動復元点)$/.test(reason||'');
   const day=at=>new Date(at).toDateString();
   function retention(entries){
@@ -1224,8 +1224,16 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       await save(selected);
       if(sqlSnapshot?.validated.value&&mode!=='SQLite')
         throw Error('SQLiteへの復旧書き込みが完了していません。再試行できます。');
-      if(omissionConflict&&idb&&(await idb.get('latest'))?.pending)
-        throw Error('SQLiteは保存済みですが未同期ミラーの解消に失敗しました。救出復元点は保持されています。再試行してください。');
+      // Do not report a successful recovery while the previous pending mirror
+      // remains authoritative on restart. Both sources were checkpointed above.
+      // Retain the old record rather than deleting potentially recoverable data.
+      if(idb){
+        let latest;
+        try{latest=await idb.get('latest');}
+        catch(e){throw Error('SQLiteは保存済みですが未同期ミラーを確認できません。復元点は保持されています。再試行してください: '+String(e.message||e));}
+        if(latest?.pending)
+          throw Error('SQLiteは保存済みですが未同期ミラーの解消に失敗しました。救出復元点は保持されています。再試行してください。');
+      }
       recoveryRequired=false;omissionConflict=false;
       return selected;
     }catch(e){
