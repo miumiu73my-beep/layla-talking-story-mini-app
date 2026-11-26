@@ -1134,3 +1134,34 @@ test('keep-branch JSON import saves and restarts with original lazy archive, act
   assert.equal(point.scope,'active');
   assert.equal((await st.loadCheckpoint(point.id,st.initial)).body,'旧本編');
 });
+
+
+test('same-day automatic checkpoint matches exact body and branch, not merely length',async()=>{
+  const sql=fakeSql(),idb=fakeIdb();
+  const store=await openStore({db:sql},()=>{},{idbFactory:idb.factory,lazyArchives:true});
+  const s=freshState();s.body='本文です';
+  await store.checkpoint(s,'日次自動復元点',{scope:'active'});
+  assert.equal(await store.hasMatchingAutomaticCheckpoint(s),true);
+  assert.equal(await store.hasMatchingAutomaticCheckpoint({...s,body:'別の本文'}),false);
+  assert.equal(await store.hasMatchingAutomaticCheckpoint({...s,activeBranch:{...s.activeBranch,id:'other'}}),false);
+  assert.equal(await store.hasMatchingAutomaticCheckpoint(s,Date.now()+86400000),false);
+  const key=[...sql.map.keys()].find(k=>/^checkpoint\/[^/]+$/.test(k));
+  const entry=JSON.parse(sql.map.get(key));sql.map.delete(entry.parts[0]);
+  assert.equal(await store.hasMatchingAutomaticCheckpoint(s),false);
+});
+test('lazy archive rename updates manifests without rewriting SQLite or IndexedDB payloads',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),host={db:sql},opts={idbFactory:idb.factory,lazyArchives:true};
+  let store=await openStore(host,()=>{},opts);
+  const s=freshState();const b={...s.activeBranch,id:'b-rename',name:'旧名',body:'本文'.repeat(50000),turns:[],draft:''};
+  s.branches=[b];await store.save(cleanState(s));
+  const old=JSON.parse(sql.map.get('active')).branchParts[0],mirror=idb.data.get('latest').archives[0];
+  store=await openStore(host,()=>{},opts);
+  let next=await store.renameStoredBranch(store.initial,'b-rename','新名');await store.save(next);
+  const changed=JSON.parse(sql.map.get('active')).branchParts[0],im=idb.data.get('latest').archives[0];
+  assert.deepEqual(changed.parts,old.parts);assert.equal(changed.hash,old.hash);
+  assert.equal(im.key,mirror.key);assert.equal(im.hash,mirror.hash);
+  store=await openStore(host,()=>{},opts);assert.equal(store.initial.branches[0].name,'新名');
+  const full=await store.materialize(store.initial,'b-rename');assert.equal(full.branches[0].name,'新名');assert.equal(full.branches[0].body,b.body);
+  next=await store.renameStoredBranch(store.initial,'b-rename','旧名');await store.save(next);
+  assert.deepEqual(JSON.parse(sql.map.get('active')).branchParts[0].parts,old.parts);
+});

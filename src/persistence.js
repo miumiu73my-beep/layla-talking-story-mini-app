@@ -3,7 +3,7 @@
 // Immutable chunks -> single manifest switch; retain the previous generation.
 // Never auto-overwrite healthy SQLite with unvalidated/different pending IDB data.
 import {cleanState,checksum,compactBackup,expandCompactBackup,archiveReference,isArchiveReference} from './logic.js';
-import {snapshot as branchSnapshot,MAX_ARCHIVED_BRANCHES} from './branches.js';
+import {snapshot as branchSnapshot,MAX_ARCHIVED_BRANCHES,renameBranch} from './branches.js';
 
 const TABLE='talking_story_data_v1',ACTIVE='active',DBNAME='talking-story-fallback-v1';
 class ArchiveDamage extends Error {}
@@ -91,7 +91,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   const branchCache=new WeakMap();
   let rootCache=null,idbRootCache=null,idbLatest=null,sqlSavesSinceGc=9;
   const refData=new WeakMap(),storedRefs=new WeakMap(),archiveIssues=new WeakMap(),unknownSummaries=new WeakSet();
-  const repairIds=new Set(),archiveChecks=new WeakMap();
+  const repairIds=new Set(),archiveChecks=new WeakMap(),pendingRenames=new WeakSet();
   const damagedEntries=new WeakSet(),protectedEntries=new WeakSet();
   // The app opts into lazy storage; legacy callers still receive full snapshots.
   const lazy=lazyArchives&&validator===cleanState;
@@ -145,7 +145,36 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       !(m.forkTurn===null||Number.isSafeInteger(m.forkTurn))||
       !Number.isSafeInteger(m.chars)||m.chars<0||!Number.isSafeInteger(m.turnCount)||m.turnCount<0||
       checksum(JSON.stringify(m))!==entry.summaryHash)throw new ArchiveDamage('分岐の要約情報が不正です。');
+    if(entry.sourceName!==undefined&&(typeof entry.sourceName!=='string'||!entry.sourceName.trim()||entry.sourceName.length>90||
+      entry.sourceNameHash!==checksum(JSON.stringify([entry.hash,entry.sourceName,m.name]))))
+      throw new ArchiveDamage('分岐名変更情報が不正です。');
+    if(entry.sourceName===undefined&&entry.sourceNameHash!==undefined)throw new ArchiveDamage('分岐名変更情報が欠落しています。');
     return m;
+  }
+  // Keep immutable original JSON. Validate original and effective metadata.
+  function renamedEntry(entry,b){
+    if(!entry.summary)return summaryEntry(entry,b);
+    if(entry.summary.name===b.name)return entry;
+    const old=checkedSummary(entry),sourceName=entry.sourceName??old.name;
+    const next=summaryEntry(entry,b);
+    if(sourceName===b.name){delete next.sourceName;delete next.sourceNameHash;}
+    else{next.sourceName=sourceName;next.sourceNameHash=checksum(JSON.stringify([next.hash,sourceName,b.name]));}
+    return next;
+  }
+  async function renameStoredBranch(state,id,name){
+    const label=String(name||'').trim();
+    if(!label||label.length>90)throw Error('分岐名は1〜90文字です。');
+    const b=state.branches.find(x=>x.id===id);
+    if(!isArchiveReference(b))return renameBranch(state,id,label);
+    if(b.name===label)return state;
+    const data=refData.get(b);
+    if(!data||unknownSummaries.has(b)||archiveIssues.has(b))throw Error('分岐の整合性を確認してから名前を変更してください。');
+    if(Object.values(data).some(e=>!e.summary))return renameBranch(await materialize(state,id),id,label);
+    if(data.idb?.omitted&&!sqlAvailable)throw Error('SQLiteに接続してから名前を変更してください。');
+    for(const e of Object.values(data))checkedSummary(e);
+    const ref=archiveReference({...summaryOf(b),name:label});
+    refData.set(ref,{...data});pendingRenames.add(ref);
+    return cleanState({...state,branches:state.branches.map(x=>x===b?ref:x)});
   }
   function entryReference(entry,source,summary,error=null,unknown=false){
     const ref=archiveReference(summary);
@@ -181,8 +210,13 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   async function readEntry(entry,source){
     if(source==='idb'&&(entry.missing||typeof entry.key!=='string'))throw new ArchiveDamage('IndexedDBに分岐のミラーがありません。');
     const raw=source==='idb'?await retryRead(()=>idb.get(entry.key)):await readParts(entry.parts,entry.hash,entry.size);
-    try{return validatedArchive(checkedJson(raw,entry),entry.id);}
-    catch(e){throw new ArchiveDamage(String(e.message||e));}
+    try{
+      const full=validatedArchive(checkedJson(raw,entry),entry.id);
+      if(entry.sourceName===undefined){if(entry.sourceNameHash!==undefined)throw Error('分岐名変更情報が欠落しています。');return full;}
+      const summary=checkedSummary(entry);
+      if(JSON.stringify(meta(full))!==JSON.stringify({...summary,name:entry.sourceName}))throw Error('変更前の分岐要約が一致しません。');
+      return validatedArchive({...full,name:summary.name},entry.id);
+    }catch(e){throw new ArchiveDamage(String(e.message||e));}
   }
   async function verifySource(state,source,allowLinkedOmissions=false){
     for(const b of state.branches){
@@ -237,7 +271,9 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const entry=refData.get(b)?.[source];
     if(!entry)throw new ArchiveDamage('保存先に分岐がありません。');
     try{
-      const full=await readEntry(entry,source);
+      let full=await readEntry(entry,source);
+      if(pendingRenames.has(b)&&entry.summary&&entry.summary.name!==b.name&&JSON.stringify(meta(full))===JSON.stringify(checkedSummary(entry)))
+        full=validatedArchive({...full,name:b.name},entry.id);
       if(!unknownSummaries.has(b)&&JSON.stringify(meta(full))!==JSON.stringify(summaryOf(b)))
         throw new ArchiveDamage('分岐の要約情報が一致しません。');
       return full;
@@ -345,11 +381,11 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   function archiveSignature(state){
     return JSON.stringify({...state,branches:state.branches.map(b=>{
-      if(isArchiveReference(b)){const e=refData.get(b)?.sql||refData.get(b)?.idb;return [b.id,e?.hash,e?.size];}
-      const raw=JSON.stringify(b);return [b.id,checksum(raw),raw.length];
+      if(isArchiveReference(b)){const e=refData.get(b)?.sql||refData.get(b)?.idb;return [b.id,e?.hash,e?.size,b.name];}
+      const raw=JSON.stringify(b);return [b.id,checksum(raw),raw.length,b.name];
     })});
   }
-  function linkMirrors(sqlState,idbState){
+  function linkMirrors(sqlState,idbState,allowPendingRename=false){
     if(!lazy||!sqlState||!idbState)return;
     for(const b of sqlState.branches){
       if(!isArchiveReference(b))continue;
@@ -357,8 +393,11 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       if(!isArchiveReference(other))continue;
       const a=refData.get(b),c=refData.get(other);
       if(a?.sql&&c?.idb&&a.sql.hash===c.idb.hash&&a.sql.size===c.idb.size&&
-        b.name===other.name&&b.chars===other.chars&&b.turnCount===other.turnCount){
-        a.idb=c.idb;c.sql=a.sql;
+        b.chars===other.chars&&b.turnCount===other.turnCount){
+        if(b.name===other.name){a.idb=c.idb;c.sql=a.sql;}
+        else if(allowPendingRename&&c.idb.omitted&&a.sql.summary&&c.idb.summary&&
+          JSON.stringify({...checkedSummary(a.sql),name:other.name})===JSON.stringify(checkedSummary(c.idb))&&
+          (a.sql.sourceName??b.name)===(c.idb.sourceName??other.name)){c.sql=a.sql;pendingRenames.add(other);}
       }
     }
   }
@@ -442,7 +481,12 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
           }
         }
         if(!entry.missing)archiveUnits+=entry.size||0;
-        archives.push(entry.summary?entry:summaryEntry(entry,b));
+        // Newly omitted copies inherit original name metadata from SQL.
+        if(entry.omitted&&!entry.summary&&sqlEntry?.summary){
+          entry={...entry,summary:sqlEntry.summary,summaryHash:sqlEntry.summaryHash,
+            ...(sqlEntry.sourceName!==undefined?{sourceName:sqlEntry.sourceName,sourceNameHash:sqlEntry.sourceNameHash}:{})};
+        }
+        archives.push(entry.summary&&!archiveIssues.has(ref)?renamedEntry(entry,b):entry.summary?entry:summaryEntry(entry,b));
       }
       // A fallback open or rename may remove a bad source from the live directory.
       for(const entry of previous?.archives||[])
@@ -527,7 +571,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       // Validate their own bytes before granting that authority, never via SQL fallback.
       try{
         const matchingBase=Boolean(fallback.pending&&sqlAvailable&&sqlSnapshot?.validated.value&&!sqlSnapshot.validated.error&&fallback.baseRev===sqlSnapshot.rev);
-        if(matchingBase)linkMirrors(sqlSnapshot.validated.value,idbValid.value);
+        if(matchingBase)linkMirrors(sqlSnapshot.validated.value,idbValid.value,true);
         if(branchProblem(idbValid.value)&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))throw Error('IndexedDB分岐の保存部品が不正です。');
         if(lazy&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))await verifySource(idbValid.value,'idb',matchingBase);
         seq=Math.max(seq,Number(fallback.rev)||0);
@@ -642,11 +686,11 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     for(const b of state.branches||[]){
       const old=previousBranches.get(b.id);
       const ref=isArchiveReference(b)?b:storedRefs.get(b);
-      if(old&&!repairIds.has(b.id)&&(branchCache.get(b)===old||refData.get(ref)?.sql===old)){branchParts.push(old.summary||archiveIssues.has(b)?old:summaryEntry(old,b));continue;}
+      if(old&&!repairIds.has(b.id)&&(branchCache.get(b)===old||refData.get(ref)?.sql===old)){branchParts.push(archiveIssues.has(b)?old:renamedEntry(old,b));continue;}
       const full=lazy?await readArchive(b):b;
       const json=JSON.stringify(full),hash=checksum(json);
       if(old&&!repairIds.has(b.id)&&!isArchiveReference(b)&&old.hash===hash&&old.size===json.length){
-        const entry=old.summary?old:summaryEntry(old,full);branchParts.push(entry);if(validator===cleanState)branchCache.set(b,entry);continue;
+        const entry=renamedEntry(old,full);branchParts.push(entry);if(validator===cleanState)branchCache.set(b,entry);continue;
       }
       const parts=splitChunks(json),bkeys=[];
       for(let i=0;i<parts.length;i++){
@@ -815,6 +859,21 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     }
     const dates=entries.filter(e=>automaticReason(e.reason)&&Number.isFinite(Number(e.at))&&Number(e.at)>0).map(e=>Number(e.at));
     return dates.length?Math.max(...dates):null;
+  }
+  // Only suppress duplicate points after validating the actual stored body.
+  async function hasMatchingAutomaticCheckpoint(state,now=Date.now()){
+    try{
+      const today=day(now);
+      for(const entry of await checkpointList()){
+        if(!automaticReason(entry.reason)||entry.scope!=='active'||day(entry.at)!==today||entry.chars!==state.body.length)continue;
+        try{
+          const restored=await loadCheckpoint(entry.id);
+          if(restored.activeBranch.id===state.activeBranch.id&&restored.body.length===state.body.length&&
+             checksum(restored.body)===checksum(state.body)&&restored.body===state.body)return true;
+        }catch{/* create a normal point instead */}
+      }
+    }catch{/* create a normal point instead */}
+    return false;
   }
   async function checkpoint(state,reason='操作前',{scope=lazy?'active':'full',branchId=null}={}){
     if(readOnly)throw Error('復旧中のため復元点を作成できません。');
@@ -1377,7 +1436,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},get mirrorStatus(){return mirrorStatus;},
     recoveryInfo:()=>({sqlite:sqlSnapshot?.validated.value?{title:sqlSnapshot.validated.value.title,chars:sqlSnapshot.validated.value.body.length,at:sqlSnapshot.validated.value.updatedAt,turns:sqlSnapshot.validated.value.turns.length}:null,idb:idbValid?.value?{title:idbValid.value.title,chars:idbValid.value.body.length,at:idbValid.value.updatedAt,turns:idbValid.value.turns.length}:null}),
     get canRebuildFromIdb(){return cleanIdb&&readOnly&&!recoveryRequired&&(sqliteCorrupt||rebuildPending);},
-    save,checkpoint,checkpoints,checkpointList,latestAutomaticCheckpointAt,loadCheckpoint,chooseRecovery,allowImportRecovery,rebuildFromIdb,rawDump,rawRowKeys,rawRowPage,rawBodySources,rawBodyText,purgeCorruptEvidence,materialize,compactState,
+    save,checkpoint,checkpoints,checkpointList,latestAutomaticCheckpointAt,hasMatchingAutomaticCheckpoint,renameStoredBranch,loadCheckpoint,chooseRecovery,allowImportRecovery,rebuildFromIdb,rawDump,rawRowKeys,rawRowPage,rawBodySources,rawBodyText,purgeCorruptEvidence,materialize,compactState,
     flush:()=>new Promise((resolve,reject)=>{
       if(!working&&queued===null)return resolve();
       const wait=()=>{

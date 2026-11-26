@@ -1,7 +1,7 @@
 import {makeRuntime} from './runtime.js';
 import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning,AUTO_CONTINUE_INPUT,editableTurnInput} from './logic.js';
 import {openStore} from './persistence.js';
-import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
+import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
 import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload,manualPageOffsets,manualPageName,serializeBackup} from './export.js';
 import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan} from './ui-flows.js';
 import './style.css';
@@ -24,7 +24,7 @@ async function ensurePeriodicCheckpoint(){
         periodicAt=await store.latestAutomaticCheckpointAt();
         periodicLoaded=true;
       }
-      if(periodicAt!==null&&new Date(periodicAt).toDateString()===new Date().toDateString())return;
+      if(periodicAt!==null&&new Date(periodicAt).toDateString()===new Date().toDateString()){periodicWarning='';return;}
       if(saveBlocked||busy||branchBusy||bodyBackupBusy||!state.body.length||document.visibilityState==='hidden')return;
       const snapshot=cleanState({...state,branches:[]}),epoch=recoveryEpoch;
       await store.checkpoint(snapshot,'日次自動復元点',{scope:'active'});
@@ -32,7 +32,7 @@ async function ensurePeriodicCheckpoint(){
       if(epoch===recoveryEpoch)bodyRecovery.seed(snapshot);
     }catch(e){
       periodicRetryAt=Date.now()+3600000;periodicLoaded=false;
-      periodicWarning='自動復元点の作成に失敗しました。1時間後に再試行します。';
+      periodicWarning='自動復元点の作成に失敗しました: '+String(e?.message||e)+'。1時間後に再試行します。';
     }
   })();
   try{await periodicTask;}finally{periodicTask=null;}
@@ -381,7 +381,8 @@ function rebuildSettings(){
       bodyEditBackup=(async()=>{
         let succeeded=false;
         try{
-          await store.checkpoint(plan.snapshot,plan.reason,{scope:'active'});
+          if(plan.large||!await store.hasMatchingAutomaticCheckpoint(plan.snapshot))
+            await store.checkpoint(plan.snapshot,plan.reason,{scope:'active'});
           if(plan.large)deletionWarning='本文を累積で大幅に削除しました。削除前の本文は重要復元点に保存されています。';
           pendingBodyEdit=text;
           renderBodyEditWarnings();
@@ -941,7 +942,7 @@ async function branchAction(action,id){
     if(await applyStoryChange(async s=>switchBranch(await store.materialize(s,id),id,{inheritLore:selection==='inherit'}),'分岐を切り替えました'))showMain();
   }else if(action==='rename'){
     const result=await textModal('分岐の名前を編集します。',found.name,{max:90,multiline:false});
-    if(result)await applyStoryChange(async s=>renameBranch(await store.materialize(s,id),id,result.text),'分岐名を変更しました');
+    if(result)await applyStoryChange(async s=>store.renameStoredBranch(s,id,result.text),'分岐名を変更しました');
   }else if(action==='delete'){
     if(await modal('保存されている分岐「'+found.name+'」を削除しますか？\n現在の分岐は削除しません。削除前の状態は復元点へ保存しますが、外部JSONバックアップも推奨します。')!=='yes')return;
     await applyStoryChange(s=>deleteInactiveBranch(s,id),'指定分岐を削除しました',{destructive:true,checkpointScope:'branch',branchId:id});
