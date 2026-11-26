@@ -199,3 +199,81 @@ test('restore and recovery hold the lock until completion or cancellation',async
   cancel('cancel');await recovery;
   assert.equal(c.branchBusy,false);assert.equal(c.state,h.original);
 });
+
+
+test('persistence details and rescue controls scroll with main instead of the sticky header',()=>{
+  const source=readFileSync(new URL('../src/main.js',import.meta.url),'utf8');
+  const css=readFileSync(new URL('../src/style.css',import.meta.url),'utf8');
+  const start=source.indexOf('function setup()');
+  const header=source.slice(source.indexOf('<header>',start),source.indexOf('</header>',start));
+  const main=source.slice(source.indexOf('<main>',start),source.indexOf('id="screen-main"',start));
+  assert.match(header,/id="status"/);
+  for(const id of ['safety','status-detail','recover-now','open-export-manual']){
+    assert.ok(!header.includes('id="'+id+'"'));
+    assert.ok(main.includes('id="'+id+'"'));
+  }
+  assert.match(css,/header \.status\.error\s*\{[^}]*-webkit-line-clamp:2/);
+  assert.match(css,/@media\(max-height:420px\)\{header\{position:static\}\}/);
+});
+
+test('critical status remains visible and full error details are retained outside header',()=>{
+  const source=readFileSync(new URL('../src/main.js',import.meta.url),'utf8');
+  const nodes={status:{},'status-detail':{}};
+  const c={el:id=>nodes[id],ready:true,saveBlocked:true,store:{recoveryRequired:true},notice:'',noticeError:false};
+  runInNewContext(source.slice(source.indexOf('function renderStatus('),source.indexOf('function safety('))+'\nthis.status=status;',c);
+  c.status('長いエラーの詳細',true);
+  assert.match(nodes.status.textContent,/衝突/);
+  assert.equal(nodes['status-detail'].textContent,'長いエラーの詳細');
+  assert.equal(nodes['status-detail'].hidden,false);
+  c.status('通常通知');
+  assert.match(nodes.status.textContent,/衝突/);
+  assert.equal(nodes['status-detail'].hidden,true);
+  c.saveBlocked=false;c.store.recoveryRequired=false;c.status('保存済み');
+  assert.equal(nodes.status.textContent,'保存済み');
+});
+
+test('integrity check locks before saving and never publishes old work results after reset',async()=>{
+  const source=readFileSync(new URL('../src/main.js',import.meta.url),'utf8');
+  const label={textContent:''},locks=[];
+  let resumeSave,finishCheck,checks=0;
+  const c={
+    ready:true,store:{checkArchive:()=>{checks++;return new Promise(resolve=>{finishCheck=resolve;});},archiveIssue:()=>false,markIntegrityChecked:async()=>1},
+    saveBlocked:false,busy:false,branchBusy:false,bodyBackupBusy:false,exporting:false,
+    document:{visibilityState:'visible'},state:{branches:[{id:'same-id'}]},recoveryEpoch:0,
+    bodyRecovery:{reset(){}},el:()=>label,lockUI:()=>locks.push(c.taskActive()),
+    saveNow:()=>new Promise(resolve=>{resumeSave=resolve;}),
+    showBranches(){},safety(){},checkArchivesManually,setTimeout
+  };
+  runInNewContext(source.slice(source.indexOf('function resetBodyRecovery('),source.indexOf('async function ensurePeriodicCheckpoint('))+
+    source.slice(source.indexOf('let integrityTask='),source.indexOf('let historyOffset='))+
+    '\nthis.run=runIntegrityCheck;this.reset=resetBodyRecovery;this.results=integrityResults;this.taskActive=()=>Boolean(integrityTask);',c);
+  c.results.set('same-id',{repairable:true});
+  const first=c.run();
+  assert.deepEqual(locks,[true]);assert.equal(resumeSave,undefined);
+  await Promise.resolve();assert.equal(typeof resumeSave,'function');
+  await c.run();assert.equal(checks,0);
+  c.reset();c.state={branches:[{id:'same-id'}]};resumeSave(true);await first;
+  assert.equal(c.results.size,0);assert.equal(checks,0);assert.match(label.textContent,/必要な時だけ/);
+  const second=c.run();await Promise.resolve();resumeSave(true);
+  for(let i=0;i<20&&!finishCheck;i++)await Promise.resolve();
+  assert.equal(typeof finishCheck,'function');
+  c.reset();c.state={branches:[{id:'same-id'}]};
+  finishCheck({sql:'ok',idb:'missing',repairable:true});await second;
+  assert.equal(c.results.size,0);assert.match(label.textContent,/必要な時だけ/);
+  assert.equal(c.taskActive(),false);assert.equal(locks.at(-1),false);
+});
+
+test('history reset supplies its own checkpoint reason without changing other defaults',async()=>{
+  const source=readFileSync(new URL('../src/main.js',import.meta.url),'utf8');
+  const reasons=[];
+  const c={ready:true,busy:false,branchBusy:false,bodyBackupBusy:false,saveBlocked:false,
+    state:{activeBranch:{id:'active'},body:'body'},candidate:null,editRev:0,historyOffset:0,fullBody:false,
+    lockUI(){},commitPendingBodyEdit(){},beforeDestructive:async(reason,opts)=>{reasons.push([reason,opts.checkpoint]);return true;},
+    saveNow:async()=>true,paint(){},status(){}};
+  runInNewContext(source.slice(source.indexOf('async function applyStoryChange('),source.indexOf('async function actOnTurn('))+'\nthis.change=applyStoryChange;',c);
+  await c.change(s=>({...s}),'履歴',{destructive:true,checkpointReason:'履歴リセット前'});
+  await c.change(s=>({...s}),'分岐',{destructive:true});
+  await c.change(s=>({...s}),'削除',{destructive:true,checkpointScope:'branch'});
+  assert.deepEqual(reasons,[['履歴リセット前',true],['分岐操作',true],['分岐削除前',true]]);
+  assert.ok(source.includes("clearHistoryAgainstBody(s),'本文を保持して履歴をリセットしました。',{destructive:true,checkpointReason:'履歴リセット前'}"));
+});

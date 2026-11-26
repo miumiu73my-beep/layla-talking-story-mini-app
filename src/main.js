@@ -9,12 +9,15 @@ import './style.css';
 const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getElementById(id);
 const node=(tag,cls,value)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=value;return e;};
 let state=freshState(),store=null,ready=false,saveBlocked=true,busy=false,stream=null,activeId=0;
-let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning='',notice='',lastAcceptedMessage='';
+let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning='',notice='',noticeError=false,lastAcceptedMessage='';
 let lastExport=null,exporting=false,pendingBodyEdit=null,bodyEditTimer=null,bodyEditBackup=null,replacementSaving=false;
 let deletionWarning='',historyWarning='';
 const bodyRecovery=makeBodyRecovery();
 let periodicAt=null,periodicTask=null,periodicWarning='',recoveryEpoch=0,periodicLoaded=false,periodicRetryAt=0;
-function resetBodyRecovery(){bodyRecovery.reset();recoveryEpoch++;}
+function resetBodyRecovery(){
+  bodyRecovery.reset();recoveryEpoch++;integrityEpoch++;integrityResults.clear();
+  const label=el('integrity-status');if(label)label.textContent=INTEGRITY_HINT;
+}
 async function ensurePeriodicCheckpoint(){
   if(!ready||!store||saveBlocked||busy||branchBusy||bodyBackupBusy||!state.body.length||document.visibilityState==='hidden')return;
   if(periodicTask||Date.now()<periodicRetryAt)return;
@@ -37,38 +40,45 @@ async function ensurePeriodicCheckpoint(){
   })();
   try{await periodicTask;}finally{periodicTask=null;}
 }
-let integrityTask=null;
+let integrityTask=null,integrityEpoch=0;
+const INTEGRITY_HINT='分岐の全文を読み込むため、必要な時だけ手動でチェックします。中断した場合は手動で再実行してください。';
 const integrityLabels={ok:'正常',damaged:'破損',missing:'なし',omitted:'容量制限で省略',retry:'一時エラー',unavailable:'利用不可',unsaved:'未保存'};
 const integrityResults=new Map();
 function integrityIdle(){return ready&&store&&!saveBlocked&&!busy&&!branchBusy&&!bodyBackupBusy&&!exporting&&document.visibilityState!=='hidden';}
 async function runIntegrityCheck(){
   if(integrityTask||!integrityIdle())return;
-  integrityTask=(async()=>{
+  const workEpoch=integrityEpoch,epoch=recoveryEpoch;
+  const sameWork=()=>workEpoch===integrityEpoch;
+  // Defer even the initial save until the task is registered and the UI locked.
+  integrityTask=Promise.resolve().then(async()=>{
     const label=el('integrity-status');
+    const report=text=>{if(sameWork())label.textContent=text;};
     try{
+      if(!sameWork()||!integrityIdle())return;
+      report('整合性チェックの準備中…');
       if(!await saveNow())throw Error('整合性チェック前の保存に失敗しました。');
-      if(!integrityIdle()){label.textContent='整合性チェックを中断しました。手動で再実行してください。';return;}
-      const branches=state.branches.slice(),epoch=recoveryEpoch;
+      if(!sameWork()||epoch!==recoveryEpoch||!integrityIdle()){report('整合性チェックを中断しました。手動で再実行してください。');return;}
+      const branches=state.branches.slice();
       let checked=0,issues=0,retry=false;
-      const isCurrent=()=>integrityIdle()&&epoch===recoveryEpoch&&branches.length===state.branches.length&&branches.every((b,i)=>state.branches[i]===b);
+      const isCurrent=()=>sameWork()&&integrityIdle()&&epoch===recoveryEpoch&&branches.length===state.branches.length&&branches.every((b,i)=>state.branches[i]===b);
       const complete=await checkArchivesManually(branches,{
         isCurrent,check:b=>store.checkArchive(b),
         onResult:(b,r,index,total)=>{
           integrityResults.set(b.id,r);
           if(r.sql==='retry'||r.idb==='retry')retry=true;
           if(store.archiveIssue(b)||r.repairable)issues++;
-          checked=index;label.textContent='整合性チェック '+index+' / '+total+' 件';
+          checked=index;report('整合性チェック '+index+' / '+total+' 件');
           showBranches();safety();lockUI();
         },
         pause:()=>new Promise(resolve=>setTimeout(resolve,30))
       });
-      if(!complete){label.textContent='整合性チェックを中断しました。手動で再実行してください。';return;}
-      if(retry){label.textContent='一時エラーあり。時間をおいて手動で再実行してください。';return;}
+      if(!complete||!isCurrent()){report('整合性チェックを中断しました。手動で再実行してください。');return;}
+      if(retry){report('一時エラーあり。時間をおいて手動で再実行してください。');return;}
       const at=await store.markIntegrityChecked();
-      if(!isCurrent()){label.textContent='作品が変更されました。手動で再チェックしてください。';return;}
-      label.textContent='最終チェック：'+new Date(at).toLocaleString('ja-JP')+'／'+checked+'件中 '+issues+'件要確認。修復は分岐一覧から実行できます。';
-    }catch(e){label.textContent='チェック失敗：'+e.message+'。手動で再試行してください。';}
-  })();
+      if(!isCurrent()){report('作品が変更されました。手動で再チェックしてください。');return;}
+      report('最終チェック：'+new Date(at).toLocaleString('ja-JP')+'／'+checked+'件中 '+issues+'件要確認。修復は分岐一覧から実行できます。');
+    }catch(e){report('チェック失敗：'+e.message+'。手動で再試行してください。');}
+  });
   lockUI();
   try{await integrityTask;}finally{integrityTask=null;lockUI();}
 }
@@ -76,9 +86,17 @@ let historyOffset=0,branchBusy=false,bodyBackupBusy=false,editRev=0,savedRev=0,s
 let activeGenerationFinished=null,stopUnconfirmed=false,streamSaveInFlight=false;
 const HISTORY_PAGE_SIZE=30;
 const promptDraft=()=>state.draft.trim()||AUTO_CONTINUE_INPUT;
+function renderStatus(){
+  const critical=ready&&(saveBlocked||Boolean(store?.recoveryRequired));
+  const message=critical?(store?.recoveryRequired?'保存データの衝突：画面上部で復旧元を選択してください。':'保存停止中：画面上部の警告・救出方法を確認してください。'):notice;
+  const error=critical||noticeError;
+  const e=el('status');
+  if(e){if(e.textContent!==message)e.textContent=message;e.className='status'+(error?' error':'');}
+  const detail=el('status-detail');
+  if(detail){detail.hidden=!noticeError||!notice;if(detail.textContent!==notice)detail.textContent=noticeError?notice:'';}
+}
 function status(text,error=false){
-  notice=text||'';
-  const e=el('status');if(e){e.textContent=notice;e.className='status'+(error?' error':'');}
+  notice=text||'';noticeError=error;renderStatus();
 }
 function safety(text=''){
   if(store?.readOnly)saveBlocked=true;
@@ -91,6 +109,7 @@ function safety(text=''){
   n.hidden=!problem&&!warnings.length;
   n.textContent=[problem,...warnings].filter(Boolean).join('／');
   n.className='safety'+(problem?' error':'');
+  if(ready)renderStatus();
 }
 function lockUI(){
   if(store?.readOnly)saveBlocked=true;
@@ -884,13 +903,13 @@ function textModal(question,initial,{max=15000,multiline=true,options=[['save','
     editor.focus();
   });
 }
-async function applyStoryChange(transform,note,{destructive=false,checkpointScope,branchId}={}){
+async function applyStoryChange(transform,note,{destructive=false,checkpointScope,branchId,checkpointReason}={}){
   if(!ready||busy||branchBusy||bodyBackupBusy||saveBlocked)return false;
   branchBusy=true;lockUI();
   commitPendingBodyEdit();
   const original=state,oldCandidate=candidate;
   try{
-    if(!await beforeDestructive(checkpointScope==='branch'?'分岐削除前':'分岐操作',{checkpoint:destructive,scope:checkpointScope,branchId}))return false;
+    if(!await beforeDestructive(checkpointReason??(checkpointScope==='branch'?'分岐削除前':'分岐操作'),{checkpoint:destructive,scope:checkpointScope,branchId}))return false;
     const changed=await transform(original);
     if(!changed||typeof changed!=='object')throw Error('変更後の状態が不正です。');
     if(changed.activeBranch.id!==original.activeBranch.id)resetBodyRecovery();
@@ -997,8 +1016,8 @@ async function branchAction(action,id){
 function setup(){
   app.innerHTML=
     '<header><div class="bar"><img class="logo" src="./icon.jpg" alt="緑の時計"><div class="titles"><div class="subtitle">LAYLA MINI-APP · LOCAL STORY</div><div class="brand" id="title-view">新しい物語</div></div><span class="badge">物語</span></div>'+
-    '<div id="status" class="status" role="status" aria-live="polite">データ読み込み中…</div><button id="recover-now" hidden class="small warn">復旧元を選択</button><button id="open-export-manual" hidden class="small ghost">共有できない場合：手動で救出</button><div id="safety" class="safety error" role="alert">初期化中</div></header>'+
-    '<main><div id="screen-main">'+
+    '<div id="status" class="status" role="status" aria-live="polite">データ読み込み中…</div></header>'+
+    '<main><div id="status-detail" class="safety error" hidden></div><div id="safety" class="safety error" role="alert">初期化中</div><button id="recover-now" hidden class="small warn">復旧元を選択</button><button id="open-export-manual" hidden class="small ghost">共有できない場合：手動で救出</button><div id="screen-main">'+
     '<section class="panel"><div class="split" style="justify-content:space-between"><h2>確定した物語</h2><span class="mini" id="counter"></span></div><p id="meta" class="hint"></p><div class="story" id="body-view"></div><div class="actions"><button id="view-full">全文を表示</button><button id="jump-bottom">入力欄へ移動</button><button id="undo">直前のターンを取り消す</button></div></section>'+
     '<section class="panel" id="prompt-section"><h2>あなたの台詞・行動</h2><p class="hint">本人が話す台詞・取る行動、次の場面の希望を記入してください。</p><textarea id="user-input" rows="5" maxlength="15000" placeholder="例：『おはよう』と笑って、隣に座る。"></textarea><p id="input-warning" class="safety" role="alert" hidden></p><div class="actions"><button id="generate" class="primary">続きを生成</button><button id="stop" class="warn" disabled>生成停止</button></div><div id="candidate-box" hidden><label for="candidate-edit">未採用の候補（編集可能）</label><textarea id="candidate-edit" rows="9"></textarea><p id="candidate-status" class="hint"></p><div class="actions"><button id="accept" class="primary">この文章を採用</button><button id="retry">もう一度生成</button><button id="discard" class="warn">破棄</button></div></div></section>'+
     '<section class="panel" id="history-section"><details><summary>会話履歴を編集・再生成・巻き戻す</summary><p class="hint">本文の軽い手直しでは履歴位置を自動補正します。複数ターンを一度に書き換えた場合は、復元点作成後に履歴をリセットできます。</p><button id="reset-history" class="small warn">本文を保持して履歴だけ再設定</button><div class="history-toolbar"><button id="turn-older" class="small ghost">前の30件</button><span id="turn-range" class="hint"></span><button id="turn-newer" class="small ghost">次の30件</button></div><div class="history-toolbar"><label for="turn-number">ターン番号</label><input id="turn-number" type="number" inputmode="numeric" min="1" placeholder="番号"><button id="turn-go" class="small ghost">移動</button><button id="turn-start" class="small warn">第1ターンの前に戻す</button></div><div id="turn-log" class="history-log"></div></details></section><section class="panel" id="branches-section"><h2>ストーリー分岐</h2><p class="hint">元の展開はここからいつでも開けます。分岐ごとの本文・設定・記憶・下書きを保存します。</p><strong id="branch-current"></strong><p id="branch-count" class="hint"></p><div id="branch-list"></div></section></div>'+
@@ -1006,7 +1025,7 @@ function setup(){
     '<section class="panel"><h2>生成設定</h2><div id="preference-fields"></div><p class="hint" id="prompt-meta"></p></section>'+
     '<section class="panel"><h2>確定本文の編集</h2><p class="hint">ここが正本です。長編の場合は編集前にJSONをバックアップしてください。</p><p id="edit-count" class="hint"></p><p id="edit-warning" class="safety" hidden>本文を大きく削除しました。誤操作であれば、直ちに「直前の状態を復元」を利用してください。</p><textarea id="edit-body" class="long" rows="12"></textarea></section>'+
     '<section class="panel"><h2>返信のごみ箱</h2><p class="hint">直近20件まで（合計150万文字目安。超過時は古い返信から整理）。復元は未採用候補として行い、現在の本文を上書きしません。</p><div id="reply-trash"></div></section>'+
-    '<section class="panel"><h2>バックアップ・復元</h2><div class="actions"><button id="check-integrity">分岐の整合性チェック</button><button id="rescue-unsaved">未保存編集の救出JSON</button></div><p id="integrity-status" class="hint">分岐の全文を読み込むため、必要な時だけ手動でチェックします。中断した場合は手動で再実行してください。</p><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-main-json">本編のみJSON（分岐なし）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む（分割は全ページ）</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-body">SQLite本編TXT救出</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button><button id="purge-corrupt" class="warn">古い破損データを削除</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" multiple hidden></section></div>'+
+    '<section class="panel"><h2>バックアップ・復元</h2><div class="actions"><button id="check-integrity">分岐の整合性チェック</button><button id="rescue-unsaved">未保存編集の救出JSON</button></div><p id="integrity-status" class="hint">'+INTEGRITY_HINT+'</p><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-main-json">本編のみJSON（分岐なし）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む（分割は全ページ）</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-body">SQLite本編TXT救出</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button><button id="purge-corrupt" class="warn">古い破損データを削除</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" multiple hidden></section></div>'+
     '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p id="manual-page" class="hint"></p><p class="hint">コピー・ページの保存・通常ブラウザでのダウンロードが可能です。分割JSONは全ページを順番に連結してから読み込んでください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="manual-prev">前のページ</button><button id="manual-next">次のページ</button><button id="copy-manual">このページをコピー</button><button id="save-manual-page">このページをファイル保存</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
     '</main><nav class="nav"><button class="primary" id="nav-main">本文へ戻る</button><button id="nav-settings">設定</button><button id="quick-backup">JSON保存</button></nav>'+
     '<div id="modal" class="overlay" hidden role="dialog" aria-modal="true"><div class="modal-card"><p id="modal-content"></p><div id="modal-buttons" class="actions"></div></div></div>';
@@ -1047,7 +1066,7 @@ function setup(){
   el('reset-history').onclick=async()=>{
     if(!state.turns.length)return;
     if(await modal('現在の本文は保持し、送信履歴だけ削除します。元の履歴は復元点に保存します。続行しますか？')!=='yes')return;
-    if(await applyStoryChange(s=>clearHistoryAgainstBody(s),'本文を保持して履歴をリセットしました。',{destructive:true}))rebuildSettings();
+    if(await applyStoryChange(s=>clearHistoryAgainstBody(s),'本文を保持して履歴をリセットしました。',{destructive:true,checkpointReason:'履歴リセット前'}))rebuildSettings();
   };
   el('check-integrity').onclick=()=>void runIntegrityCheck();
   el('rescue-unsaved').onclick=async()=>{
