@@ -55,12 +55,34 @@ export function utf8ByteLength(text){
   return n;
 }
 export const MANUAL_EXPORT_LIMIT=250000;
+export const MANUAL_PAGE_SIZE=200000;
 export function manualExportPayload(text,result){
-  return (result.kind==='manual'||result.kind==='unconfirmed')&&text.length<=MANUAL_EXPORT_LIMIT?text:null;
+  return (result.kind==='manual'||result.kind==='unconfirmed')?text:null;
+}
+// Store just offsets, not a second array of copied text. Never split a surrogate pair.
+export function manualPageOffsets(text,limit=MANUAL_PAGE_SIZE){
+  if(!Number.isSafeInteger(limit)||limit<2)throw Error('Invalid export page size');
+  const offsets=[0];
+  for(let start=0;start<text.length;){
+    let end=Math.min(text.length,start+limit);
+    if(end<text.length&&/[\uD800-\uDBFF]/.test(text[end-1])&&/[\uDC00-\uDFFF]/.test(text[end]))end--;
+    offsets.push(end);start=end;
+  }
+  if(offsets.length===1)offsets.push(0);
+  return offsets;
+}
+export function manualPageName(name,index,total){
+  if(total===1)return name;
+  const width=String(total).length;
+  // All multipart data are raw text fragments, not independently importable JSON.
+  return name+'.part-'+String(index+1).padStart(width,'0')+'-of-'+total+'.txt';
 }
 export async function writeFile(host,name,text,mime){
   const fallback=()=>text.length<=MANUAL_EXPORT_LIMIT?{text,name,mime}:{name,mime};
   let reason='';
+  // Avoid sending large strings through the native Base64 bridge or a second
+  // full-size Blob. The user can save each exact fragment independently.
+  if(text.length>MANUAL_EXPORT_LIMIT)return {kind:'manual',message:'大容量のため分割救出を使用します。各ページを順番に保存してください。',...fallback()};
   if(typeof host?.utils?.saveFile==='function'){
     try{
       const r=await host.utils.saveFile(name,utf8ToBase64(text),true);
