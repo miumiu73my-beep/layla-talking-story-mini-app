@@ -416,7 +416,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
           Number.isSafeInteger(sqlEntry.size)&&archiveUnits+sqlEntry.size>MIRROR_ARCHIVE_LIMIT&&
           !damagedEntries.has(sqlEntry)&&!archiveIssues.has(ref));
         if(omit)entry={id:b.id,missing:true,omitted:true,hash:sqlEntry.hash,size:sqlEntry.size};
-        else if(header.pending&&existing?.omitted&&sqlEntry?.hash===existing.hash&&!repairIds.has(b.id))entry=existing;
+        else if(header.pending&&existing?.omitted&&(!sqlEntry||(sqlEntry.hash===existing.hash&&sqlEntry.size===existing.size))&&!repairIds.has(b.id))entry=existing;
         else if(!repairIds.has(b.id)&&existing?.missing&&!existing.omitted&&known?.sql!=='ok')entry=existing;
         else if(!repairIds.has(b.id)&&!existing&&archiveIssues.has(ref)&&known?.sql!=='ok'&&original){
           entry={id:b.id,missing:true,hash:original.hash,size:original.size};
@@ -535,6 +535,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     }
   }
   const omittedCount=idbLatest?.archives?.filter(e=>e.omitted).length||0;
+  if(!idb)mirrorStatus='IndexedDBミラーなし。外部JSONバックアップを推奨します。';
   if(omittedCount)mirrorStatus='IndexedDBミラーは容量制限で分岐 '+omittedCount+' 件を省略しています。省略分岐はSQLite利用時のみ閲覧できます。';
   const cleanIdb=Boolean(idbValid?.value&&!idbValid.error);
   if(cleanIdb&&!sqlSnapshot?.validated.error)linkMirrors(sqlSnapshot?.validated.value,idbValid.value);
@@ -565,6 +566,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   // synchronized mirror after a conflicting SQLite revision.
   if(fallback?.pending&&omittedCount&&idbValid?.error&&sqlSnapshot?.validated.value){
     readOnly=true;
+    // Display pending root for export; the authoritative SQLite stays intact.
+    if(idbValid.value)preferred=idbValid.value;
     mirrorStatus='未同期IndexedDBとSQLiteを安全に照合できません。上書きを停止しました。未保存編集の救出JSON・外部バックアップを利用してください。';
     notify(mirrorStatus,true);
   }
@@ -699,7 +702,9 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   }
   async function commit(state){
     if(readOnly)throw Error('読み取り専用です。復旧元を確認するかJSONバックアップを利用してください。');
-    const saved={state,rev:seq+1,at:Date.now(),baseRev:sqlInitialized&&!sqlRetryBlocked?(manifest?.rev||0):null,pending:true};
+    const saved={state,rev:seq+1,at:Date.now(),baseRev:sqlInitialized&&!sqlRetryBlocked&&manifest?manifest.rev||0:
+      idbLatest?.archives?.some(e=>e.omitted)?(idbLatest.pending?idbLatest.baseRev:idbLatest.rev):
+      sqlInitialized&&!sqlRetryBlocked?0:null,pending:true};
     if(!sqlAvailable&&!sqliteCorrupt&&sqlInitialized&&!sqlRetryBlocked&&
        typeof sql==='function'&&Date.now()>=nextSqlRetry){
       try{
