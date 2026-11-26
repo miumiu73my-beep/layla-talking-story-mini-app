@@ -1,8 +1,9 @@
 import {makeRuntime} from './runtime.js';
-import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning,AUTO_CONTINUE_INPUT,editableTurnInput} from './logic.js';
+import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning,AUTO_CONTINUE_INPUT,editableTurnInput} from './logic.js';
 import {openStore} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
 import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload,manualPageOffsets,manualPageName,serializeBackup} from './export.js';
+import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan} from './ui-flows.js';
 import './style.css';
 
 const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getElementById(id);
@@ -579,16 +580,8 @@ function stopGeneration(){
   try{stream?.abort();}catch(e){status('停止指示のエラー: '+String(e.message||e),true);}
   stopUntil=generationStarted?requestedAt+5000:0; // Ignore late stream callbacks and earlier stop confirmations.
   busy=false;stream=null;lockUI();
-  let retryFallbackWasUsed=false;
-  if(!candidate?.text?.trim()){
-    retryFallbackWasUsed=Boolean(retryFallback?.text?.trim());
-    candidate=retryFallbackWasUsed?retryFallback:null;
-  }
+  candidate=stoppedCandidate(candidate,retryFallback);
   retryFallback=null;
-  if(candidate){
-    if(retryFallbackWasUsed)candidate.note=(candidate.note||'')+'／再生成を停止して前の候補に戻しました。';
-    else candidate.note='停止しました。途中までの文章を採用するか編集できます。';
-  }
   state.pendingCandidate=candidate;showCandidate();persist(0);
   if(typeof activeStop==='function'){const cancel=activeStop;activeStop=null;cancel();}
   if(!generationStarted){
@@ -596,18 +589,12 @@ function stopGeneration(){
     status('生成開始前に停止しました。');return;
   }
   status('停止指示を送信しました。Laylaの終了応答を確認中です。');
-  let released=false;
-  const release=confirmed=>{
-    if(released||stopMarker!==activeId)return;
-    released=true;stopUntil=0;activeGenerationFinished=null;
+  waitForStop({finalizing,requestedAt,isCurrent:()=>stopMarker===activeId,onRelease:confirmed=>{
+    stopUntil=0;activeGenerationFinished=null;
     stopUnconfirmed=!confirmed;lockUI();
     status(confirmed?'Laylaから生成終了の応答を確認しました。':
       '停止完了を確認できませんでした。モデルが推論中の可能性があります。再生成には確認が必要です。',!confirmed);
-  };
-  if(finalizing){
-    Promise.resolve(finalizing).then(()=>setTimeout(()=>release(true),Math.max(0,requestedAt+750-Date.now())));
-  }
-  setTimeout(()=>release(false),5000);
+  }});
 }
 function clearManualExport(){
   lastExport=null;el('manual-text').value='';el('manual-export').hidden=true;
@@ -648,10 +635,9 @@ async function exportAs(ext){
   try{
     while(bodyEditBackup)await bodyEditBackup;
     commitPendingBodyEdit();
-    const light=ext==='compact-json',mainOnly=ext==='main-json',json=light||mainOnly||ext==='json';
     const snapshot=cleanState(state);
-    const branchChars=snapshot.branches.reduce((n,b)=>n+(b.chars??b.body?.length??0),0);
-    if((light||ext==='json')&&branchChars+snapshot.body.length>5000000){
+    const {light,mainOnly,json,large,mime,suffix}=exportPlan(ext,snapshot);
+    if(large){
       const choice=await modal('分岐を含む大きなバックアップです。端末のメモリを多く使う場合があります。本編のみJSONも選べます。',[['yes','分岐込みで続行'],['main','本編のみJSON'],['no','キャンセル']]);
       if(choice==='main'){exporting=false;lockUI();return await exportAs('main-json');}
       if(choice!=='yes')return;
@@ -664,8 +650,7 @@ async function exportAs(ext){
       backupSizeWarning='50MB超のJSONは再読み込みできないため書き出しを中止しました。軽量JSONまたは本編のみJSONを利用してください。';
       content=null;safety();status(backupSizeWarning,true);return;
     }
-    const name=filename(snapshot.title,json?'json':ext,new Date(),light?'_軽量分岐':mainOnly?'_本編のみ':'');
-    const mime=json?'application/json':ext==='md'?'text/markdown':'text/plain';
+    const name=filename(snapshot.title,json?'json':ext,new Date(),suffix);
     const result=await writeFile(host,name,content,mime);
     presentExport(name,content,mime,result);
     if(json&&result.kind==='share'){backupSizeWarning='';safety();}
@@ -686,22 +671,20 @@ async function beforeDestructive(action,{checkpoint=true,scope,branchId}={}){
 }
 async function handleImport(file){
   if(!file||!ready||busy||branchBusy||bodyBackupBusy||exporting)return;
+  branchBusy=true;lockUI();
   try{
-    if(!store||(!store.hasStorage&&!store.corrupt))throw Error('保存先がありません。ファイルを読み込めません。既存の作品は変更していません。保存先を復旧してから再試行してください。');
-    if(file.size>TRANSFER_MAX_BYTES)throw Error('50MB以下のファイルを選んでください。');
-    const parsed=parseImport(file.name,await file.text(),state);
-    const type=parsed.full?'設定・記憶・本文・履歴すべて':'本文と履歴のみ';
-    if(await modal(file.name+' を読み込みます。置換対象: '+type+'。事前に外部JSONバックアップを取っていますか？')!=='yes')return;
-    if(saveBlocked){
-      if(store?.recoveryRequired)throw Error('先に復旧元を選択してください。');
-      if(await modal('現在の保存先は読み取り専用です。既存の異常データが残る場合があります。外部バックアップを確認した上で復旧を許可しますか？')!=='yes')return;
-      await store.allowImportRecovery();saveBlocked=false;
-    }else if(!await beforeDestructive('import'))return;
-    resetBodyRecovery();state=parsed.state;state.updatedAt=new Date().toISOString();
-    candidate=state.pendingCandidate;fullBody=false;paint();rebuildSettings();
-    editRev++;if(await saveNow(true))status('ファイルを読み込み保存しました。');
-    else status('読み込みましたが保存に失敗しました。外部JSONへ書き出してください。',true);
+    while(bodyEditBackup)await bodyEditBackup;
+    commitPendingBodyEdit();
+    await runImport(file,{store,getState:()=>state,isSaveBlocked:()=>saveBlocked||Boolean(store?.readOnly),modal,beforeDestructive,
+      unlockRecovery:()=>{saveBlocked=false;},
+      apply:async next=>{
+        resetBodyRecovery();state=next;state.updatedAt=new Date().toISOString();
+        candidate=state.pendingCandidate;fullBody=false;paint();rebuildSettings();
+        editRev++;if(await saveNow(true))status('ファイルを読み込み保存しました。');
+        else status('読み込みましたが保存に失敗しました。外部JSONへ書き出してください。',true);
+      }});
   }catch(e){status('読み込みに失敗しました: '+String(e.message||e),true);}
+  finally{branchBusy=false;lockUI();}
 }
 async function resetStory(){
   if(!ready||busy||bodyBackupBusy||saveBlocked)return;
@@ -916,14 +899,8 @@ async function actOnTurn(index,action){
     return;
   }
   if(action==='regenerate'){
-    const latest=index===state.turns.length-1;
-    const explanation=latest?'直前の返信はごみ箱へ移し、分岐を増やさず再生成します。未採用候補もごみ箱に移ります。入力途中の下書きは入力欄に残し、元のターンの入力で再生成します。':'元のストーリー全体は別の分岐に残し、選択ターンの前から再生成します。';
-    if(await modal('第'+(index+1)+'ターンの返信を再生成します。\n'+explanation)!=='yes')return;
-    const input=turn.user;
-    const preserveDraft=latest&&state.draft.length>0;
-    if(await applyStoryChange(s=>regenerateAt(s,index),latest?'直前の返信をごみ箱へ移しました。':'再生成用の分岐を作成しました')){
-      showMain({scroll:false});el('prompt-section').scrollIntoView({block:'start'});await startGeneration({inputOverride:input,preserveDraft});
-    }
+    await regenerateTurn({index,turn,state,modal,applyStoryChange,regenerateAt,showMain,
+      scrollPrompt:()=>el('prompt-section').scrollIntoView({block:'start'}),startGeneration});
     return;
   }
   if(action==='undo'){
