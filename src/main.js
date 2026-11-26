@@ -613,13 +613,18 @@ function clearManualExport(){
   lastExport=null;el('manual-text').value='';el('manual-export').hidden=true;
   el('manual-name').textContent='';el('open-export-manual').hidden=true;
 }
+function currentManualPage(){
+  if(!lastExport)return '';
+  const {text,offsets,index}=lastExport;
+  return text.slice(offsets[index],offsets[index+1]);
+}
 function showManualExport(scroll=true){
   if(!lastExport)return;
   const {name,text,mime,warning,offsets,index}=lastExport,total=offsets.length-1;
   el('manual-export').hidden=false;
   el('manual-name').textContent=name+(warning?'／'+warning:'');
   el('manual-page').textContent=(index+1)+' / '+total+' ページ'+(total>1?'（すべて順番どおり、区切り文字を足さず連結してください）':'');
-  el('manual-text').value=text.slice(offsets[index],offsets[index+1]);
+  el('manual-text').value=currentManualPage();
   el('manual-prev').disabled=index===0;
   el('manual-next').disabled=index===total-1;
   el('download-manual').dataset.name=manualPageName(name,index,total);
@@ -1048,7 +1053,7 @@ function setup(){
     const button=el('save-manual-page');
     if(button.disabled)return;
     const name=el('download-manual').dataset.name,mime=el('download-manual').dataset.mime;
-    const text=el('manual-text').value;
+    const text=currentManualPage();
     button.disabled=true;
     try{const result=await writeFile(host,name,text,mime);status(result.message,result.kind==='manual'||result.kind==='unconfirmed');}
     catch(e){status('ページ保存失敗：'+e.message,true);}
@@ -1057,13 +1062,13 @@ function setup(){
   el('download-manual').onclick=()=>{
     const name=el('download-manual').dataset.name||'story.txt';
     const mime=el('download-manual').dataset.mime||'text/plain';
-    const blob=new Blob([el('manual-text').value],{type:mime+';charset=utf-8'});
+    const blob=new Blob([currentManualPage()],{type:mime+';charset=utf-8'});
     if(browserDownload(name,blob))status('ブラウザにダウンロードを指示しました。実際の保存を確認してください。');
     else status('この環境ではダウンロードできません。コピーで救出してください。',true);
   };
   el('copy-manual').onclick=async()=>{
     const area=el('manual-text');area.focus();area.select();
-    try{await navigator.clipboard.writeText(area.value);status('コピーしました。ファイルに保存してください。');}
+    try{await navigator.clipboard.writeText(currentManualPage());status('コピーしました。ファイルに保存してください。');}
     catch{status('テキストを選択しました。コピー操作をしてください。',true);}
   };
   document.addEventListener('visibilitychange',()=>{
