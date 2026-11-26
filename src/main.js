@@ -10,7 +10,7 @@ const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getE
 const node=(tag,cls,value)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=value;return e;};
 let state=freshState(),store=null,ready=false,saveBlocked=true,busy=false,stream=null,activeId=0;
 let candidate=null,saveTimer=null,fullBody=false,saveError='',backupSizeWarning='',notice='',lastAcceptedMessage='';
-let lastExport=null,exporting=false,pendingBodyEdit=null,bodyEditTimer=null,bodyEditBackup=null;
+let lastExport=null,exporting=false,pendingBodyEdit=null,bodyEditTimer=null,bodyEditBackup=null,replacementSaving=false;
 let deletionWarning='',historyWarning='';
 const bodyRecovery=makeBodyRecovery();
 let periodicAt=null,periodicTask=null,periodicWarning='',recoveryEpoch=0,periodicLoaded=false,periodicRetryAt=0;
@@ -101,8 +101,8 @@ function lockUI(){
   el('nav-settings').disabled=!ready||busy||branchBusy||bodyBackupBusy;
   el('nav-main').disabled=!ready||branchBusy||bodyBackupBusy;
   el('import').disabled=!ready||busy||branchBusy||bodyBackupBusy||exporting||Boolean(store?.recoveryRequired);
-  if(el('recover'))el('recover').disabled=!ready||exporting||branchBusy||!store?.recoveryRequired;
-  if(el('recover-now')){el('recover-now').hidden=!store?.recoveryRequired;el('recover-now').disabled=!ready||busy||exporting||branchBusy;}
+  if(el('recover'))el('recover').disabled=!ready||busy||exporting||branchBusy||bodyBackupBusy||!store?.recoveryRequired;
+  if(el('recover-now')){el('recover-now').hidden=!store?.recoveryRequired;el('recover-now').disabled=!ready||busy||exporting||branchBusy||bodyBackupBusy;}
   if(el('raw-backup'))el('raw-backup').disabled=!ready||branchBusy||exporting;
   if(el('raw-body'))el('raw-body').disabled=!ready||busy||branchBusy||exporting||bodyBackupBusy;
   if(el('purge-corrupt'))el('purge-corrupt').disabled=disabled||exporting||store?.mode()!=='SQLite';
@@ -704,6 +704,22 @@ async function handleImport(file){
   }catch(e){status('読み込みに失敗しました: '+String(e.message||e),true);}
   finally{branchBusy=false;lockUI();}
 }
+// Keep the last saved work visible until the replacement has been saved.
+async function saveStoryReplacement(next){
+  const original=state,oldCandidate=candidate,originalRev=editRev;
+  let saved=false;
+  replacementSaving=true;
+  try{
+    state=next;candidate=state.pendingCandidate;editRev++;
+    saved=await saveNow(true);
+    return saved;
+  }finally{
+    if(!saved){state=original;candidate=oldCandidate;editRev=originalRev;}
+    replacementSaving=false;
+    if(saved){resetBodyRecovery();fullBody=false;historyOffset=0;}
+    paint();rebuildSettings();
+  }
+}
 async function resetStory(){
   if(!ready||busy||branchBusy||bodyBackupBusy||saveBlocked||exporting)return;
   branchBusy=true;lockUI();
@@ -712,12 +728,16 @@ async function resetStory(){
     while(bodyEditBackup)await bodyEditBackup;
     commitPendingBodyEdit();
     if(!await beforeDestructive('reset'))return;
-    resetBodyRecovery();state=freshState();candidate=null;paint();rebuildSettings();editRev++;await saveNow(true);
-  }finally{branchBusy=false;lockUI();}
+    if(!await saveStoryReplacement(freshState()))status('新しい作品を保存できませんでした。元の作品に戻しました。',true);
+  }catch(e){status('新しい作品を作成できません: '+String(e.message||e),true);}
+  finally{branchBusy=false;lockUI();}
 }
 async function restoreCheckpoint(){
-  if(!ready||saveBlocked||busy||bodyBackupBusy)return;
+  if(!ready||saveBlocked||busy||branchBusy||bodyBackupBusy||exporting)return;
+  branchBusy=true;lockUI();
   try{
+    while(bodyEditBackup)await bodyEditBackup;
+    commitPendingBodyEdit();
     const versions=await store.checkpointList();
     if(!versions.length){status('復元できる以前の保存点はありません。');return;}
     const choices=versions.map((v,i)=>[String(i),String(i+1)+'：'+
@@ -735,25 +755,26 @@ async function restoreCheckpoint(){
     // Keep the complete old work in that case, too.
     const crossBranch=scope==='active'&&selected.activeBranch.id!==state.activeBranch.id;
     if(!await beforeDestructive('選択した復元点を開く',{scope:!crossBranch&&(scope==='active'||scope==='branch')?'active':'full'}))return;
-    resetBodyRecovery();state=selected;candidate=state.pendingCandidate;fullBody=false;
-    editRev++;paint();rebuildSettings();
-    if(await saveNow(true))status('第'+(n+1)+'候補の復元点へ戻しました。');
-    else status('復元内容を保存できませんでした。JSONで退避してください。',true);
+    if(await saveStoryReplacement(selected))status('第'+(n+1)+'候補の復元点へ戻しました。');
+    else status('復元内容を保存できませんでした。元の作品に戻しました。',true);
   }catch(e){status('復元できません: '+String(e.message||e),true);}
+  finally{branchBusy=false;lockUI();}
 }
 async function recoverChoice(){
-  if(!store?.recoveryRequired)return;
-  const info=store.recoveryInfo();
+  if(!ready||busy||branchBusy||bodyBackupBusy||exporting||!store?.recoveryRequired)return;
+  branchBusy=true;lockUI();
+  try{
+    while(bodyEditBackup)await bodyEditBackup;
+    const info=store.recoveryInfo();
   const describe=(name,value)=>name+'：'+(value?value.title+'／'+value.chars+'文字／'+value.turns+'ターン／更新 '+(value.at||'不明'):'読み取り不可');
   const choice=await modal('保存データの衝突です。どちらを採用しますか？\n'+
     describe('SQLite',info.sqlite)+'\n'+describe('IndexedDB',info.idb)+
     (info.omissionConflict?'\n未同期IndexedDBには省略分岐 '+info.omittedCount+' 件があり、全体の採用はできません。SQLiteを採用する前に未同期本編と読込可能な分岐を救出復元点へ保存します。読めない省略分岐は救出復元点に含まれません。自動合併はしません。':'\n選ばなかった側も復元点へ保存します。決められない場合は保留してJSONを書き出してください。'),
     info.omissionConflict?[['sqlite','SQLiteを採用（未同期本編を退避）'],['cancel','保留する']]:[['idb','IndexedDBの退避を使う'],['sqlite','SQLiteの保存を使う'],['cancel','保留する']]);
-  if(choice!=='idb'&&choice!=='sqlite')return;
-  try{
+    if(choice!=='idb'&&choice!=='sqlite')return;
     const recovered=await store.chooseRecovery(choice);
     resetBodyRecovery();state=store.compactState(cleanState(recovered));candidate=state.pendingCandidate;
-    saveBlocked=false;saveError='';ready=true;
+    saveBlocked=false;saveError='';ready=true;fullBody=false;historyOffset=0;
     editRev++;savedRev=editRev;
     paint();rebuildSettings();lockUI();safety();
     status('指定した保存元から復元・保存しました。設定欄も最新表示に更新しました。');
@@ -761,7 +782,7 @@ async function recoverChoice(){
     saveBlocked=true;
     status('復旧に失敗しました。再度選択できます: '+String(e.message||e),true);
     lockUI();safety();
-  }
+  }finally{branchBusy=false;lockUI();}
 }
 
 async function rebuildIdb(){
@@ -1074,10 +1095,10 @@ function setup(){
     catch{status('テキストを選択しました。コピー操作をしてください。',true);}
   };
   document.addEventListener('visibilitychange',()=>{
-    if(document.visibilityState==='hidden'&&ready){state.pendingCandidate=candidate;void saveNow(Boolean(busy&&candidate));}
+    if(document.visibilityState==='hidden'&&ready&&!replacementSaving){state.pendingCandidate=candidate;void saveNow(Boolean(busy&&candidate));}
     else if(document.visibilityState==='visible'&&ready&&!busy&&!branchBusy&&!bodyBackupBusy)void ensurePeriodicCheckpoint().then(()=>safety());
   });
-  window.addEventListener('pagehide',()=>{if(ready){state.pendingCandidate=candidate;void saveNow(Boolean(busy&&candidate));}});
+  window.addEventListener('pagehide',()=>{if(ready&&!replacementSaving){state.pendingCandidate=candidate;void saveNow(Boolean(busy&&candidate));}});
   // Stream chunks only mark dirty; write a bounded-rate snapshot while active.
   setInterval(()=>{
     if(!ready||!busy||!candidate||saveBlocked||streamSaveInFlight||editRev===savedRev)return;
