@@ -262,15 +262,19 @@ export function buildRequest(state,userText){
   const entries=sections.filter(([,key])=>d[key].trim()).map(([title,key,latest])=>({
     title,key,latest,quota:0,length:d[key].length,header:'\n\n【'+title+'】\n'
   }));
+  const historyHeader='\n\n【直近のユーザー入力・行動（確定済み）】\n';
+  const bodyHeader='\n\n【確定本文の末尾】\n';
+  // Reserve recent body before optional setting headings, even at small context sizes.
+  // Allow two UTF-16 units for a complete supplementary character when space permits.
+  const bodyQuota=d.body&&remaining>bodyHeader.length?
+    Math.min(remaining,d.body.length+bodyHeader.length,p.contextChars+bodyHeader.length,
+      Math.max(bodyHeader.length+2,Math.floor(remaining*0.40))):0;
+  if(bodyQuota>bodyHeader.length)remaining-=bodyQuota;
   // Count actual headings and separators. No minimum optional quota.
   const selected=[];
   for(const e of entries){
     if(remaining>=e.header.length+1){remaining-=e.header.length+1;e.quota=1;selected.push(e);}
   }
-  const historyHeader='\n\n【直近のユーザー入力・行動（確定済み）】\n';
-  const bodyHeader='\n\n【確定本文の末尾】\n';
-  const bodyQuota=d.body&&remaining>=300?Math.min(d.body.length+bodyHeader.length,p.contextChars+bodyHeader.length,Math.floor(remaining*0.40)):0;
-  if(bodyQuota>bodyHeader.length)remaining-=bodyQuota;
   const historyQuota=historyText&&remaining>=200?Math.min(historyText.length+historyHeader.length,700,Math.floor(remaining*0.15)):0;
   const historyBudget=Math.max(0,historyQuota-historyHeader.length);
   if(historyBudget)remaining-=historyQuota;

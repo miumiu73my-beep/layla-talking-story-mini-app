@@ -239,3 +239,18 @@ test('reply trash deduplicates exact replies before retention',()=>{
   assert.deepEqual(rememberReply(['A','B','A'],'B'),['B','A']);
   assert.deepEqual(rememberReply(['A','B'],'A'),['A','B']);
 });
+
+
+test('2048-token context reserves a recent body tail before optional settings',()=>{
+  const s=freshState();Object.assign(s.prefs,{contextTokens:2048,targetChars:500});
+  s.characters='人'.repeat(500);s.body='文'.repeat(1996)+'末尾😀';
+  for(const manySettings of [false,true]){
+    if(manySettings)for(const k of ['player','rules','avoidPlot','avoidWords','memory','world','synopsis','goal'])s[k]='設定'.repeat(250);
+    const x=buildRequest(s,'続けて');
+    assert.equal(x.meta.overBudget,false);
+    assert.ok(x.messages[0].content.includes('【確定本文の末尾】'));
+    assert.ok(x.messages[0].content.endsWith('末尾😀'));
+    assert.ok(x.meta.bodyOmitted<s.body.length);
+    assert.ok(x.meta.estimatedTokens+x.meta.outputTokens+160<=2048);
+  }
+});

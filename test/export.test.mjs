@@ -133,3 +133,17 @@ test('300k and million-character exports attempt native save before paging',asyn
     }
   }
 });
+
+
+test('compact streaming backup never splits shared emoji surrogates',async()=>{
+  const root={schema:'layla-talking-story-backup',version:1,body:'共通😀',branches:[{id:'a',body:'共通😁'},{id:'b',body:'共通😂'}]};
+  const data=JSON.parse(await serializeBackup(root,async b=>b,{compact:true}));
+  assert.equal(data.entries[1].prefix,2);assert.equal(data.entries[2].prefix,2);
+  const bodies=[];
+  for(const entry of data.entries){
+    assert.doesNotMatch(entry.suffix,/[\uD800-\uDFFF]/u);
+    bodies.push(entry.base===null?entry.suffix:bodies[entry.base].slice(0,entry.prefix)+entry.suffix);
+  }
+  assert.equal(bodies[data.payload.body],root.body);
+  assert.deepEqual(data.payload.branches.map(b=>bodies[b.body]),root.branches.map(b=>b.body));
+});

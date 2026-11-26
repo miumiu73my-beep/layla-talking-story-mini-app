@@ -139,6 +139,8 @@ export async function serializeBackup(snapshot,loadBranch,{compact=false,maxByte
   }
   const prefix=(a,b)=>{
     let i=0;while(i<a.length&&i<b.length&&a.charCodeAt(i)===b.charCodeAt(i))i++;
+    // A shared high surrogate alone is not a valid shared prefix.
+    if(i>0&&i<b.length&&b.charCodeAt(i)>=0xdc00&&b.charCodeAt(i)<=0xdfff)i--;
     return i;
   };
   const head=JSON.stringify(compact?{...root,body:0}:root).slice(0,-1)+',"branches":[';
