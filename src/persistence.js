@@ -6,6 +6,15 @@ import {cleanState,checksum,compactBackup,expandCompactBackup,archiveReference,i
 import {snapshot as branchSnapshot,MAX_ARCHIVED_BRANCHES} from './branches.js';
 
 const TABLE='talking_story_data_v1',ACTIVE='active',DBNAME='talking-story-fallback-v1';
+class ArchiveDamage extends Error {}
+// Retry only storage reads; deterministic content validation is not retried.
+async function retryRead(read){
+  let error;
+  for(let attempt=0;attempt<3;attempt++){
+    try{return await read();}catch(e){error=e;if(e instanceof ArchiveDamage)throw e;}
+  }
+  throw error;
+}
 export function splitChunks(src,limit=40000){
   const chunks=[];let pos=0;
   while(pos<src.length){
@@ -78,6 +87,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   const branchCache=new WeakMap();
   let rootCache=null,idbRootCache=null,idbLatest=null,sqlSavesSinceGc=9;
   const refData=new WeakMap(),storedRefs=new WeakMap(),archiveIssues=new WeakMap(),unknownSummaries=new WeakSet();
+  const repairIds=new Set();
   // The app opts into lazy storage; legacy callers still receive full snapshots.
   const lazy=lazyArchives&&validator===cleanState;
   const meta=b=>({id:b.id,name:b.name,createdAt:b.createdAt,parentId:b.parentId,forkTurn:b.forkTurn,
@@ -149,7 +159,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         if(source==='sql'&&(!Array.isArray(entry.parts)||!entry.parts.length||entry.parts.length>1500||
           entry.parts.some(k=>typeof k!=='string'||(knownKeys&&!knownKeys.has(k)))))
           throw Error('分岐チャンクが欠落しています。');
-        if(source==='idb'&&typeof entry.key!=='string')throw Error('分岐の保存キーが不正です。');
+        if(source==='idb'&&(entry.missing||typeof entry.key!=='string'))throw new ArchiveDamage('IndexedDBに分岐のミラーがありません。');
         return entryReference(entry,source,summary);
       }
       // Legacy manifests lack summaries: read once, then upgrade on next save.
@@ -162,8 +172,10 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     }
   }
   async function readEntry(entry,source){
-    const raw=source==='idb'?await idb.get(entry.key):await readParts(entry.parts,entry.hash,entry.size);
-    return validatedArchive(checkedJson(raw,entry),entry.id);
+    if(source==='idb'&&(entry.missing||typeof entry.key!=='string'))throw new ArchiveDamage('IndexedDBに分岐のミラーがありません。');
+    const raw=source==='idb'?await retryRead(()=>idb.get(entry.key)):await readParts(entry.parts,entry.hash,entry.size);
+    try{return validatedArchive(checkedJson(raw,entry),entry.id);}
+    catch(e){throw new ArchiveDamage(String(e.message||e));}
   }
   async function verifySource(state,source){
     for(const b of state.branches){
@@ -198,22 +210,116 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const source=refData.get(b);
     if(!source)throw Error('保存済み分岐の参照がありません。');
     let failure=null;
-    for(const type of ['idb','sql']){
+    for(const type of ['sql','idb']){
       const entry=source[type];if(!entry)continue;
       try{
-        const full=await readEntry(entry,type);
-        if(!unknownSummaries.has(b)&&JSON.stringify(meta(full))!==JSON.stringify(summaryOf(b)))
-          throw Error('分岐の要約情報が一致しません。');
+        const full=await readCheckedArchive(b,type);
+        if(!failure)archiveIssues.delete(b);
+        else archiveIssues.set(b,'一方の保存先に問題があります。整合性チェックで確認してください。');
         return full;
       }catch(e){failure=e;}
     }
     const message='分岐「'+b.name+'」を読み込めません: '+(failure?.message||'保存先なし');
+    const changed=archiveIssues.get(b)!==message;
     archiveIssues.set(b,message);
-    // Stop all mutation/GC on discovery; the root and original manifest survive.
-    readOnly=true;
-    if(source.sql){sqliteCorrupt=true;sqlProblem=message;rawEvidence=rawEvidence||JSON.stringify(manifest);}
-    notify(message+'。本編は表示を維持し、上書きを停止しました。',true);
+    if(changed)notify(message+'。本編の保存は継続できます。再試行または整合性チェックを行ってください。',true);
     throw Error(message);
+  }
+  async function readCheckedArchive(b,source){
+    const entry=refData.get(b)?.[source];
+    if(!entry)throw new ArchiveDamage('保存先に分岐がありません。');
+    const full=await readEntry(entry,source);
+    if(!unknownSummaries.has(b)&&JSON.stringify(meta(full))!==JSON.stringify(summaryOf(b)))
+      throw new ArchiveDamage('分岐の要約情報が一致しません。');
+    return full;
+  }
+  // Check both copies independently, never treat fallback as proof of primary health.
+  async function checkArchive(b){
+    if(!isArchiveReference(b))return {id:b.id,sql:'unsaved',idb:'unsaved',repairable:false};
+    const data=refData.get(b)||{},result={id:b.id};
+    for(const type of ['sql','idb']){
+      if(type==='sql'&&!sqlAvailable||type==='idb'&&!idb){result[type]='unavailable';continue;}
+      if(!data[type]||data[type].missing){result[type]='missing';continue;}
+      try{await readCheckedArchive(b,type);result[type]='ok';}
+      catch(e){result[type]=e instanceof ArchiveDamage?'damaged':'retry';result[type+'Error']=String(e.message||e);}
+    }
+    const bad=x=>x==='damaged'||x==='missing';
+    result.repairable=(result.sql==='ok'&&bad(result.idb))||(result.idb==='ok'&&bad(result.sql));
+    const failed=['sql','idb'].some(t=>result[t]==='damaged'||result[t]==='retry'||(data[t]&&result[t]==='missing'));
+    if(failed)archiveIssues.set(b,'整合性チェック: SQLite '+result.sql+' / IndexedDB '+result.idb);
+    else archiveIssues.delete(b);
+    return result;
+  }
+  // Durable evidence is written BEFORE removing or replacing a branch reference.
+  async function protectArchive(b){
+    const data=refData.get(b)||{};
+    if(data.sql){
+      if(!sqlAvailable||!sqlInitialized||sqlRetryBlocked)throw Error('SQLite原本を保護できません。再試行してください。');
+      const entry=data.sql;
+      if(!Array.isArray(entry.parts)||!entry.parts.every(k=>typeof k==='string'))throw Error('分岐目録の保護に失敗しました。');
+      const marker='corrupt-backup/v2-branch-'+Date.now()+'-'+Math.random().toString(36).slice(2);
+      await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[marker,JSON.stringify({version:1,parts:[],branchParts:[entry]})]);
+      for(const key of entry.parts)
+        await run('INSERT OR REPLACE INTO '+TABLE+' (k,v) VALUES (?,?)',['corrupt-keep/'+key,'1']);
+    }
+    if(data.idb&&!data.idb.missing){
+      if(!idb)throw Error('IndexedDB原本を保護できません。');
+      const entry=data.idb,raw=await retryRead(()=>idb.get(entry.key));
+      await idb.put('corrupt-keep/branch/'+Date.now()+'-'+Math.random().toString(36).slice(2),{entry,raw});
+    }
+  }
+  async function isolateArchive(state,id){
+    const b=state.branches.find(x=>x.id===id);
+    if(!b||!isArchiveReference(b)||readOnly)throw Error('隔離できる分岐がありません。');
+    await flushSaves();
+    const check=await checkArchive(b);
+    if(check.sql==='ok'||check.idb==='ok'||check.sql==='retry'||check.idb==='retry')
+      throw Error('健全なコピーがあるか、一時的な読込エラーです。修復または再試行してください。');
+    if(!archiveIssues.has(b))throw Error('破損を確認できません。');
+    await protectArchive(b);
+    const next={...state,branches:state.branches.filter(x=>x!==b)};
+    await save(next);return compactState(next);
+  }
+  async function repairArchive(state,id){
+    const b=state.branches.find(x=>x.id===id);
+    if(!b||!isArchiveReference(b)||readOnly)throw Error('修復できる分岐がありません。');
+    await flushSaves();
+    const check=await checkArchive(b);
+    if(!check.repairable)throw Error('検証済みの修復元がありません。');
+    const full=await readCheckedArchive(b,check.sql==='ok'?'sql':'idb');
+    await protectArchive(b);
+    const next={...state,branches:state.branches.map(x=>x===b?full:x)};
+    repairIds.add(id);
+    try{await save(next);return compactState(next);}
+    finally{repairIds.delete(id);}
+  }
+  async function flushSaves(){
+    while(working||queued!==null)await new Promise(resolve=>setTimeout(resolve,10));
+  }
+  async function lastIntegrityCheckAt(){
+    try{if(idb){const at=await idb.get('archive-check-at');if(Number.isFinite(at))return at;}}catch{}
+    try{if(sqlAvailable){const rows=sqlRows(await retryRead(()=>run('SELECT v FROM '+TABLE+' WHERE k=?',['archive-check-at'])));return Number(rows[0]?.v)||0;}}catch{}
+    return 0;
+  }
+  async function markIntegrityChecked(){
+    const at=Date.now();let saved=false;
+    if(idb)try{await idb.put('archive-check-at',at);saved=true;}catch{}
+    if(sqlAvailable&&sqlInitialized&&!sqlRetryBlocked&&!readOnly)
+      try{await run('INSERT OR REPLACE INTO '+TABLE+' (k,v) VALUES (?,?)',['archive-check-at',String(at)]);saved=true;}catch{}
+    if(!saved)throw Error('整合性チェック日時を保存できません。');
+    return at;
+  }
+  // Separate recovery record: never overwrite latest/ACTIVE on a root lock.
+  async function stashActive(state){
+    if(!idb)throw Error('IndexedDB退避先がありません。');
+    const raw=JSON.stringify(cleanState({...state,branches:[]}));
+    await idb.put('unsaved-active', {at:Date.now(),raw,hash:checksum(raw)});
+  }
+  async function readStashedActive(){
+    if(!idb)return null;
+    const record=await idb.get('unsaved-active');
+    if(!record||typeof record.raw!=='string'||checksum(record.raw)!==record.hash)return null;
+    return {at:record.at,state:cleanState(JSON.parse(record.raw))};
   }
   async function materialize(state,onlyId=null){
     const branches=[];
@@ -269,7 +375,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const raws=coreSections(core).map(section=>JSON.stringify(section));
     const generation='snapshot/'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
     const previous=idbLatest?.format===2?idbLatest:null;
-    const previousKeys=previous?[...mirrorEntries(previous).map(e=>e.key),...previous.archives.map(e=>e.key)]:[];
+    const previousKeys=previous?[...mirrorEntries(previous).map(e=>e.key),...previous.archives.map(e=>e.key).filter(k=>typeof k==='string')]:[];
     const eligible=new Set([...previousKeys,...(previous?.previousKeys||[])]);
     const created=[];
     const entries=[],archives=[];
@@ -285,11 +391,21 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         const ref=isArchiveReference(b)?b:storedRefs.get(b);
         const existing=refData.get(ref)?.idb;
         let entry;
-        if(existing&&eligible.has(existing.key))entry=existing;
+        if(existing&&!existing.missing&&eligible.has(existing.key)&&!repairIds.has(b.id))entry=existing;
         else{
-          const full=await readArchive(b),raw=JSON.stringify(full),key=generation+'/branch/'+b.id;
-          entry={id:b.id,key,hash:checksum(raw),size:raw.length};
-          created.push(key);await idb.put(key,raw);
+          let full;
+          try{full=await readArchive(b);}
+          catch(e){
+            // Explicit incomplete mirror. Never claim it is a complete recovery source.
+            const original=refData.get(ref)?.sql||existing;
+            if(!original)throw e;
+            entry={id:b.id,missing:true,hash:original.hash,size:original.size};
+          }
+          if(full){
+            const raw=JSON.stringify(full),key=generation+'/branch/'+b.id;
+            entry={id:b.id,key,hash:checksum(raw),size:raw.length};
+            created.push(key);await idb.put(key,raw);
+          }
         }
         archives.push(entry.summary?entry:summaryEntry(entry,b));
       }
@@ -344,8 +460,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         const loaded=await decodeGeneration(manifest,lazy);
         sqlSnapshot={state:loaded,validated:validate(loaded,validator),rev:Number(manifest.rev)||0};
         seq=Math.max(seq,sqlSnapshot.rev);
-        const damaged=branchProblem(sqlSnapshot.validated.value);
-        if(damaged)throw Error('分岐「'+damaged.name+'」の保存部品が不正です。本編を読取専用で救出しました。');
+        // Branch-local damage is retained in its original directory; root remains writable.
         if(sqlSnapshot.validated.error)throw Error('SQLite保存内容の検証失敗: '+sqlSnapshot.validated.error.message+
           (sqlSnapshot.validated.rescued?'。正常な本文と分岐を読取専用で救出しました。':'') );
         rawEvidence=null;
@@ -370,7 +485,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       // Pending mirrors may replace SQLite, and recovery mirrors may rebuild it.
       // Validate their own bytes before granting that authority, never via SQL fallback.
       try{
-        if(branchProblem(idbValid.value))throw Error('IndexedDB分岐の保存部品が不正です。');
+        if(branchProblem(idbValid.value)&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))throw Error('IndexedDB分岐の保存部品が不正です。');
         if(lazy&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))await verifySource(idbValid.value,'idb');
         seq=Math.max(seq,Number(fallback.rev)||0);
       }catch(e){idbValid.error=e;notify('IndexedDBの分岐を検証できません: '+e.message,true);}
@@ -406,16 +521,16 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   else mode=idb?'IndexedDB（退避）':'保存不可';
 
   async function readParts(parts,expectedHash,expectedSize){
-    if(!Array.isArray(parts)||parts.length>1500)throw Error('保存部品数が不正です。');
+    if(!Array.isArray(parts)||parts.length>1500)throw new ArchiveDamage('保存部品数が不正です。');
     const chunks=[];
     for(const key of parts){
-      const record=sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key]));
-      if(typeof record[0]?.v!=='string')throw Error('保存チャンク欠落: '+key);
+      const record=await retryRead(async()=>sqlRows(await run('SELECT v FROM '+TABLE+' WHERE k=?',[key])));
+      if(typeof record[0]?.v!=='string')throw new ArchiveDamage('保存チャンク欠落: '+key);
       chunks.push(record[0].v);
     }
     const raw=chunks.join('');
-    if(expectedHash&&checksum(raw)!==expectedHash)throw Error('チェックサムが不一致');
-    if(expectedSize!==undefined&&raw.length!==expectedSize)throw Error('保存文字数が不一致');
+    if(expectedHash&&checksum(raw)!==expectedHash)throw new ArchiveDamage('チェックサムが不一致');
+    if(expectedSize!==undefined&&raw.length!==expectedSize)throw new ArchiveDamage('保存文字数が不一致');
     return raw;
   }
   async function decodeGeneration(m,refs=false){
@@ -435,7 +550,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       const branches=[];
       // One key-only scan detects missing chunks without loading any branch body.
       const knownKeys=refs&&m.branchParts.some(b=>b?.summary!==undefined)?
-        new Set(sqlRows(await run('SELECT k FROM '+TABLE)).map(row=>row.k)):null;
+        new Set((await retryRead(async()=>sqlRows(await run('SELECT k FROM '+TABLE)))).map(row=>row.k)):null;
       for(const b of m.branchParts)branches.push(await decodeArchiveEntry(b,'sql',refs,knownKeys));
       root.branches=branches;
     }
@@ -468,10 +583,10 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     for(const b of state.branches||[]){
       const old=previousBranches.get(b.id);
       const ref=isArchiveReference(b)?b:storedRefs.get(b);
-      if(old&&(branchCache.get(b)===old||refData.get(ref)?.sql===old)){branchParts.push(old.summary?old:summaryEntry(old,b));continue;}
+      if(old&&!repairIds.has(b.id)&&(branchCache.get(b)===old||refData.get(ref)?.sql===old)){branchParts.push(old.summary||archiveIssues.has(b)?old:summaryEntry(old,b));continue;}
       const full=lazy?await readArchive(b):b;
       const json=JSON.stringify(full),hash=checksum(json);
-      if(old&&old.hash===hash&&old.size===json.length){
+      if(old&&!repairIds.has(b.id)&&old.hash===hash&&old.size===json.length){
         const entry=old.summary?old:summaryEntry(old,full);branchParts.push(entry);if(validator===cleanState)branchCache.set(b,entry);continue;
       }
       const parts=splitChunks(json),bkeys=[];
@@ -504,7 +619,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     sqlSavesSinceGc=0;
     try{
       const retain=new Set([ACTIVE,...keys,...(previous?.parts||[])]);
-      for(const b of [...branchParts,...(previous?.branchParts||[])])for(const key of b.parts)retain.add(key);
+      for(const b of [...branchParts,...(previous?.branchParts||[])])for(const key of b.parts||[])retain.add(key);
       const all=sqlRows(await run('SELECT k FROM '+TABLE));
       // Recovery markers survive restart and protect every readable old generation row.
       for(const {k} of all){
@@ -545,7 +660,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
           // Validate the root and archive directory without loading every modern branch.
           // Old entries without summaries still need their original full validation.
           const checked=validate(await decodeGeneration(current,lazy),validator);
-          if(checked.error||branchProblem(checked.value))throw Error('SQLite保存部品を検証できません。自動上書きを禁止しました。');
+          if(checked.error)throw Error('SQLite保存部品を検証できません。自動上書きを禁止しました。');
         }else if(manifest){
           throw Error('SQLiteの既存ACTIVEが見つかりません。自動上書きを禁止しました。');
         }
@@ -1188,6 +1303,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     initial:preferred,sqlInitial:sqlSnapshot?.validated.value||null,
     get readOnly(){return readOnly;},get corrupt(){return sqliteCorrupt;},
     archiveIssue:b=>archiveIssues.get(b)||'',
+    checkArchive,repairArchive,isolateArchive,lastIntegrityCheckAt,markIntegrityChecked,stashActive,readStashedActive,
     get recoveryRequired(){return recoveryRequired;},get hasStorage(){return Boolean(sqlAvailable||idb);},
     mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},
     recoveryInfo:()=>({sqlite:sqlSnapshot?.validated.value?{title:sqlSnapshot.validated.value.title,chars:sqlSnapshot.validated.value.body.length,at:sqlSnapshot.validated.value.updatedAt,turns:sqlSnapshot.validated.value.turns.length}:null,idb:idbValid?.value?{title:idbValid.value.title,chars:idbValid.value.body.length,at:idbValid.value.updatedAt,turns:idbValid.value.turns.length}:null}),
