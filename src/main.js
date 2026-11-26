@@ -1,6 +1,6 @@
 import {makeRuntime} from './runtime.js';
 import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning,AUTO_CONTINUE_INPUT,editableTurnInput} from './logic.js';
-import {openStore} from './persistence.js';
+import {openStore,CheckpointArchiveUnreadable} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
 import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload,manualPageOffsets,manualPageName,serializeBackup} from './export.js';
 import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan} from './ui-flows.js';
@@ -671,6 +671,10 @@ async function beforeDestructive(action,{checkpoint=true,scope,branchId}={}){
     // A failed archive read may have just discovered damage. Expose the
     // repair/isolation controls immediately, without changing the work.
     showBranches();safety();lockUI();
+    if(e instanceof CheckpointArchiveUnreadable){
+      status('読込不能の分岐があるため中止しました。分岐の整合性チェック・修復または隔離が必要です。',true);
+      await modal(String(e.message||e),[['ok','閉じる']]);
+    }
     return false;
   }
 }
@@ -692,10 +696,15 @@ async function handleImport(file){
   finally{branchBusy=false;lockUI();}
 }
 async function resetStory(){
-  if(!ready||busy||bodyBackupBusy||saveBlocked)return;
-  if(await modal('新しい作品にすると本文・設定・保存済みのすべての分岐が置き換わります。事前にJSONを外部保存してください。')!=='yes')return;
-  if(!await beforeDestructive('reset'))return;
-  resetBodyRecovery();state=freshState();candidate=null;paint();rebuildSettings();editRev++;await saveNow(true);
+  if(!ready||busy||branchBusy||bodyBackupBusy||saveBlocked||exporting)return;
+  branchBusy=true;lockUI();
+  try{
+    if(await modal('新しい作品にすると本文・設定・保存済みのすべての分岐が置き換わります。事前にJSONを外部保存してください。')!=='yes')return;
+    while(bodyEditBackup)await bodyEditBackup;
+    commitPendingBodyEdit();
+    if(!await beforeDestructive('reset'))return;
+    resetBodyRecovery();state=freshState();candidate=null;paint();rebuildSettings();editRev++;await saveNow(true);
+  }finally{branchBusy=false;lockUI();}
 }
 async function restoreCheckpoint(){
   if(!ready||saveBlocked||busy||bodyBackupBusy)return;
