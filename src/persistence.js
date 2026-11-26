@@ -561,7 +561,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       notify(sqliteCorrupt?'SQLite保存を検証できません。上書きを停止しました: '+sqlProblem:'SQLiteを読み込めません。この起動中はSQLiteへ書き込まず、IndexedDBへ退避を試します。再起動後に保存元を確認してください: '+sqlProblem);
     }
   }
-  let idbValid=null;
+  let idbValid=null,partialRebuild=null,rebuildOmitted=[];
   if(idbReadError){idbValid={value:null,error:idbReadError};notify('IndexedDBの分割保存を検証できません: '+idbReadError.message,true);}
   else if(fallback?.state){
     idbValid=validate(fallback.state,validator);
@@ -573,7 +573,22 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         const matchingBase=Boolean(fallback.pending&&sqlAvailable&&sqlSnapshot?.validated.value&&!sqlSnapshot.validated.error&&fallback.baseRev===sqlSnapshot.rev);
         if(matchingBase)linkMirrors(sqlSnapshot.validated.value,idbValid.value,true);
         if(branchProblem(idbValid.value)&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))throw Error('IndexedDB分岐の保存部品が不正です。');
-        if(lazy&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))await verifySource(idbValid.value,'idb',matchingBase);
+        if(lazy&&sqliteCorrupt){
+          // Only deliberate, validated omissions may be left out of explicit
+          // reconstruction. Never relax verification for normal pending sync.
+          const omitted=idbValid.value.branches.filter(b=>{
+            const entry=refData.get(b)?.idb;
+            return entry?.omitted===true&&entry.missing===true&&typeof entry.key!=='string';
+          });
+          if(omitted.length){
+            const selected=validator({...idbValid.value,branches:idbValid.value.branches.filter(b=>!omitted.includes(b))});
+            await verifySource(selected,'idb');
+            partialRebuild=selected;rebuildOmitted=omitted.map(b=>refData.get(b).idb);
+            // An incomplete mirror is NOT a complete synchronization source.
+            idbValid.error=Error('容量制限で省略された分岐があります。');
+            notify('本編と検証済み分岐の再作成が可能です。省略分岐 '+omitted.length+' 件は再作成せず、旧SQLite原本を保護します。',true);
+          }else await verifySource(idbValid.value,'idb');
+        }else if(lazy&&fallback.pending&&sqlAvailable)await verifySource(idbValid.value,'idb',matchingBase);
         seq=Math.max(seq,Number(fallback.rev)||0);
       }catch(e){idbValid.error=e;notify('IndexedDBの分岐を検証できません: '+e.message,true);}
     }
@@ -916,7 +931,12 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     return task;
   }
   async function checkpointArchive(b,storage,created){
-    const full=await readArchive(b),raw=JSON.stringify(full),hash=checksum(raw),size=raw.length;
+    let full;
+    try{full=await readArchive(b);}
+    catch(e){
+      throw Error(String(e.message||e)+'。作品全体の復元点は作成できません。メイン画面の「ストーリー分岐」で読込不能の分岐を確認し、設定の「分岐の整合性チェック」を実行してください。健全なコピーがあれば修復、一時エラーなら再試行、両方とも読めない場合は「分岐を隔離（原本保持）」を行ってから再試行してください。');
+    }
+    const raw=JSON.stringify(full),hash=checksum(raw),size=raw.length;
     const base='checkpoint-archive/'+b.id+'/'+hash+'-'+size;
     // The checksum is not cryptographic: reuse only after exact content equality.
     for(let attempt=0;attempt<100;attempt++){
@@ -1219,12 +1239,21 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     return true;
   }
   async function rebuildFromIdb(){
-    if(!cleanIdb||recoveryRequired||!readOnly||(!sqliteCorrupt&&!rebuildPending))throw Error('検証済みIndexedDBからの再作成は利用できません。');
-    const selected=idbValid.value;
+    if((!cleanIdb&&!partialRebuild)||recoveryRequired||!readOnly||(!sqliteCorrupt&&!rebuildPending))throw Error('検証済みIndexedDBからの再作成は利用できません。');
+    const selected=partialRebuild||idbValid.value;
     if(lazy)await verifySource(selected,'idb');
     rebuildPending=true;
     try{
       await allowImportRecovery();
+      // allowImportRecovery has retained the old ACTIVE manifest and every
+      // surviving generation row. Also retain the omitted mirror directory
+      // separately, even if the old SQLite manifest was unreadable.
+      if(rebuildOmitted.length){
+        await run('INSERT INTO '+TABLE+' (k,v) VALUES (?,?)',[
+          'corrupt-backup/v2-idb-omitted-'+Date.now()+'-'+Math.random().toString(36).slice(2),
+          JSON.stringify({version:1,parts:[],omittedArchives:rebuildOmitted})
+        ]);
+      }
       nextSqlRetry=0;
       await save(selected);
       if(mode!=='SQLite')throw Error('SQLiteへの書き込みを確認できません。');
@@ -1435,7 +1464,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     get recoveryRequired(){return recoveryRequired;},get hasStorage(){return Boolean(sqlAvailable||idb);},
     mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},get mirrorStatus(){return mirrorStatus;},
     recoveryInfo:()=>({sqlite:sqlSnapshot?.validated.value?{title:sqlSnapshot.validated.value.title,chars:sqlSnapshot.validated.value.body.length,at:sqlSnapshot.validated.value.updatedAt,turns:sqlSnapshot.validated.value.turns.length}:null,idb:idbValid?.value?{title:idbValid.value.title,chars:idbValid.value.body.length,at:idbValid.value.updatedAt,turns:idbValid.value.turns.length}:null}),
-    get canRebuildFromIdb(){return cleanIdb&&readOnly&&!recoveryRequired&&(sqliteCorrupt||rebuildPending);},
+    get canRebuildFromIdb(){return Boolean(cleanIdb||partialRebuild)&&readOnly&&!recoveryRequired&&(sqliteCorrupt||rebuildPending);},
+    get rebuildOmittedCount(){return rebuildOmitted.length;},
     save,checkpoint,checkpoints,checkpointList,latestAutomaticCheckpointAt,hasMatchingAutomaticCheckpoint,renameStoredBranch,loadCheckpoint,chooseRecovery,allowImportRecovery,rebuildFromIdb,rawDump,rawRowKeys,rawRowPage,rawBodySources,rawBodyText,purgeCorruptEvidence,materialize,compactState,
     flush:()=>new Promise((resolve,reject)=>{
       if(!working&&queued===null)return resolve();
