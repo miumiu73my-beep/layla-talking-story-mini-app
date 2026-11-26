@@ -1273,3 +1273,52 @@ test('omitted pending archive with mismatched SQLite revision permits explicit S
   assert.equal(st.initial.body,'復旧後の編集');
   assert.equal(st.recoveryRequired,false);
 });
+
+test('recovery with failed latest mirror stays retryable across restart',async()=>{
+  const sql=fakeSql(),original=freshState();original.body='SQLiteの原稿';
+  seed(sql,original,{rev:7});
+  const pending={...original,body:'未同期の原稿'};
+  const data=new Map([['latest',{state:pending,rev:8,pending:true,at:10}]]);
+  let failLatest=true;
+  const idbFactory=async()=>({
+    get:async key=>data.get(key)||null,
+    put:async(key,value)=>{
+      if(key==='latest'&&failLatest)throw Error('mirror quota');
+      data.set(key,value);
+    }
+  });
+  const open=()=>openStore({db:sql},()=>{},{idbFactory});
+  let st=await open();
+  assert.equal(st.recoveryRequired,true);
+  await assert.rejects(st.chooseRecovery('sqlite'),/未同期ミラーの解消に失敗/);
+  assert.equal(st.readOnly,true);
+  assert.equal(st.recoveryRequired,true);
+  assert.equal(data.get('latest').pending,true);
+  assert.ok((await st.checkpointList()).some(p=>p.reason==='選ばなかった復旧元'));
+  st=await open();
+  assert.equal(st.recoveryRequired,true);
+  failLatest=false;
+  await st.chooseRecovery('sqlite');
+  assert.equal(st.recoveryRequired,false);
+  assert.equal(data.get('latest').pending,false);
+  st=await open();
+  assert.equal(st.recoveryRequired,false);
+  assert.equal(st.initial.body,original.body);
+  await st.save({...st.initial,body:'復旧後の編集'});
+  assert.equal((await open()).initial.body,'復旧後の編集');
+});
+test('ordinary checkpoints do not evict either recovery source checkpoint',async()=>{
+  const sql=fakeSql(),original=freshState();original.body='SQLite';
+  seed(sql,original,{rev:2});
+  const pending={...original,body:'IndexedDB'};
+  const idb=fakeIdb({latest:{state:pending,rev:3,pending:true,at:10}});
+  const st=await openStore({db:sql},()=>{},{idbFactory:idb.factory});
+  const chosen=await st.chooseRecovery('sqlite');
+  for(let i=0;i<10;i++)await st.checkpoint(chosen,'通常の復元点 '+i);
+  const list=await st.checkpointList();
+  const other=list.find(p=>p.reason==='選ばなかった復旧元');
+  const selected=list.find(p=>p.reason==='復旧前に選択した保存元');
+  assert.ok(other);assert.ok(selected);
+  assert.equal((await st.loadCheckpoint(other.id,chosen)).body,pending.body);
+  assert.equal((await st.loadCheckpoint(selected.id,chosen)).body,original.body);
+});
