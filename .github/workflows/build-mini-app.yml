@@ -14,14 +14,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.16.0'
+          cache: npm
       - name: Install
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
-          else
-            echo '::warning::package-lock.json is not yet committed; temporary npm install fallback'
-            npm install --no-audit --no-fund
-          fi
+        run: npm ci --no-audit --no-fund
       - name: Tests
         run: npm test
       - name: Build
