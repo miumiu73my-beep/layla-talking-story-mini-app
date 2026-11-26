@@ -747,8 +747,8 @@ async function recoverChoice(){
   const describe=(name,value)=>name+'：'+(value?value.title+'／'+value.chars+'文字／'+value.turns+'ターン／更新 '+(value.at||'不明'):'読み取り不可');
   const choice=await modal('保存データの衝突です。どちらを採用しますか？\n'+
     describe('SQLite',info.sqlite)+'\n'+describe('IndexedDB',info.idb)+
-    '\n選ばなかった側も復元点へ保存します。決められない場合は保留してJSONを書き出してください。',
-    [['idb','IndexedDBの退避を使う'],['sqlite','SQLiteの保存を使う'],['cancel','保留する']]);
+    (info.omissionConflict?'\n未同期IndexedDBには省略分岐 '+info.omittedCount+' 件があり、全体の採用はできません。SQLiteを採用する前に未同期本編と読込可能な分岐を救出復元点へ保存します。読めない省略分岐は救出復元点に含まれません。自動合併はしません。':'\n選ばなかった側も復元点へ保存します。決められない場合は保留してJSONを書き出してください。'),
+    info.omissionConflict?[['sqlite','SQLiteを採用（未同期本編を退避）'],['cancel','保留する']]:[['idb','IndexedDBの退避を使う'],['sqlite','SQLiteの保存を使う'],['cancel','保留する']]);
   if(choice!=='idb'&&choice!=='sqlite')return;
   try{
     const recovered=await store.chooseRecovery(choice);
