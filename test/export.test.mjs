@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {filename,writeFile,utf8ToBase64,utf8ByteLength,manualExportPayload,MANUAL_EXPORT_LIMIT,serializeBackup} from '../src/export.js';
+import {filename,writeFile,utf8ToBase64,utf8ByteLength,manualExportPayload,manualPageOffsets,manualPageName,MANUAL_EXPORT_LIMIT,serializeBackup} from '../src/export.js';
 test('filename uses local date including milliseconds and excludes dangerous characters',()=>{
   const d=new Date(2026,10,24,0,4,5,678);
   assert.equal(filename('   ','json',d),'story_20261124-000405678.json');
@@ -80,11 +80,12 @@ test('UTF-8 byte length and base64 match platform encoding including lone surrog
   assert.equal(utf8ByteLength(text),Buffer.byteLength(text,'utf8'));
   assert.equal(utf8ToBase64(text),Buffer.from(text,'utf8').toString('base64'));
 });
-test('large unconfirmed export does not retain payload; successful and cancelled exports release manual data',async()=>{
+test('large export skips native bridge and exposes full paged rescue; successful and cancelled release data',async()=>{
   const large='海'.repeat(MANUAL_EXPORT_LIMIT+1);
-  const r=await writeFile({utils:{saveFile:async()=>undefined}},'large.txt',large,'text/plain');
-  assert.equal(r.kind,'unconfirmed');assert.equal(r.text,undefined);
-  assert.equal(manualExportPayload(large,r),null);
+  let called=0;
+  const r=await writeFile({utils:{saveFile:async()=>{called++;return undefined;}}},'large.txt',large,'text/plain');
+  assert.equal(r.kind,'manual');assert.equal(called,0);assert.equal(r.text,undefined);
+  assert.equal(manualExportPayload(large,r),large);
   assert.equal(manualExportPayload('small',{kind:'share'}),null);
   assert.equal(manualExportPayload('small',{kind:'cancelled'}),null);
   assert.equal(manualExportPayload('small',{kind:'manual'}),'small');
@@ -103,5 +104,17 @@ test('bounded backup serializer loads each branch once and uses readable v1/v2 f
       assert.deepEqual(data.payload.branches.map(x=>bodies[x.body]),root.branches.map(x=>x.body));
     }
     assert.equal(await serializeBackup(root,async b=>b,{compact,maxBytes:5}),null);
+  }
+});
+
+test('million-character manual rescue is complete and pages never split emoji pairs',()=>{
+  const large='海'.repeat(199999)+'😀'+'物語😀\n'.repeat(200000);
+  for(const kind of ['manual','unconfirmed']){
+    const payload=manualExportPayload(large,{kind});
+    const offsets=manualPageOffsets(payload),parts=offsets.slice(0,-1).map((start,i)=>payload.slice(start,offsets[i+1]));
+    assert.equal(parts.join(''),large);
+    assert.equal(parts[0].length,199999);
+    assert.ok(parts.every(p=>p.length<=200000&&!/[\uD800-\uDBFF]$/.test(p)));
+    assert.equal(manualPageName('story.json',0,parts.length),'story.json.part-1-of-'+parts.length+'.txt');
   }
 });
