@@ -1165,3 +1165,70 @@ test('lazy archive rename updates manifests without rewriting SQLite or IndexedD
   next=await store.renameStoredBranch(store.initial,'b-rename','旧名');await store.save(next);
   assert.deepEqual(JSON.parse(sql.map.get('active')).branchParts[0].parts,old.parts);
 });
+
+test('explicit SQLite rebuild retains original rows when mirror deliberately omitted an archive',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),host={db:sql},opts={lazyArchives:true,idbFactory:idb.factory};
+  let st=await openStore(host,()=>{},opts);
+  const original=cleanState({...freshState(),body:'復旧する本編',branches:[
+    {id:'a',name:'ミラーあり',body:'あ'.repeat(1100000)},
+    {id:'b',name:'容量省略',body:'い'.repeat(1100000)}]});
+  await st.save(original);
+  const oldText=sql.map.get('active'),old=JSON.parse(oldText),omitted=old.branchParts[1];
+  assert.equal(idb.data.get('latest').archives[1].omitted,true);
+  sql.map.delete(old.parts[0]);
+  st=await openStore(host,()=>{},opts);
+  assert.equal(st.readOnly,true);assert.equal(st.canRebuildFromIdb,true);
+  assert.equal(st.rebuildOmittedCount,1);
+  const restored=await st.rebuildFromIdb();
+  assert.equal(restored.body,original.body);
+  assert.deepEqual(restored.branches.map(b=>b.id),['a']);
+  assert.equal(st.mode(),'SQLite');assert.equal(st.readOnly,false);
+  for(const key of omitted.parts){assert.ok(sql.map.has(key));assert.ok(sql.map.has('corrupt-keep/'+key));}
+  assert.ok([...sql.map].some(([key,value])=>key.startsWith('corrupt-backup/')&&value===oldText));
+  st=await openStore(host,()=>{},opts);
+  assert.equal(st.initial.body,original.body);
+  assert.equal((await st.materialize(st.initial,'a')).branches[0].body,original.branches[0].body);
+  await st.save({...st.initial,draft:'編集を再開'});
+  for(const key of omitted.parts)assert.ok(sql.map.has(key));
+});
+
+test('partial rebuild refuses a genuinely damaged non-omitted mirror archive',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),host={db:sql},opts={lazyArchives:true,idbFactory:idb.factory};
+  let st=await openStore(host,()=>{},opts);
+  const s=cleanState({...freshState(),branches:[
+    {id:'a',name:'A',body:'あ'.repeat(1100000)},{id:'b',name:'B',body:'い'.repeat(1100000)}]});
+  await st.save(s);
+  const active=sql.map.get('active'),manifest=JSON.parse(active),mirror=idb.data.get('latest');
+  assert.equal(mirror.archives[1].omitted,true);
+  sql.map.delete(manifest.parts[0]);idb.data.delete(mirror.archives[0].key);
+  st=await openStore(host,()=>{},opts);
+  assert.equal(st.readOnly,true);assert.equal(st.canRebuildFromIdb,false);
+  await assert.rejects(st.rebuildFromIdb());assert.equal(sql.map.get('active'),active);
+});
+
+test('unreadable archive blocks reset and replace with isolation guidance; isolation preserves evidence',async()=>{
+  const sql=fakeSql(),host={db:sql},opts={lazyArchives:true,idbFactory:async()=>{throw Error('no IDB');}};
+  let st=await openStore(host,()=>{},opts);
+  const original=cleanState({...freshState(),body:'旧本編',branches:[
+    {id:'broken',name:'破損分岐',body:'原文'.repeat(40000)}]});
+  await st.save(original);
+  const old=JSON.parse(sql.map.get('active')).branchParts[0];
+  sql.map.delete(old.parts[0]);
+  st=await openStore(host,()=>{},opts);
+  let state=st.initial;const active=sql.map.get('active');
+  await assert.rejects(st.checkpoint(state,'reset',{scope:'full'}),/分岐を隔離（原本保持）/);
+  const raw=JSON.stringify(cleanState({...freshState(),body:'新本編'}));
+  const beforeDestructive=async(reason,options)=>{await st.checkpoint(state,reason,options);return true;};
+  const doImport=()=>runImport({name:'story.json',size:raw.length,text:async()=>raw},{
+    store:st,getState:()=>state,isSaveBlocked:()=>st.readOnly,modal:async()=>'replace',beforeDestructive,
+    apply:async next=>{state=next;await st.save(next);},unlockRecovery:()=>{throw Error('unexpected recovery');}
+  });
+  await assert.rejects(doImport(),/分岐を隔離（原本保持）/);
+  assert.equal(state.body,'旧本編');assert.equal(sql.map.get('active'),active);
+  state=await st.isolateArchive(state,'broken');
+  assert.equal(state.branches.length,0);
+  for(const key of old.parts.slice(1)){assert.ok(sql.map.has(key));assert.ok(sql.map.has('corrupt-keep/'+key));}
+  await st.checkpoint(state,'reset',{scope:'full'});
+  assert.equal(await doImport(),true);
+  assert.equal((await openStore(host,()=>{},opts)).initial.body,'新本編');
+});
