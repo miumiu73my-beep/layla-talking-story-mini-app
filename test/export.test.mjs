@@ -80,11 +80,11 @@ test('UTF-8 byte length and base64 match platform encoding including lone surrog
   assert.equal(utf8ByteLength(text),Buffer.byteLength(text,'utf8'));
   assert.equal(utf8ToBase64(text),Buffer.from(text,'utf8').toString('base64'));
 });
-test('large export skips native bridge and exposes full paged rescue; successful and cancelled release data',async()=>{
+test('large export tries native bridge and exposes full paged rescue when unconfirmed; successful and cancelled release data',async()=>{
   const large='海'.repeat(MANUAL_EXPORT_LIMIT+1);
   let called=0;
   const r=await writeFile({utils:{saveFile:async()=>{called++;return undefined;}}},'large.txt',large,'text/plain');
-  assert.equal(r.kind,'manual');assert.equal(called,0);assert.equal(r.text,undefined);
+  assert.equal(r.kind,'unconfirmed');assert.equal(called,1);assert.equal(r.text,undefined);
   assert.equal(manualExportPayload(large,r),large);
   assert.equal(manualExportPayload('small',{kind:'share'}),null);
   assert.equal(manualExportPayload('small',{kind:'cancelled'}),null);
@@ -116,5 +116,20 @@ test('million-character manual rescue is complete and pages never split emoji pa
     assert.equal(parts[0].length,199999);
     assert.ok(parts.every(p=>p.length<=200000&&!/[\uD800-\uDBFF]$/.test(p)));
     assert.equal(manualPageName('story.json',0,parts.length),'story.json.part-1-of-'+parts.length+'.txt');
+  }
+});
+
+test('300k and million-character exports attempt native save before paging',async()=>{
+  for(const length of [300000,1000000]){
+    const text='海'.repeat(length-2)+'😀';
+    for(const ext of ['json','txt']){
+      const raw=ext==='json'?JSON.stringify({body:text}):text;
+      let calls=0;
+      const host={utils:{saveFile:async(name,base64)=>{calls++;assert.equal(Buffer.from(base64,'base64').toString('utf8'),raw);return true;}}};
+      const result=await writeFile(host,'story.'+ext,raw,ext==='json'?'application/json':'text/plain');
+      assert.equal(calls,1);assert.equal(result.kind,'share');assert.equal(manualExportPayload(raw,result),null);
+      const failure=await writeFile({utils:{saveFile:async()=>{throw Error('bridge limit');}}},'story.'+ext,raw,'text/plain');
+      assert.equal(failure.kind,'manual');assert.equal(manualExportPayload(raw,failure),raw);
+    }
   }
 });

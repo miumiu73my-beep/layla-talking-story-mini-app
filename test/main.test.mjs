@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {freshState,cleanState,archiveReference,compactBackup} from '../src/logic.js';
-import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan} from '../src/ui-flows.js';
+import {freshState,cleanState,archiveReference,compactBackup,parseImport} from '../src/logic.js';
+import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan,readImportFiles} from '../src/ui-flows.js';
 
 function harness({hasStorage=true,corrupt=false,blocked=!hasStorage,choices=['replace'],checkpoint=true}={}){
   const calls=[],questions=[];
@@ -85,4 +85,22 @@ test('export plan distinguishes large all-branch backup, main-only and text',()=
   assert.equal(exportPlan('json',state).large,true);assert.equal(exportPlan('compact-json',state).large,true);
   assert.deepEqual(exportPlan('main-json',state),{light:false,mainOnly:true,json:true,large:false,mime:'application/json',suffix:'_本編のみ'});
   assert.equal(exportPlan('md',state).mime,'text/markdown');
+});
+
+test('multipart JSON imports in numeric order and rejects incomplete or mixed sets before changing state',async()=>{
+  const h=harness();
+  const raw=JSON.stringify(h.incoming),cut=Math.floor(raw.length/2);
+  const a=h.file(raw.slice(0,cut),'story.json.part-1-of-2.txt'),b=h.file(raw.slice(cut),'story.json.part-2-of-2.txt');
+  for(const bad of [[a],[a,a],[a,{...b,name:'other.json.part-2-of-2.txt'}],[a,h.file('x','plain.txt')],[a,{...b,size:50000001}]]){
+    await assert.rejects(h.run(bad));assert.equal(h.state(),h.old);assert.deepEqual(h.calls,[]);
+  }
+  assert.throws(()=>parseImport(a.name,'fragment',h.old),/分割保存/);
+  assert.equal(await h.run([b,a]),true);assert.equal(h.state().body,'imported');
+});
+test('multipart TXT and MD preserve exact text including interior BOM and emoji',async()=>{
+  for(const ext of ['txt','md']){
+    const parts=['海😀','\uFEFF続き\r\n'];
+    const files=parts.map((s,i)=>{const bytes=new TextEncoder().encode(s);return {name:'story.'+ext+'.part-'+(i+1)+'-of-2.txt',size:bytes.length,arrayBuffer:async()=>bytes.buffer};});
+    assert.deepEqual(await readImportFiles(files.reverse()),{name:'story.'+ext,raw:parts.join('')});
+  }
 });

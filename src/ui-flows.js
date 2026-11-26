@@ -1,22 +1,53 @@
 import {cleanState,parseImport,TRANSFER_MAX_BYTES} from './logic.js';
 
+// Validate the complete set before reading any file. Preserve fragment text
+// exactly, including a BOM character that happens to start an interior page.
+export async function readImportFiles(input){
+  const files=Array.isArray(input)?input:[input];
+  if(!files.length||files.some(f=>!f||!Number.isSafeInteger(f.size)||f.size<0))throw Error('ファイルを選択してください。');
+  if(files.reduce((sum,f)=>sum+f.size,0)>TRANSFER_MAX_BYTES)throw Error('合計50MB以下のファイルを選んでください。');
+  const pattern=/^(.+\.(?:json|txt|md))\.part-(\d+)-of-(\d+)\.txt$/i;
+  const parts=files.map(f=>pattern.exec(f.name));
+  if(files.length===1&&!parts[0]){
+    if(/\.part-\d+-of-\d+(?:\.|$)/i.test(files[0].name))throw Error('分割保存の断片です。全ページをまとめて選択してください。');
+    return {name:files[0].name,raw:await files[0].text()};
+  }
+  if(parts.some(p=>!p))throw Error('分割保存の全ページだけをまとめて選択してください。');
+  const name=parts[0][1],total=Number(parts[0][3]),ordered=new Map();
+  if(!Number.isSafeInteger(total)||total<2||total!==files.length)throw Error('分割保存の断片です。全ページをまとめて選択してください。');
+  for(let i=0;i<files.length;i++){
+    const p=parts[i],index=Number(p[2]);
+    if(p[1]!==name||Number(p[3])!==total||!Number.isSafeInteger(index)||index<1||index>total||ordered.has(index))
+      throw Error('異なるバックアップ、重複または不正なページ番号が含まれています。');
+    ordered.set(index,files[i]);
+  }
+  const chunks=[];
+  for(let i=1;i<=total;i++){
+    const f=ordered.get(i);
+    if(!f)throw Error('分割保存のページが不足しています。');
+    chunks.push(typeof f.arrayBuffer==='function'
+      ?new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(await f.arrayBuffer())
+      :await f.text());
+  }
+  return {name,raw:chunks.join('')};
+}
+
 // The actual import workflow, with UI/storage dependencies supplied by the caller.
-export async function runImport(file,{store,getState,isSaveBlocked,modal,beforeDestructive,apply,unlockRecovery}){
+export async function runImport(input,{store,getState,isSaveBlocked,modal,beforeDestructive,apply,unlockRecovery}){
   if(!store||(!store.hasStorage&&!store.corrupt))throw Error('保存先がありません。ファイルを読み込めません。既存の作品は変更していません。保存先を復旧してから再試行してください。');
-  if(file.size>TRANSFER_MAX_BYTES)throw Error('50MB以下のファイルを選んでください。');
-  const raw=await file.text();
-  const current=getState(),parsed=parseImport(file.name,raw,current);
+  const {name,raw}=await readImportFiles(input);
+  const current=getState(),parsed=parseImport(name,raw,current);
   const blocked=isSaveBlocked();
   const canKeep=!blocked;
   const count=current.branches.length;
   let choice;
   if(parsed.full){
     const options=[...(canKeep?[['keep','現在の分岐を残して本編のみ置換']]:[]),['replace','ファイルの分岐で全置換'],['cancel','キャンセル']];
-    choice=await modal(file.name+' を読み込みます。\nファイルの保存済み分岐 '+parsed.state.branches.length+' 件／現在の保存済み分岐 '+count+' 件。\n全置換では現在の分岐がファイルの分岐に置き換わります。本編のみ置換では設定・記憶・本文・履歴等を読み込み、現在の分岐とアクティブ分岐IDを維持します。ファイル内の分岐は取り込みません。'+(canKeep?'':'\n読み取り専用の復旧中は分岐保持を安全に保証できないため全置換のみ可能です。')+'\n事前に外部JSONバックアップを取っていますか？',options);
+    choice=await modal(name+' を読み込みます。\nファイルの保存済み分岐 '+parsed.state.branches.length+' 件／現在の保存済み分岐 '+count+' 件。\n全置換では現在の分岐がファイルの分岐に置き換わります。本編のみ置換では設定・記憶・本文・履歴等を読み込み、現在の分岐とアクティブ分岐IDを維持します。ファイル内の分岐は取り込みません。'+(canKeep?'':'\n読み取り専用の復旧中は分岐保持を安全に保証できないため全置換のみ可能です。')+'\n事前に外部JSONバックアップを取っていますか？',options);
     if(choice!=='replace'&&!(choice==='keep'&&canKeep))return false;
   }else{
     if(blocked&&count)throw Error('読み取り専用の保存先では現在の分岐を安全に保持できません。先に保存先を復旧してください。');
-    if(await modal(file.name+' を読み込みます。置換対象: 本文と履歴のみ。現在の分岐 '+count+' 件は保持します。事前に外部JSONバックアップを取っていますか？')!=='yes')return false;
+    if(await modal(name+' を読み込みます。置換対象: 本文と履歴のみ。現在の分岐 '+count+' 件は保持します。事前に外部JSONバックアップを取っていますか？')!=='yes')return false;
     choice='text';
   }
   // Check the storage again after the dialog. Never authorize a stale keep choice.
@@ -32,7 +63,7 @@ export async function runImport(file,{store,getState,isSaveBlocked,modal,beforeD
   }
   const latest=getState();
   const next=choice==='keep'?cleanState({...parsed.state,activeBranch:latest.activeBranch,branches:latest.branches}):
-    choice==='text'?parseImport(file.name,raw,latest).state:parsed.state;
+    choice==='text'?parseImport(name,raw,latest).state:parsed.state;
   await apply(next);
   return true;
 }

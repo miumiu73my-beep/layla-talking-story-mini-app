@@ -421,6 +421,7 @@ export function expandCompactBackup(value){
 }
 
 export function parseImport(filename,content,current){
+  if(/\.part-\d+-of-\d+(?:\.|$)/i.test(String(filename||'')))throw Error('分割保存の断片です。全ページをまとめて選択してください。');
   const src=String(content||'');
   if(new TextEncoder().encode(src).length>TRANSFER_MAX_BYTES)throw Error('ファイル容量が50MBを超えています。');
   const ext=String(filename||'').split('.').pop().toLowerCase();

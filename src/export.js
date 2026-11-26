@@ -80,9 +80,8 @@ export function manualPageName(name,index,total){
 export async function writeFile(host,name,text,mime){
   const fallback=()=>text.length<=MANUAL_EXPORT_LIMIT?{text,name,mime}:{name,mime};
   let reason='';
-  // Avoid sending large strings through the native Base64 bridge or a second
-  // full-size Blob. The user can save each exact fragment independently.
-  if(text.length>MANUAL_EXPORT_LIMIT)return {kind:'manual',message:'大容量のため分割救出を使用します。各ページを順番に保存してください。',...fallback()};
+  // Size alone is not a reason to skip native or Web Share. Keep large
+  // fallback payloads out of the result; the UI already owns the original.
   if(typeof host?.utils?.saveFile==='function'){
     try{
       const r=await host.utils.saveFile(name,utf8ToBase64(text),true);
@@ -112,8 +111,14 @@ export async function writeFile(host,name,text,mime){
     if(err?.name==='AbortError')return {kind:'cancelled',message:'共有をキャンセルしました。'};
     reason=reason||String(err?.message||err);
   }
-  // A second, manual browser-only option can be offered in the UI, since
-  // a native WKWebView <a download> may silently do nothing.
+  // Outside Layla, try a single browser download before manual paging.
+  // In Layla's WebView the download click may silently do nothing.
+  if(typeof host?.utils?.saveFile!=='function'){
+    try{
+      if(browserDownload(name,new Blob([text],{type:mime+';charset=utf-8'})))
+        return {kind:'share',message:'ブラウザにダウンロードを指示しました。実際のファイル保存を確認してください。'};
+    }catch(err){reason=reason||String(err?.message||err);}
+  }
   return {kind:'manual',
     message:'自動書き出しできませんでした'+(reason?'（'+reason+'）':'')+'。内容をコピーするか、ブラウザ用ダウンロードを選んでください。',
     ...fallback()};
