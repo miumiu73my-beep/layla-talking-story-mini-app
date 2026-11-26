@@ -36,6 +36,44 @@ async function ensurePeriodicCheckpoint(){
   })();
   try{await periodicTask;}finally{periodicTask=null;}
 }
+let integrityTask=null,integrityAt=0,integrityLoaded=false,integrityRetryAt=0;
+const integrityLabels={ok:'正常',damaged:'破損',missing:'なし',retry:'一時エラー',unavailable:'利用不可',unsaved:'未保存'};
+const integrityResults=new Map();
+function integrityIdle(){return ready&&store&&!saveBlocked&&!busy&&!branchBusy&&!bodyBackupBusy&&!exporting&&document.visibilityState!=='hidden';}
+async function runIntegrityCheck(manual=false){
+  if(integrityTask||!integrityIdle())return;
+  integrityTask=(async()=>{
+    const label=el('integrity-status');
+    try{
+      if(!integrityLoaded){integrityAt=await store.lastIntegrityCheckAt();integrityLoaded=true;}
+      if(!manual&&(Date.now()<integrityRetryAt||(integrityAt&&new Date(integrityAt).toDateString()===new Date().toDateString())))return;
+      if(!integrityIdle())return;
+      if(!await saveNow())throw Error('整合性チェック前の保存に失敗しました。');
+      const branches=state.branches.slice();
+      let checked=0,issues=0,retry=false;
+      for(const b of branches){
+        if(!integrityIdle()){label.textContent='整合性チェックを中断しました。待機中に再試行します。';return;}
+        const r=await store.checkArchive(b);
+        if(state.branches.includes(b)){
+          integrityResults.set(b.id,r);
+          if(r.sql==='retry'||r.idb==='retry')retry=true;
+          if(store.archiveIssue(b)||r.repairable)issues++;
+        }
+        checked++;
+        label.textContent='整合性チェック '+checked+' / '+branches.length+' 件';
+        showBranches();safety();lockUI();
+        await new Promise(resolve=>setTimeout(resolve,30));
+      }
+      if(branches.length!==state.branches.length||branches.some(b=>!state.branches.includes(b))){
+        label.textContent='分岐が変更されたため、次回チェックします。';return;
+      }
+      if(retry){integrityRetryAt=Date.now()+3600000;label.textContent='一時エラーあり。1時間後に再試行します。';return;}
+      integrityAt=await store.markIntegrityChecked();integrityRetryAt=0;
+      label.textContent='最終チェック：'+new Date(integrityAt).toLocaleString('ja-JP')+'／'+checked+'件中 '+issues+'件要確認。修復は分岐一覧から実行できます。';
+    }catch(e){integrityRetryAt=Date.now()+3600000;label.textContent='チェック失敗：'+e.message;}
+  })();
+  try{await integrityTask;}finally{integrityTask=null;lockUI();}
+}
 let historyOffset=0,branchBusy=false,bodyBackupBusy=false,editRev=0,savedRev=0,stopUntil=0,retryFallback=null;
 let activeGenerationFinished=null,stopUnconfirmed=false,streamSaveInFlight=false;
 const HISTORY_PAGE_SIZE=30;
@@ -70,6 +108,7 @@ function lockUI(){
   if(el('raw-body'))el('raw-body').disabled=!ready||busy||branchBusy||exporting||bodyBackupBusy;
   if(el('purge-corrupt'))el('purge-corrupt').disabled=disabled||exporting||store?.mode()!=='SQLite';
   if(el('raw-rows'))el('raw-rows').disabled=!ready||busy||branchBusy||exporting;
+  if(el('check-integrity'))el('check-integrity').disabled=disabled||Boolean(integrityTask);
   if(el('rebuild-idb'))el('rebuild-idb').disabled=!ready||busy||branchBusy||exporting||!store?.canRebuildFromIdb;
   if(el('reset-history'))el('reset-history').disabled=disabled;
   for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy||exporting||(bodyBackupBusy&&input.id!=='edit-body');
@@ -101,7 +140,10 @@ async function saveNow(force=false){
   while(bodyEditBackup)await bodyEditBackup;
   commitPendingBodyEdit();
   clearTimeout(saveTimer);saveTimer=null;
-  if(!store||saveBlocked){safety();return false;}
+  if(!store||saveBlocked){
+    if(store?.readOnly&&editRev!==savedRev)try{await store.stashActive(state);saveError='未保存の本編・下書き・候補をIndexedDBの救出用領域へ退避しました。';}catch(e){saveError='未保存編集の退避に失敗: '+e.message;}
+    safety();return false;
+  }
   // Daily recovery points run separately; foreground and stream saves do not wait.
   if(!force&&editRev===savedRev){safety();return true;}
   const revision=editRev;
@@ -114,7 +156,7 @@ async function saveNow(force=false){
     safety();return true;
   }catch(e){
     saveError='保存失敗: '+String(e?.message||e);
-    status(saveError,true);safety();return false;
+    status(saveError,true);if(store?.readOnly)try{await store.stashActive(state);saveError+='／未保存編集を救出用領域へ退避しました。';}catch{}safety();return false;
   }
 }
 let promptMetaTimer=null;
@@ -188,7 +230,15 @@ function showBranches(){
       actionButton('名前変更',()=>branchAction('rename',b.id)),
       actionButton('削除',()=>branchAction('delete',b.id))
     );
-    if(store?.archiveIssue(b))for(const button of actions.querySelectorAll('button'))button.dataset.invalidAction='1';
+    const issue=store?.archiveIssue(b),result=integrityResults.get(b.id);
+    if(result)summary.append(node('div','hint','SQLite：'+integrityLabels[result.sql]+'／IndexedDB：'+integrityLabels[result.idb]));
+    if(issue){
+      summary.append(node('div','hint',issue));
+      // Keep retry/open available, but require verified recovery or isolation before destructive changes.
+      for(const button of Array.from(actions.querySelectorAll('button')).slice(1))button.dataset.invalidAction='1';
+      actions.append(actionButton('分岐を隔離（原本保持）',()=>branchAction('isolate',b.id),Boolean(result?.repairable)));
+    }
+    if(result?.repairable)actions.append(actionButton('健全なコピーから修復',()=>branchAction('repair',b.id)));
     row.append(summary,actions);target.append(row);
   }
 }
@@ -880,6 +930,18 @@ async function branchAction(action,id){
   if(!ready||busy||branchBusy||saveBlocked)return;
   const found=id===state.activeBranch?.id?state.activeBranch:state.branches.find(b=>b.id===id);
   if(!found){status('分岐が見つかりません。',true);return;}
+  if(action==='isolate'||action==='repair'){
+    if(await modal(action==='isolate'?'読めない分岐を一覧から外します。破損原本は救出用に保持します。続行しますか？':'検証済みの健全なコピーから分岐を修復します。旧原本は救出用に保持します。続行しますか？')!=='yes')return;
+    branchBusy=true;lockUI();
+    try{
+      if(!await saveNow())throw Error('本編の保存に失敗しました。');
+      state=await (action==='isolate'?store.isolateArchive(state,id):store.repairArchive(state,id));
+      integrityResults.delete(id);paint();
+      status(action==='isolate'?'分岐を隔離しました。':'分岐の修復保存を行いました。再チェックで両保存先を確認してください。');
+    }catch(e){status(e.message,true);showBranches();safety();}
+    finally{branchBusy=false;lockUI();}
+    return;
+  }
   if(action==='switch'){
     const selection=await modal('「'+found.name+'」に切り替えます。人物設定・世界観・自由記憶・ユーザー設定はどうしますか？\n生成パラメータは常に現在の値を引き継ぎます。',
       [['branch','切替先分岐の設定を使用'],['inherit','現在の設定を引き継ぐ'],['cancel','キャンセル']]);
@@ -906,7 +968,7 @@ function setup(){
     '<section class="panel"><h2>生成設定</h2><div id="preference-fields"></div><p class="hint" id="prompt-meta"></p></section>'+
     '<section class="panel"><h2>確定本文の編集</h2><p class="hint">ここが正本です。長編の場合は編集前にJSONをバックアップしてください。</p><p id="edit-count" class="hint"></p><p id="edit-warning" class="safety" hidden>本文を大きく削除しました。誤操作であれば、直ちに「直前の状態を復元」を利用してください。</p><textarea id="edit-body" class="long" rows="12"></textarea></section>'+
     '<section class="panel"><h2>返信のごみ箱</h2><p class="hint">直近20件まで（合計150万文字目安。超過時は古い返信から整理）。復元は未採用候補として行い、現在の本文を上書きしません。</p><div id="reply-trash"></div></section>'+
-    '<section class="panel"><h2>バックアップ・復元</h2><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-main-json">本編のみJSON（分岐なし）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-body">SQLite本編TXT救出</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button><button id="purge-corrupt" class="warn">古い破損データを削除</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
+    '<section class="panel"><h2>バックアップ・復元</h2><div class="actions"><button id="check-integrity">分岐の整合性チェック</button><button id="rescue-unsaved">未保存編集の救出JSON</button></div><p id="integrity-status" class="hint">起動後の待機中に1日1回チェックします。</p><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-main-json">本編のみJSON（分岐なし）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-body">SQLite本編TXT救出</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button><button id="purge-corrupt" class="warn">古い破損データを削除</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
     '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p class="hint">コピーするか、通常ブラウザではダウンロードを選択してください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="copy-manual">テキストをコピー</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
     '</main><nav class="nav"><button class="primary" id="nav-main">本文へ戻る</button><button id="nav-settings">設定</button><button id="quick-backup">JSON保存</button></nav>'+
     '<div id="modal" class="overlay" hidden role="dialog" aria-modal="true"><div class="modal-card"><p id="modal-content"></p><div id="modal-buttons" class="actions"></div></div></div>';
@@ -949,6 +1011,16 @@ function setup(){
     if(await modal('現在の本文は保持し、送信履歴だけ削除します。元の履歴は復元点に保存します。続行しますか？')!=='yes')return;
     if(await applyStoryChange(s=>clearHistoryAgainstBody(s),'本文を保持して履歴をリセットしました。',{destructive:true}))rebuildSettings();
   };
+  el('check-integrity').onclick=()=>void runIntegrityCheck(true);
+  el('rescue-unsaved').onclick=async()=>{
+    try{
+      const record=await store.readStashedActive();
+      if(!record){status('救出用の未保存編集はありません。');return;}
+      const name='unsaved-active-'+record.at+'.json',content=JSON.stringify(record.state),mime='application/json';
+      const result=await writeFile(host,name,content,mime);
+      presentExport(name,content,mime,result,'救出用本編のみ（分岐を含まない）');
+    }catch(e){status('未保存編集の救出失敗: '+e.message,true);}
+  };
   el('raw-body').onclick=()=>void exportRescuedBody();
   el('purge-corrupt').onclick=()=>void purgeCorruption();
   el('raw-backup').onclick=()=>void exportRaw();
@@ -981,7 +1053,7 @@ function setup(){
   // No background execution is assumed; check daily while the app is open.
   setInterval(()=>{
     if(ready&&document.visibilityState==='visible'&&!busy&&!branchBusy&&!bodyBackupBusy)
-      void ensurePeriodicCheckpoint().then(()=>safety());
+      void ensurePeriodicCheckpoint().then(()=>safety()).then(()=>runIntegrityCheck());
   },60000);
   el('modal').hidden=true;paint();
 }
@@ -1010,7 +1082,7 @@ async function init(){
       else status('準備完了。保存先：'+store.mode());
     }
     safety();
-    if(!saveBlocked&&!store.recoveryRequired)setTimeout(()=>void ensurePeriodicCheckpoint().then(()=>safety()),0);
+    if(!saveBlocked&&!store.recoveryRequired){setTimeout(()=>void ensurePeriodicCheckpoint().then(()=>safety()),0);setTimeout(()=>void runIntegrityCheck(),10000);}
   }catch(e){
     ready=true;saveBlocked=true;saveError='初期化に失敗: '+String(e.message||e);
     status(saveError,true);paint();safety();
