@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {openStore,splitChunks,checksum,sqlRows,MIRROR_ARCHIVE_LIMIT} from '../src/persistence.js';
 import {freshState,cleanState} from '../src/logic.js';
+import {runImport} from '../src/ui-flows.js';
 
 function fakeSql(){
   const map=new Map();
@@ -964,6 +965,10 @@ test('explicit corruption cleanup preserves healthy generations and checkpoints 
   st=await openStore({db:sql},()=>{},opts);
   assert.equal(st.initial.body,'健全な現在の原稿');
   assert.ok((await st.checkpointList()).some(x=>x.reason==='手動復元点'));
+  await st.save({...st.initial,body:'整理後の再保存'});
+  st=await openStore({db:sql},()=>{},opts);
+  assert.equal(st.initial.body,'整理後の再保存');
+  assert.ok((await st.checkpointList()).some(x=>x.reason==='手動復元点'));
 });
 
 test('failed rebuild after protection remains read-only and retries SQLite without restart',async()=>{
@@ -1104,4 +1109,28 @@ test('mirror failure warning once per consecutive failure, SQLite saves continue
   assert.match(st.mirrorStatus,/ミラー更新失敗/);
   assert.equal(notices.filter(m=>m.includes('ミラー更新失敗')).length,1);
   assert.equal((await openStore({db:sql},()=>{},opts)).initial.body,'二回目');
+});
+
+test('keep-branch JSON import saves and restarts with original lazy archive, active ID and recovery point',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={lazyArchives:true,idbFactory:idb.factory},host={db:sql};
+  let st=await openStore(host,()=>{},opts);
+  const original=cleanState({...freshState(),body:'旧本編',activeBranch:{id:'active-old',name:'本編'},branches:[{id:'one',name:'枝',body:'保存された分岐'}]});
+  await st.save(original);
+  st=await openStore(host,()=>{},opts);
+  let state=st.initial;
+  const oldParts=JSON.parse(sql.map.get('active')).branchParts[0].parts;
+  const raw=JSON.stringify(cleanState({...freshState(),body:'新本編',activeBranch:{id:'one',name:'別作品'}}));
+  await runImport({name:'story.json',size:raw.length,text:async()=>raw},{
+    store:st,getState:()=>state,isSaveBlocked:()=>st.readOnly,modal:async()=>'keep',
+    beforeDestructive:async(reason,opts)=>{await st.save(state);state=st.compactState(state);await st.checkpoint(state,reason,opts);return true;},
+    apply:async next=>{state=next;await st.save(state);},unlockRecovery:()=>{throw Error('unexpected recovery');}
+  });
+  st=await openStore(host,()=>{},opts);
+  assert.equal(st.initial.body,'新本編');
+  assert.equal(st.initial.activeBranch.id,'active-old');
+  assert.deepEqual(JSON.parse(sql.map.get('active')).branchParts[0].parts,oldParts);
+  assert.equal((await st.materialize(st.initial,'one')).branches[0].body,'保存された分岐');
+  const point=(await st.checkpointList()).find(x=>x.reason==='本編読み込前');
+  assert.equal(point.scope,'active');
+  assert.equal((await st.loadCheckpoint(point.id,st.initial)).body,'旧本編');
 });
