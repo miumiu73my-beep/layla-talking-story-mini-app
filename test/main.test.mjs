@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {freshState,cleanState,archiveReference,compactBackup,parseImport} from '../src/logic.js';
-import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan,readImportFiles} from '../src/ui-flows.js';
+import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan,readImportFiles,exportJsonWithFallback,checkArchivesManually} from '../src/ui-flows.js';
 
 function harness({hasStorage=true,corrupt=false,blocked=!hasStorage,choices=['replace'],checkpoint=true}={}){
   const calls=[],questions=[];
@@ -103,4 +103,35 @@ test('multipart TXT and MD preserve exact text including interior BOM and emoji'
     const files=parts.map((s,i)=>{const bytes=new TextEncoder().encode(s);return {name:'story.'+ext+'.part-'+(i+1)+'-of-2.txt',size:bytes.length,arrayBuffer:async()=>bytes.buffer};});
     assert.deepEqual(await readImportFiles(files.reverse()),{name:'story.'+ext,raw:parts.join('')});
   }
+});
+
+
+test('unreadable archived branch offers explicit main-only backup without changing originals',async()=>{
+  const snapshot=cleanState({...freshState(),body:'本文😀',draft:'下書き',branches:[{id:'good',name:'正常',body:'分岐1'},{id:'bad',name:'破損',body:'分岐2'}]});
+  const before=JSON.stringify(snapshot);
+  const read=async b=>{if(b.id==='bad')throw Error('unreadable');return b;};
+  for(const compact of [false,true]){
+    let confirmations=0;
+    const result=await exportJsonWithFallback(snapshot,read,{compact,confirmMain:async(b,e)=>{confirmations++;assert.equal(b.id,'bad');assert.match(e.message,/unreadable/);return true;}});
+    assert.equal(result.mainOnly,true);assert.equal(result.cancelled,false);assert.equal(confirmations,1);
+    const restored=parseImport('backup.json',result.content,freshState()).state;
+    assert.equal(restored.body,snapshot.body);assert.equal(restored.draft,snapshot.draft);assert.equal(restored.branches.length,0);
+    const cancelled=await exportJsonWithFallback(snapshot,read,{compact,confirmMain:async()=>false});
+    assert.equal(cancelled.cancelled,true);assert.equal(cancelled.content,null);
+    const full=await exportJsonWithFallback(snapshot,async b=>b,{compact,confirmMain:async()=>assert.fail('unexpected fallback')});
+    assert.equal(full.mainOnly,false);assert.equal(parseImport('backup.json',full.content,freshState()).state.branches.length,2);
+  }
+  const oversize=await exportJsonWithFallback(snapshot,read,{maxBytes:1,confirmMain:async()=>assert.fail('oversize is not unreadable')});
+  assert.equal(oversize.content,null);assert.equal(oversize.cancelled,false);
+  assert.equal(JSON.stringify(snapshot),before);
+});
+
+test('manual archive check stops before publishing an obsolete result and restarts on request',async()=>{
+  const branches=['a','b','c'],reads=[],results=[];let current=true;
+  const opts={isCurrent:()=>current,check:async b=>{reads.push(b);if(b==='b')current=false;return 'ok';},onResult:(b,r)=>results.push([b,r]),pause:async()=>{}};
+  assert.equal(await checkArchivesManually(branches,opts),false);
+  assert.deepEqual(reads,['a','b']);assert.deepEqual(results,[['a','ok']]);
+  current=true;reads.length=0;results.length=0;
+  assert.equal(await checkArchivesManually(branches,{...opts,check:async b=>{reads.push(b);return 'ok';}}),true);
+  assert.deepEqual(reads,branches);assert.deepEqual(results,branches.map(b=>[b,'ok']));
 });
