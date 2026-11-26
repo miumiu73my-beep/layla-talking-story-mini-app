@@ -87,7 +87,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   const branchCache=new WeakMap();
   let rootCache=null,idbRootCache=null,idbLatest=null,sqlSavesSinceGc=9;
   const refData=new WeakMap(),storedRefs=new WeakMap(),archiveIssues=new WeakMap(),unknownSummaries=new WeakSet();
-  const repairIds=new Set();
+  const repairIds=new Set(),archiveChecks=new WeakMap();
   // The app opts into lazy storage; legacy callers still receive full snapshots.
   const lazy=lazyArchives&&validator===cleanState;
   const meta=b=>({id:b.id,name:b.name,createdAt:b.createdAt,parentId:b.parentId,forkTurn:b.forkTurn,
@@ -245,7 +245,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     }
     const bad=x=>x==='damaged'||x==='missing';
     result.repairable=(result.sql==='ok'&&bad(result.idb))||(result.idb==='ok'&&bad(result.sql));
-    const failed=['sql','idb'].some(t=>result[t]==='damaged'||result[t]==='retry'||(data[t]&&result[t]==='missing'));
+    const failed=['sql','idb'].some(t=>result[t]==='damaged'||result[t]==='retry'||result[t]==='missing');
+    archiveChecks.set(b,result);
     if(failed)archiveIssues.set(b,'整合性チェック: SQLite '+result.sql+' / IndexedDB '+result.idb);
     else archiveIssues.delete(b);
     return result;
@@ -275,7 +276,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const check=await checkArchive(b);
     if(check.sql==='ok'||check.idb==='ok'||check.sql==='retry'||check.idb==='retry')
       throw Error('健全なコピーがあるか、一時的な読込エラーです。修復または再試行してください。');
-    if(!archiveIssues.has(b))throw Error('破損を確認できません。');
+    if(!archiveIssues.has(b)||!['sql','idb'].some(t=>check[t]==='damaged'||check[t]==='missing'))throw Error('破損を確認できません。');
     await protectArchive(b);
     const next={...state,branches:state.branches.filter(x=>x!==b)};
     await save(next);return compactState(next);
@@ -391,7 +392,12 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         const ref=isArchiveReference(b)?b:storedRefs.get(b);
         const existing=refData.get(ref)?.idb;
         let entry;
-        if(existing&&!existing.missing&&eligible.has(existing.key)&&!repairIds.has(b.id))entry=existing;
+        const known=archiveChecks.get(ref),original=refData.get(ref)?.sql||existing;
+        if(!repairIds.has(b.id)&&existing?.missing&&known?.sql!=='ok')entry=existing;
+        else if(!repairIds.has(b.id)&&!existing&&archiveIssues.has(ref)&&known?.sql!=='ok'&&original){
+          entry={id:b.id,missing:true,hash:original.hash,size:original.size};
+        }
+        else if(existing&&!existing.missing&&eligible.has(existing.key)&&!repairIds.has(b.id))entry=existing;
         else{
           let full;
           try{full=await readArchive(b);}
@@ -412,6 +418,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       const record={...header,format:2,state:overlay,overlayHash:checksum(JSON.stringify(overlay)),core:entries[0],coreParts:entries.slice(1),archives,previousKeys,generation};
       // Manifest last: interrupted writes cannot replace the last valid snapshot.
       await idb.put('latest',record);
+      if(header.pending&&archives.some(e=>e.missing))await stashActive(state);
       idbLatest=record;idbRootCache={entries,raws};
       for(let i=0;i<state.branches.length;i++)reference(state.branches[i],'idb',archives[i]);
       const keep=new Set([...entries.map(e=>e.key),...archives.map(e=>e.key),...previousKeys]);
@@ -586,7 +593,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       if(old&&!repairIds.has(b.id)&&(branchCache.get(b)===old||refData.get(ref)?.sql===old)){branchParts.push(old.summary||archiveIssues.has(b)?old:summaryEntry(old,b));continue;}
       const full=lazy?await readArchive(b):b;
       const json=JSON.stringify(full),hash=checksum(json);
-      if(old&&!repairIds.has(b.id)&&old.hash===hash&&old.size===json.length){
+      if(old&&!repairIds.has(b.id)&&!isArchiveReference(b)&&old.hash===hash&&old.size===json.length){
         const entry=old.summary?old:summaryEntry(old,full);branchParts.push(entry);if(validator===cleanState)branchCache.set(b,entry);continue;
       }
       const parts=splitChunks(json),bkeys=[];
@@ -689,7 +696,9 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     }
     if(idb){
       await writeMirror({...saved,rev:++seq,pending:true});
-      mode='IndexedDB（未同期退避）';notify('IndexedDBへ退避しました。外部JSONバックアップも推奨します。');
+      mode='IndexedDB（未同期退避）';
+      backupWarning=idbLatest?.archives?.some(e=>e.missing)?'分岐のミラーが不完全です。未同期の本編は救出用領域にも保持しました。':'';
+      notify(backupWarning||'IndexedDBへ退避しました。外部JSONバックアップも推奨します。',Boolean(backupWarning));
       return;
     }
     mode='保存不可';notify('保存先がありません。JSON書き出しが必要です。');
