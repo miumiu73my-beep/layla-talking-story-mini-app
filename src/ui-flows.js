@@ -1,4 +1,5 @@
 import {cleanState,parseImport,TRANSFER_MAX_BYTES} from './logic.js';
+import {serializeBackup} from './export.js';
 
 // Validate the complete set before reading any file. Preserve fragment text
 // exactly, including a BOM character that happens to start an interior page.
@@ -102,4 +103,35 @@ export function exportPlan(ext,snapshot){
   return {light,mainOnly,json,large:(light||ext==='json')&&branchChars+snapshot.body.length>5000000,
     mime:json?'application/json':ext==='md'?'text/markdown':'text/plain',
     suffix:light?'_軽量分岐':mainOnly?'_本編のみ':''};
+}
+
+
+// Only a branch read failure permits the explicitly confirmed main-only backup.
+// Oversize JSON and unrelated serialization errors must not silently drop data.
+export async function exportJsonWithFallback(snapshot,loadBranch,{compact=false,maxBytes=TRANSFER_MAX_BYTES,confirmMain}={}){
+  let failedBranch=null;
+  try{
+    const content=await serializeBackup(snapshot,async b=>{
+      try{return await loadBranch(b);}
+      catch(e){failedBranch=b;throw e;}
+    },{compact,maxBytes});
+    return {content,mainOnly:false,cancelled:false};
+  }catch(e){
+    if(!failedBranch)throw e;
+    if(!await confirmMain(failedBranch,e))return {content:null,mainOnly:false,cancelled:true};
+    return {content:JSON.stringify({...snapshot,branches:[]}),mainOnly:true,cancelled:false};
+  }
+}
+
+// Manual-only, cooperative cancellation between individual archive reads.
+// A new manual invocation starts from the first branch, never reuses stale progress.
+export async function checkArchivesManually(branches,{isCurrent,check,onResult,pause}){
+  for(let i=0;i<branches.length;i++){
+    if(!isCurrent())return false;
+    const result=await check(branches[i]);
+    if(!isCurrent())return false;
+    onResult(branches[i],result,i+1,branches.length);
+    await pause();
+  }
+  return isCurrent();
 }
