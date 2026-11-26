@@ -2,7 +2,7 @@ import {makeRuntime} from './runtime.js';
 import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,parseImport,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning,AUTO_CONTINUE_INPUT,editableTurnInput} from './logic.js';
 import {openStore} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,renameBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
-import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload,serializeBackup} from './export.js';
+import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload,manualPageOffsets,manualPageName,serializeBackup} from './export.js';
 import './style.css';
 
 const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getElementById(id);
@@ -37,7 +37,7 @@ async function ensurePeriodicCheckpoint(){
   try{await periodicTask;}finally{periodicTask=null;}
 }
 let integrityTask=null,integrityAt=0,integrityLoaded=false,integrityRetryAt=0;
-const integrityLabels={ok:'正常',damaged:'破損',missing:'なし',retry:'一時エラー',unavailable:'利用不可',unsaved:'未保存'};
+const integrityLabels={ok:'正常',damaged:'破損',missing:'なし',omitted:'容量制限で省略',retry:'一時エラー',unavailable:'利用不可',unsaved:'未保存'};
 const integrityResults=new Map();
 function integrityIdle(){return ready&&store&&!saveBlocked&&!busy&&!branchBusy&&!bodyBackupBusy&&!exporting&&document.visibilityState!=='hidden';}
 async function runIntegrityCheck(manual=false){
@@ -87,6 +87,7 @@ function safety(text=''){
   const warnings=ready?warningsForState(state):[];
   const unreadable=state.branches.filter(b=>store?.archiveIssue(b));
   if(unreadable.length)warnings.push('読込不能の分岐 '+unreadable.length+'件：元データを保護しています。本文TXT/MDや生データ救出をご利用ください。');
+  if(store?.mirrorStatus)warnings.push(store.mirrorStatus);
   const problem=[text,saveError,backupSizeWarning,periodicWarning,saveBlocked?'保存停止中。JSON書き出しで現状を退避し、復旧元を確認してください。':''].filter(Boolean).join('／');
   const n=el('safety');
   n.hidden=!problem&&!warnings.length;
@@ -612,20 +613,28 @@ function clearManualExport(){
   lastExport=null;el('manual-text').value='';el('manual-export').hidden=true;
   el('manual-name').textContent='';el('open-export-manual').hidden=true;
 }
-function showManualExport(){
+function showManualExport(scroll=true){
   if(!lastExport)return;
-  el('manual-export').hidden=false;el('manual-name').textContent=lastExport.name+(lastExport.warning?'／'+lastExport.warning:'');
-  el('manual-text').value=lastExport.text;
-  el('download-manual').dataset.name=lastExport.name;
-  el('download-manual').dataset.mime=lastExport.mime;
-  el('manual-export').scrollIntoView({block:'nearest'});
+  const {name,text,mime,warning,offsets,index}=lastExport,total=offsets.length-1;
+  el('manual-export').hidden=false;
+  el('manual-name').textContent=name+(warning?'／'+warning:'');
+  el('manual-page').textContent=(index+1)+' / '+total+' ページ'+(total>1?'（すべて順番どおり、区切り文字を足さず連結してください）':'');
+  el('manual-text').value=text.slice(offsets[index],offsets[index+1]);
+  el('manual-prev').disabled=index===0;
+  el('manual-next').disabled=index===total-1;
+  el('download-manual').dataset.name=manualPageName(name,index,total);
+  el('download-manual').dataset.mime=total>1?'text/plain':mime;
+  if(scroll)el('manual-export').scrollIntoView({block:'nearest'});
 }
 function presentExport(name,content,mime,result,warning=''){
   clearManualExport();
   const text=manualExportPayload(content,result);
   const needsManual=result.kind==='manual'||result.kind==='unconfirmed';
-  if(text!==null){lastExport={name,text,mime,warning};el('open-export-manual').hidden=false;}
-  const alternative=needsManual&&text===null?'／大きいため手動欄に保持しません。ファイルを確認し、必要なら本編のみJSON・軽量JSON・本文TXTまたは分割救出をお試しください。':'';
+  if(text!==null){
+    lastExport={name,text,mime,warning,offsets:manualPageOffsets(text),index:0};
+    el('open-export-manual').hidden=false;
+  }
+  const alternative=lastExport&&lastExport.offsets.length>2?'／手動救出ボタンから全ページを順番に保存できます。':'';
   status((warning?warning+'／':'')+result.message+alternative,Boolean(warning)||needsManual);
 }
 async function exportAs(ext){
@@ -970,7 +979,7 @@ function setup(){
     '<section class="panel"><h2>確定本文の編集</h2><p class="hint">ここが正本です。長編の場合は編集前にJSONをバックアップしてください。</p><p id="edit-count" class="hint"></p><p id="edit-warning" class="safety" hidden>本文を大きく削除しました。誤操作であれば、直ちに「直前の状態を復元」を利用してください。</p><textarea id="edit-body" class="long" rows="12"></textarea></section>'+
     '<section class="panel"><h2>返信のごみ箱</h2><p class="hint">直近20件まで（合計150万文字目安。超過時は古い返信から整理）。復元は未採用候補として行い、現在の本文を上書きしません。</p><div id="reply-trash"></div></section>'+
     '<section class="panel"><h2>バックアップ・復元</h2><div class="actions"><button id="check-integrity">分岐の整合性チェック</button><button id="rescue-unsaved">未保存編集の救出JSON</button></div><p id="integrity-status" class="hint">起動後の待機中に1日1回チェックします。</p><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-main-json">本編のみJSON（分岐なし）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-body">SQLite本編TXT救出</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button><button id="purge-corrupt" class="warn">古い破損データを削除</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" hidden></section></div>'+
-    '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p class="hint">コピーするか、通常ブラウザではダウンロードを選択してください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="copy-manual">テキストをコピー</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
+    '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p id="manual-page" class="hint"></p><p class="hint">コピー・ページの保存・通常ブラウザでのダウンロードが可能です。分割JSONは全ページを順番に連結してから読み込んでください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="manual-prev">前のページ</button><button id="manual-next">次のページ</button><button id="copy-manual">このページをコピー</button><button id="save-manual-page">このページをファイル保存</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
     '</main><nav class="nav"><button class="primary" id="nav-main">本文へ戻る</button><button id="nav-settings">設定</button><button id="quick-backup">JSON保存</button></nav>'+
     '<div id="modal" class="overlay" hidden role="dialog" aria-modal="true"><div class="modal-card"><p id="modal-content"></p><div id="modal-buttons" class="actions"></div></div></div>';
   el('nav-main').onclick=()=>showMain();el('nav-settings').onclick=showSettings;
@@ -1031,7 +1040,20 @@ function setup(){
   el('raw-rows').onclick=()=>void exportRawRows();
   el('rebuild-idb').onclick=()=>void rebuildIdb();
   el('close-manual').onclick=clearManualExport;
-  el('open-export-manual').onclick=showManualExport;
+  el('open-export-manual').onclick=()=>showManualExport();
+  el('manual-prev').onclick=()=>{if(lastExport&&lastExport.index>0){lastExport.index--;showManualExport(false);}};
+  el('manual-next').onclick=()=>{if(lastExport&&lastExport.index<lastExport.offsets.length-2){lastExport.index++;showManualExport(false);}};
+  el('save-manual-page').onclick=async()=>{
+    if(!lastExport)return;
+    const button=el('save-manual-page');
+    if(button.disabled)return;
+    const name=el('download-manual').dataset.name,mime=el('download-manual').dataset.mime;
+    const text=el('manual-text').value;
+    button.disabled=true;
+    try{const result=await writeFile(host,name,text,mime);status(result.message,result.kind==='manual'||result.kind==='unconfirmed');}
+    catch(e){status('ページ保存失敗：'+e.message,true);}
+    finally{button.disabled=false;}
+  };
   el('download-manual').onclick=()=>{
     const name=el('download-manual').dataset.name||'story.txt';
     const mime=el('download-manual').dataset.mime||'text/plain';
