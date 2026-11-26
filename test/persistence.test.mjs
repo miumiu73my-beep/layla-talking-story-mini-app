@@ -790,21 +790,29 @@ test('lazy split missing SQL archive preserves root and other archives without I
   await st.save(state);
   const manifest=sql.map.get('active'),m=JSON.parse(manifest);
   sql.map.delete(m.branchParts[0].parts[0]);
-  const surviving=[...sql.map.keys()];
+  const surviving=m.branchParts[0].parts.slice(1);
   st=await openStore(host,()=>{},opts);
   assert.equal(st.initial.body,state.body);
   assert.equal(st.initial.branches.length,2);
   assert.match(st.archiveIssue(st.initial.branches[0]),/欠落/);
   assert.equal(st.archiveIssue(st.initial.branches[1]),'');
-  assert.equal(st.readOnly,true);
+  assert.equal(st.readOnly,false);
   assert.equal((await st.materialize(st.initial,'good')).branches[1].body,'正常な分岐本文');
   await assert.rejects(st.materialize(st.initial,'bad'),/読み込めません/);
-  await assert.rejects(st.save({...st.initial,draft:'上書き禁止'}),/上書き禁止/);
-  assert.equal(sql.map.get('active'),manifest);
-  assert.deepEqual([...sql.map.keys()],surviving);
+  for(let i=0;i<12;i++)await st.save({...st.initial,draft:'保存 '+i});
+  assert.deepEqual(JSON.parse(sql.map.get('active')).branchParts[0],m.branchParts[0]);
+  assert.ok(surviving.every(k=>sql.map.has(k)));
+  st=await openStore(host,()=>{},opts);
+  assert.equal(st.initial.draft,'保存 11');
+  assert.equal(st.readOnly,false);
+  const isolated=await st.isolateArchive(st.initial,'bad');
+  assert.equal(isolated.branches.length,1);
+  assert.ok(surviving.every(k=>sql.map.has('corrupt-keep/'+k)));
+  for(let i=0;i<12;i++)await st.save({...isolated,draft:'隔離後 '+i});
+  assert.ok(surviving.every(k=>sql.map.has(k)));
 });
 
-test('lazy archive checksum failure is deferred until selected and prevents later writes',async()=>{
+test('lazy archive checksum failure is detected independently without locking root',async()=>{
   for(const withSql of [true,false]){
     const sql=fakeSql(),idb=fakeIdb(),host=withSql?{db:sql}:{};
     const opts={lazyArchives:true,idbFactory:idb.factory};
@@ -818,8 +826,14 @@ test('lazy archive checksum failure is deferred until selected and prevents late
     assert.equal(st.readOnly,false);
     await assert.rejects(st.materialize(st.initial,'one'),/読み込めません/);
     assert.match(st.archiveIssue(st.initial.branches[0]),/読み込めません/);
-    assert.equal(st.readOnly,true);
-    await assert.rejects(st.save(st.initial),/上書き禁止/);
+    assert.equal(st.readOnly,false);
+    const result=await st.checkArchive(st.initial.branches[0]);
+    assert.equal(result.idb,'damaged');
+    if(withSql)assert.equal(result.sql,'damaged');
+    await st.save({...st.initial,draft:'本編の編集'});
+    st=await openStore(host,()=>{},opts);
+    assert.equal(st.initial.draft,'本編の編集');
+    assert.equal(st.readOnly,false);
   }
 });
 
@@ -972,4 +986,70 @@ test('failed rebuild after protection remains read-only and retries SQLite witho
   assert.equal(recovered.body,s.body);assert.equal(st.mode(),'SQLite');assert.equal(st.readOnly,false);
   const reopened=await openStore(host,()=>{},{idbFactory:idb.factory,lazyArchives:true});
   assert.equal(reopened.initial.body,s.body);
+});
+
+test('archive SQL transient failure retries without stopping root saves',async()=>{
+  const sql=fakeSql(),opts={lazyArchives:true,idbFactory:async()=>{throw Error('no IDB');}};
+  let st=await openStore({db:sql},()=>{},opts);
+  const original=cleanState({...freshState(),body:'本編',branches:[{id:'one',name:'枝',body:'原文'}]});
+  await st.save(original);
+  const key=JSON.parse(sql.map.get('active')).branchParts[0].parts[0];
+  st=await openStore({db:sql},()=>{},opts);
+  const execute=sql.executeSql.bind(sql);let failures=1;
+  sql.executeSql=async(q,a=[])=>{
+    if(q.startsWith('SELECT v FROM')&&a[0]===key&&failures-->0)throw Error('timeout');
+    return execute(q,a);
+  };
+  assert.equal((await st.materialize(st.initial,'one')).branches[0].body,'原文');
+  assert.equal(st.readOnly,false);
+  await st.save({...st.initial,draft:'保存可能'});
+  assert.equal((await openStore({db:sql},()=>{},opts)).initial.draft,'保存可能');
+});
+test('integrity check detects altered SQL contents, repairs from verified mirror and preserves evidence',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),host={db:sql},opts={lazyArchives:true,idbFactory:idb.factory};
+  let st=await openStore(host,()=>{},opts);
+  const original=cleanState({...freshState(),body:'本編',branches:[{id:'one',name:'枝',body:'原文'.repeat(40000)}]});
+  await st.save(original);
+  const old=JSON.parse(sql.map.get('active')).branchParts[0];
+  sql.map.set(old.parts[0],'broken');
+  st=await openStore(host,()=>{},opts);
+  const result=await st.checkArchive(st.initial.branches[0]);
+  assert.equal(result.sql,'damaged');assert.equal(result.idb,'ok');assert.equal(result.repairable,true);
+  const repaired=await st.repairArchive(st.initial,'one');
+  const next=JSON.parse(sql.map.get('active')).branchParts[0];
+  assert.notEqual(next.parts[0],old.parts[0]);
+  assert.equal(sql.map.get(old.parts[0]),'broken');assert.ok(sql.map.has('corrupt-keep/'+old.parts[0]));
+  assert.deepEqual(await st.checkArchive(repaired.branches[0]),{id:'one',sql:'ok',idb:'ok',repairable:false});
+  const at=await st.markIntegrityChecked();
+  st=await openStore(host,()=>{},opts);
+  assert.equal(await st.lastIntegrityCheckAt(),at);
+  assert.equal((await st.materialize(st.initial,'one')).branches[0].body,original.branches[0].body);
+});
+test('missing SQL archive with no prior mirror is explicitly marked incomplete without blocking root',async()=>{
+  const sql=fakeSql(),host={db:sql},idb=fakeIdb();
+  const noIdb={lazyArchives:true,idbFactory:async()=>{throw Error('no IDB');}};
+  let st=await openStore(host,()=>{},noIdb);
+  await st.save(cleanState({...freshState(),body:'本編',branches:[{id:'one',name:'枝',body:'原文'}]}));
+  const old=JSON.parse(sql.map.get('active')).branchParts[0];
+  sql.map.delete(old.parts[0]);
+  const warnings=[];
+  st=await openStore(host,(m,e)=>{if(e)warnings.push(m);},{lazyArchives:true,idbFactory:idb.factory});
+  await st.save({...st.initial,draft:'編集'});
+  assert.equal(idb.data.get('latest').archives[0].missing,true);
+  assert.equal(st.backupWarning,'');
+  await st.save({...st.initial,draft:'さらに編集'});
+  assert.equal(st.backupWarning,'');
+  assert.equal(warnings.filter(x=>x.includes('ミラー更新失敗')).length,0);
+  assert.deepEqual(JSON.parse(sql.map.get('active')).branchParts[0],old);
+});
+test('root lock emergency snapshot is stored separately from latest',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={lazyArchives:true,idbFactory:idb.factory};
+  let st=await openStore({db:sql},()=>{},opts);
+  const original=freshState();original.body='旧本編';await st.save(original);
+  const latest=idb.data.get('latest'),m=JSON.parse(sql.map.get('active'));
+  sql.map.delete(m.parts[0]);
+  st=await openStore({db:sql},()=>{},opts);assert.equal(st.readOnly,true);
+  await st.stashActive({...original,body:'救出本文',draft:'未保存下書き'});
+  assert.equal(idb.data.get('latest'),latest);
+  assert.equal((await st.readStashedActive()).state.draft,'未保存下書き');
 });
