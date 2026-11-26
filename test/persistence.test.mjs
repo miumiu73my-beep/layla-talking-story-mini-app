@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {openStore,splitChunks,checksum,sqlRows} from '../src/persistence.js';
+import {openStore,splitChunks,checksum,sqlRows,MIRROR_ARCHIVE_LIMIT} from '../src/persistence.js';
 import {freshState,cleanState} from '../src/logic.js';
 
 function fakeSql(){
@@ -1052,4 +1052,56 @@ test('root lock emergency snapshot is stored separately from latest',async()=>{
   await st.stashActive({...original,body:'救出本文',draft:'未保存下書き'});
   assert.equal(idb.data.get('latest'),latest);
   assert.equal((await st.readStashedActive()).state.draft,'未保存下書き');
+});
+
+test('bounded synchronized mirror omits oversized aggregate branches without treating them as damaged',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),opts={lazyArchives:true,idbFactory:idb.factory};
+  let st=await openStore({db:sql},()=>{},opts);
+  const s=cleanState({...freshState(),body:'本編',branches:[
+    {id:'a',name:'A',body:'あ'.repeat(1100000)},
+    {id:'b',name:'B',body:'い'.repeat(1100000)}]});
+  await st.save(s);
+  const rec=idb.data.get('latest');
+  assert.ok(rec.archives.filter(e=>!e.missing).reduce((n,e)=>n+e.size,0)<=MIRROR_ARCHIVE_LIMIT);
+  assert.equal(rec.archives[1].omitted,true);
+  st=await openStore({db:sql},()=>{},opts);
+  assert.equal((await st.checkArchive(st.initial.branches[1])).idb,'omitted');
+  assert.equal(st.archiveIssue(st.initial.branches[1]),'');
+  assert.equal((await st.materialize(st.initial,'b')).branches[1].body,s.branches[1].body);
+  // Outage: keep incomplete directory and root edits, but do not claim all branches are available.
+  let outage=await openStore({},()=>{},opts);
+  assert.equal(outage.readOnly,false);
+  assert.match(outage.mirrorStatus,/省略/);
+  await outage.save({...outage.initial,draft:'未同期'});
+  assert.equal(idb.data.get('latest').archives[1].omitted,true);
+  outage=await openStore({},()=>{},opts);
+  await outage.save({...outage.initial,draft:'再起動後の未同期'});
+  assert.equal(idb.data.get('latest').archives[1].omitted,true);
+  st=await openStore({db:sql},()=>{},opts);
+  assert.equal(st.initial.draft,'再起動後の未同期');
+  assert.equal(st.readOnly,false);
+  assert.equal((await st.materialize(st.initial,'b')).branches[1].body,s.branches[1].body);
+});
+test('IDB-only storage keeps all newly saved archives despite synchronized mirror budget',async()=>{
+  const idb=fakeIdb(),opts={lazyArchives:true,idbFactory:idb.factory};
+  let st=await openStore({},()=>{},opts);
+  const s=cleanState({...freshState(),branches:[
+    {id:'a',name:'A',body:'あ'.repeat(1100000)},{id:'b',name:'B',body:'い'.repeat(1100000)}]});
+  await st.save(s);
+  assert.ok(idb.data.get('latest').archives.every(e=>!e.missing));
+  st=await openStore({},()=>{},opts);
+  assert.equal((await st.materialize(st.initial,'b')).branches[1].body,s.branches[1].body);
+});
+test('mirror failure warning once per consecutive failure, SQLite saves continue',async()=>{
+  const sql=fakeSql(),idb=fakeIdb(),notices=[];
+  const opts={lazyArchives:true,idbFactory:async()=>({get:async k=>idb.data.get(k),put:async()=>{throw Error('quota');}})};
+  const st=await openStore({db:sql},(m,e)=>{if(e)notices.push(m);},opts);
+  const s=freshState();
+  await st.save({...s,body:'初回'});
+  await st.save({...s,body:'二回目'});
+  assert.equal(st.mode(),'SQLite');
+  assert.equal(st.backupWarning,'');
+  assert.match(st.mirrorStatus,/ミラー更新失敗/);
+  assert.equal(notices.filter(m=>m.includes('ミラー更新失敗')).length,1);
+  assert.equal((await openStore({db:sql},()=>{},opts)).initial.body,'二回目');
 });
