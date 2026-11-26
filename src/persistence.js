@@ -538,6 +538,10 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   if(!idb)mirrorStatus='IndexedDBミラーなし。外部JSONバックアップを推奨します。';
   if(omittedCount)mirrorStatus='IndexedDBミラーは容量制限で分岐 '+omittedCount+' 件を省略しています。省略分岐はSQLite利用時のみ閲覧できます。';
   const cleanIdb=Boolean(idbValid?.value&&!idbValid.error);
+  if(idb&&sqlSnapshot?.validated.value&&!sqlSnapshot.validated.error&&!fallback?.pending&&
+    (!cleanIdb||Number(fallback?.rev)!==sqlSnapshot.rev)){
+    mirrorStatus='IndexedDBミラーなし・未検証または古い可能性があります。SQLiteを使用中。外部JSONバックアップ推奨。';
+  }
   if(cleanIdb&&!sqlSnapshot?.validated.error)linkMirrors(sqlSnapshot?.validated.value,idbValid.value);
   const different=Boolean(cleanIdb&&sqlSnapshot?.validated.value&&!sqlSnapshot.validated.error&&
     (lazy?fallback.pending&&archiveSignature(idbValid.value)!==archiveSignature(sqlSnapshot.validated.value):
