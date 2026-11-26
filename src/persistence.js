@@ -7,6 +7,7 @@ import {snapshot as branchSnapshot,MAX_ARCHIVED_BRANCHES,renameBranch} from './b
 
 const TABLE='talking_story_data_v1',ACTIVE='active',DBNAME='talking-story-fallback-v1';
 class ArchiveDamage extends Error {}
+export class CheckpointArchiveUnreadable extends Error {}
 // Limit synchronized archive copies, not authoritative SQLite or IDB-only saves.
 // Previous-generation retention can temporarily double this archive budget.
 export const MIRROR_ARCHIVE_LIMIT=2000000; // serialized UTF-16 code units
@@ -934,7 +935,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     let full;
     try{full=await readArchive(b);}
     catch(e){
-      throw Error(String(e.message||e)+'。作品全体の復元点は作成できません。メイン画面の「ストーリー分岐」で読込不能の分岐を確認し、設定の「分岐の整合性チェック」を実行してください。健全なコピーがあれば修復、一時エラーなら再試行、両方とも読めない場合は「分岐を隔離（原本保持）」を行ってから再試行してください。');
+      throw new CheckpointArchiveUnreadable(String(e.message||e)+'。作品全体の復元点は作成できません。メイン画面の「ストーリー分岐」で読込不能の分岐を確認し、設定の「分岐の整合性チェック」を実行してください。健全なコピーがあれば修復、一時エラーなら再試行、両方とも読めない場合は「分岐を隔離（原本保持）」を行ってから再試行してください。');
     }
     const raw=JSON.stringify(full),hash=checksum(raw),size=raw.length;
     const base='checkpoint-archive/'+b.id+'/'+hash+'-'+size;
@@ -1000,6 +1001,9 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
               await run('DELETE FROM '+TABLE+' WHERE k=?',[key]);
           }
         }catch{/* A future successful checkpoint will collect orphan chunks. */}
+        // readArchive has already tried both storage sources. Do not let a
+        // secondary checkpoint-storage failure mask the isolation guidance.
+        if(e instanceof CheckpointArchiveUnreadable)throw e;
         notify('SQLite復元点の作成に失敗しました。IndexedDBへ退避を試します: '+e.message,true);
       }
     }
