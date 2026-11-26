@@ -33,7 +33,7 @@ test('compact backup counts incoming archives but keep ignores them',async()=>{
   const h=harness({choices:['keep']});
   const raw=compactBackup(cleanState({...h.incoming,branches:[{id:'incoming',body:'分岐本文'}]}));
   await h.run(h.file(raw));
-  assert.match(h.questions[0].q,/ファイルの保存済み分岐 1 件/);assert.deepEqual(h.state().branches,[h.branch]);
+  assert.match(h.questions[0].q,/ファイルの保存済み分岐 1 件/);assert.equal(h.state().branches.length,1);assert.equal(h.state().branches[0],h.branch);
 });
 test('cancel or failed checkpoint never replaces current state',async()=>{
   for(const opts of [{choices:['cancel']},{choices:['keep'],checkpoint:false},{choices:['replace'],checkpoint:false}]){
