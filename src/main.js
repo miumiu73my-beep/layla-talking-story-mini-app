@@ -668,6 +668,9 @@ async function beforeDestructive(action,{checkpoint=true,scope,branchId}={}){
     return true;
   }catch(e){
     status('操作前の安全保存に失敗したため中止しました: '+String(e.message||e),true);
+    // A failed archive read may have just discovered damage. Expose the
+    // repair/isolation controls immediately, without changing the work.
+    showBranches();safety();lockUI();
     return false;
   }
 }
@@ -744,13 +747,15 @@ async function recoverChoice(){
 }
 
 async function rebuildIdb(){
-  if(!store?.canRebuildFromIdb||busy||branchBusy)return;
-  if(await modal('検証済みのIndexedDBデータを使ってSQLiteを再作成します。破損した旧SQLite行は救出用に保持します。実行しますか？')!=='yes')return;
+  if(!store?.canRebuildFromIdb||busy||branchBusy||exporting||bodyBackupBusy)return;
   branchBusy=true;lockUI();
+  const omitted=store.rebuildOmittedCount;
   try{
+    const detail=omitted?'\n容量制限で省略された分岐 '+omitted+' 件は再作成後の分岐一覧には戻りません。本編と検証済み分岐のみ復元します。旧SQLiteの目録・残存原本と省略分岐の目録は救出用に保持しますが、分岐の完全復元は保証できません。':'';
+    if(await modal('検証済みのIndexedDBデータを使ってSQLiteを再作成します。破損した旧SQLite行は救出用に保持します。'+detail+'\n実行しますか？')!=='yes')return;
     const rebuilt=await store.rebuildFromIdb();resetBodyRecovery();state=store.compactState(rebuilt);candidate=state.pendingCandidate;
     saveBlocked=false;saveError='';editRev++;savedRev=editRev;fullBody=false;paint();rebuildSettings();safety();
-    status('IndexedDBからSQLiteを再作成しました。');
+    status(omitted?'本編と検証済み分岐をSQLiteへ再作成しました。省略分岐 '+omitted+' 件は一覧に戻っていません。旧原本はSQLite生データの分割救出から確認できます。':'IndexedDBからSQLiteを再作成しました。',Boolean(omitted));
   }catch(e){saveBlocked=true;status('SQLiteの再作成に失敗しました: '+String(e.message||e),true);safety();}
   finally{branchBusy=false;lockUI();}
 }
