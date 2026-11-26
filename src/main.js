@@ -2,8 +2,8 @@ import {makeRuntime} from './runtime.js';
 import {FIELDS,LIMITS,BODY_LIMIT,TRANSFER_MAX_BYTES,cleanState,freshState,warningsForState,buildRequest,samplerParams,readableText,compactBackup,acceptTurn,bodyFingerprint,rememberReply,restoreReplyCandidate,updateStreamText,inputLimitWarning,AUTO_CONTINUE_INPUT,editableTurnInput} from './logic.js';
 import {openStore,CheckpointArchiveUnreadable} from './persistence.js';
 import {timeline,timelineAt,forkAt,rewindAfter,editUserAt,editReplyAt,regenerateAt,switchBranch,deleteInactiveBranch,reconcileBodyEdit,clearHistoryAgainstBody,rewindLastWithoutFork,MAX_ARCHIVED_BRANCHES,makeBodyRecovery} from './branches.js';
-import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload,manualPageOffsets,manualPageName,serializeBackup} from './export.js';
-import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan} from './ui-flows.js';
+import {writeFile,filename,browserDownload,utf8ByteLength,manualExportPayload,manualPageOffsets,manualPageName} from './export.js';
+import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan,exportJsonWithFallback,checkArchivesManually} from './ui-flows.js';
 import './style.css';
 
 const app=document.getElementById('app'),host=makeRuntime(),el=id=>document.getElementById(id);
@@ -37,42 +37,39 @@ async function ensurePeriodicCheckpoint(){
   })();
   try{await periodicTask;}finally{periodicTask=null;}
 }
-let integrityTask=null,integrityAt=0,integrityLoaded=false,integrityRetryAt=0;
+let integrityTask=null;
 const integrityLabels={ok:'正常',damaged:'破損',missing:'なし',omitted:'容量制限で省略',retry:'一時エラー',unavailable:'利用不可',unsaved:'未保存'};
 const integrityResults=new Map();
 function integrityIdle(){return ready&&store&&!saveBlocked&&!busy&&!branchBusy&&!bodyBackupBusy&&!exporting&&document.visibilityState!=='hidden';}
-async function runIntegrityCheck(manual=false){
+async function runIntegrityCheck(){
   if(integrityTask||!integrityIdle())return;
   integrityTask=(async()=>{
     const label=el('integrity-status');
     try{
-      if(!integrityLoaded){integrityAt=await store.lastIntegrityCheckAt();integrityLoaded=true;if(integrityAt)label.textContent='最終チェック：'+new Date(integrityAt).toLocaleString('ja-JP')+'。現在の状態は手動で再チェックできます。';}
-      if(!manual&&(Date.now()<integrityRetryAt||(integrityAt&&new Date(integrityAt).toDateString()===new Date().toDateString())))return;
-      if(!integrityIdle())return;
       if(!await saveNow())throw Error('整合性チェック前の保存に失敗しました。');
-      const branches=state.branches.slice();
+      if(!integrityIdle()){label.textContent='整合性チェックを中断しました。手動で再実行してください。';return;}
+      const branches=state.branches.slice(),epoch=recoveryEpoch;
       let checked=0,issues=0,retry=false;
-      for(const b of branches){
-        if(!integrityIdle()){label.textContent='整合性チェックを中断しました。待機中に再試行します。';return;}
-        const r=await store.checkArchive(b);
-        if(state.branches.includes(b)){
+      const isCurrent=()=>integrityIdle()&&epoch===recoveryEpoch&&branches.length===state.branches.length&&branches.every((b,i)=>state.branches[i]===b);
+      const complete=await checkArchivesManually(branches,{
+        isCurrent,check:b=>store.checkArchive(b),
+        onResult:(b,r,index,total)=>{
           integrityResults.set(b.id,r);
           if(r.sql==='retry'||r.idb==='retry')retry=true;
           if(store.archiveIssue(b)||r.repairable)issues++;
-        }
-        checked++;
-        label.textContent='整合性チェック '+checked+' / '+branches.length+' 件';
-        showBranches();safety();lockUI();
-        await new Promise(resolve=>setTimeout(resolve,30));
-      }
-      if(branches.length!==state.branches.length||branches.some(b=>!state.branches.includes(b))){
-        label.textContent='分岐が変更されたため、次回チェックします。';return;
-      }
-      if(retry){integrityRetryAt=Date.now()+3600000;label.textContent='一時エラーあり。1時間後に再試行します。';return;}
-      integrityAt=await store.markIntegrityChecked();integrityRetryAt=0;
-      label.textContent='最終チェック：'+new Date(integrityAt).toLocaleString('ja-JP')+'／'+checked+'件中 '+issues+'件要確認。修復は分岐一覧から実行できます。';
-    }catch(e){integrityRetryAt=Date.now()+3600000;label.textContent='チェック失敗：'+e.message;}
+          checked=index;label.textContent='整合性チェック '+index+' / '+total+' 件';
+          showBranches();safety();lockUI();
+        },
+        pause:()=>new Promise(resolve=>setTimeout(resolve,30))
+      });
+      if(!complete){label.textContent='整合性チェックを中断しました。手動で再実行してください。';return;}
+      if(retry){label.textContent='一時エラーあり。時間をおいて手動で再実行してください。';return;}
+      const at=await store.markIntegrityChecked();
+      if(!isCurrent()){label.textContent='作品が変更されました。手動で再チェックしてください。';return;}
+      label.textContent='最終チェック：'+new Date(at).toLocaleString('ja-JP')+'／'+checked+'件中 '+issues+'件要確認。修復は分岐一覧から実行できます。';
+    }catch(e){label.textContent='チェック失敗：'+e.message+'。手動で再試行してください。';}
   })();
+  lockUI();
   try{await integrityTask;}finally{integrityTask=null;lockUI();}
 }
 let historyOffset=0,branchBusy=false,bodyBackupBusy=false,editRev=0,savedRev=0,stopUntil=0,retryFallback=null;
@@ -638,14 +635,26 @@ async function exportAs(ext){
     while(bodyEditBackup)await bodyEditBackup;
     commitPendingBodyEdit();
     const snapshot=cleanState(state);
-    const {light,mainOnly,json,large,mime,suffix}=exportPlan(ext,snapshot);
+    let {light,mainOnly,json,large,mime,suffix}=exportPlan(ext,snapshot);
     if(large){
       const choice=await modal('分岐を含む大きなバックアップです。端末のメモリを多く使う場合があります。本編のみJSONも選べます。',[['yes','分岐込みで続行'],['main','本編のみJSON'],['no','キャンセル']]);
-      if(choice==='main'){exporting=false;lockUI();return await exportAs('main-json');}
-      if(choice!=='yes')return;
+      if(choice==='main'){ext='main-json';({light,mainOnly,json,large,mime,suffix}=exportPlan(ext,snapshot));}
+      else if(choice!=='yes')return;
     }
-    let content;
-    if(light||ext==='json')content=await serializeBackup(snapshot,async b=>store?(await store.materialize({...snapshot,branches:[b]},b.id)).branches[0]:b,{compact:light,maxBytes:TRANSFER_MAX_BYTES});
+    let content,warning='';
+    if(light||ext==='json'){
+      const result=await exportJsonWithFallback(snapshot,async b=>store?(await store.materialize({...snapshot,branches:[b]},b.id)).branches[0]:b,{
+        compact:light,maxBytes:TRANSFER_MAX_BYTES,
+        confirmMain:async (branch,error)=>{
+          showBranches();safety();
+          const choice=await modal('分岐「'+branch.name+'」を読み込めず、分岐込みJSONを作成できませんでした。\n'+String(error?.message||error)+'\n本編のみJSONには保存済み分岐'+snapshot.branches.length+'件が一切含まれません。端末内の分岐原本は変更しません。後で整合性チェック・修復をお試しください。',[['main','本編のみJSONを保存'],['cancel','キャンセル']]);
+          return choice==='main';
+        }
+      });
+      if(result.cancelled){status('分岐込みJSONの書き出しを中止しました。分岐原本は変更していません。',true);return;}
+      content=result.content;
+      if(result.mainOnly){suffix='_本編のみ';warning='分岐なしの本編のみJSON（保存済み分岐'+snapshot.branches.length+'件は含まれません）';}
+    }
     else if(mainOnly)content=JSON.stringify({...snapshot,branches:[]});
     else content=readableText(snapshot,ext);
     if(json&&(content===null||utf8ByteLength(content)>TRANSFER_MAX_BYTES)){
@@ -654,7 +663,7 @@ async function exportAs(ext){
     }
     const name=filename(snapshot.title,json?'json':ext,new Date(),suffix);
     const result=await writeFile(host,name,content,mime);
-    presentExport(name,content,mime,result);
+    presentExport(name,content,mime,result,warning);
     if(json&&result.kind==='share'){backupSizeWarning='';safety();}
     if(editRev!==savedRev)void saveNow();
   }catch(e){status('書き出しに失敗しました: '+String(e.message||e)+'。本編のみJSONまたは本文TXTをお試しください。',true);safety();showBranches();}
@@ -976,7 +985,7 @@ function setup(){
     '<section class="panel"><h2>生成設定</h2><div id="preference-fields"></div><p class="hint" id="prompt-meta"></p></section>'+
     '<section class="panel"><h2>確定本文の編集</h2><p class="hint">ここが正本です。長編の場合は編集前にJSONをバックアップしてください。</p><p id="edit-count" class="hint"></p><p id="edit-warning" class="safety" hidden>本文を大きく削除しました。誤操作であれば、直ちに「直前の状態を復元」を利用してください。</p><textarea id="edit-body" class="long" rows="12"></textarea></section>'+
     '<section class="panel"><h2>返信のごみ箱</h2><p class="hint">直近20件まで（合計150万文字目安。超過時は古い返信から整理）。復元は未採用候補として行い、現在の本文を上書きしません。</p><div id="reply-trash"></div></section>'+
-    '<section class="panel"><h2>バックアップ・復元</h2><div class="actions"><button id="check-integrity">分岐の整合性チェック</button><button id="rescue-unsaved">未保存編集の救出JSON</button></div><p id="integrity-status" class="hint">起動後の待機中に1日1回チェックします。</p><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-main-json">本編のみJSON（分岐なし）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む（分割は全ページ）</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-body">SQLite本編TXT救出</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button><button id="purge-corrupt" class="warn">古い破損データを削除</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" multiple hidden></section></div>'+
+    '<section class="panel"><h2>バックアップ・復元</h2><div class="actions"><button id="check-integrity">分岐の整合性チェック</button><button id="rescue-unsaved">未保存編集の救出JSON</button></div><p id="integrity-status" class="hint">分岐の全文を読み込むため、必要な時だけ手動でチェックします。中断した場合は手動で再実行してください。</p><p class="hint">JSONは設定・自由記憶・本文・履歴を保存。TXTとMDは本文用。保存先はiOS「ファイル」で確認してください。</p><div class="actions"><button id="export-json" class="primary">全データ JSON</button><button id="export-light-json">軽量JSON（分岐共有）</button><button id="export-main-json">本編のみJSON（分岐なし）</button><button id="export-txt">本文 TXT</button><button id="export-md">本文 MD</button></div><div class="actions"><button id="import">ファイルを読み込む（分割は全ページ）</button><button id="restore">直前の状態を復元</button><button id="new-story" class="warn">新しい作品</button></div><div class="actions"><button id="recover">復旧元を選択</button><button id="raw-body">SQLite本編TXT救出</button><button id="raw-backup">本編生データの簡易救出</button><button id="raw-rows">SQLite生データの分割救出</button><button id="rebuild-idb" class="warn">IndexedDBからSQLiteを再作成</button><button id="purge-corrupt" class="warn">古い破損データを削除</button></div><input id="file-picker" type="file" accept=".json,.txt,.md" multiple hidden></section></div>'+
     '<section class="panel" id="manual-export" hidden><h3>緊急書き出し</h3><p id="manual-name" class="hint"></p><p id="manual-page" class="hint"></p><p class="hint">コピー・ページの保存・通常ブラウザでのダウンロードが可能です。分割JSONは全ページを順番に連結してから読み込んでください。Layla内では保存されたか必ず確認してください。</p><textarea id="manual-text" rows="6" readonly></textarea><div class="actions"><button id="manual-prev">前のページ</button><button id="manual-next">次のページ</button><button id="copy-manual">このページをコピー</button><button id="save-manual-page">このページをファイル保存</button><button id="download-manual">ブラウザ用ダウンロード</button><button id="close-manual">閉じる</button></div></section>'+
     '</main><nav class="nav"><button class="primary" id="nav-main">本文へ戻る</button><button id="nav-settings">設定</button><button id="quick-backup">JSON保存</button></nav>'+
     '<div id="modal" class="overlay" hidden role="dialog" aria-modal="true"><div class="modal-card"><p id="modal-content"></p><div id="modal-buttons" class="actions"></div></div></div>';
@@ -1019,7 +1028,7 @@ function setup(){
     if(await modal('現在の本文は保持し、送信履歴だけ削除します。元の履歴は復元点に保存します。続行しますか？')!=='yes')return;
     if(await applyStoryChange(s=>clearHistoryAgainstBody(s),'本文を保持して履歴をリセットしました。',{destructive:true}))rebuildSettings();
   };
-  el('check-integrity').onclick=()=>void runIntegrityCheck(true);
+  el('check-integrity').onclick=()=>void runIntegrityCheck();
   el('rescue-unsaved').onclick=async()=>{
     if(!ready||!store||exporting||busy||branchBusy||bodyBackupBusy)return;
     exporting=true;lockUI();
@@ -1074,10 +1083,10 @@ function setup(){
     if(!ready||!busy||!candidate||saveBlocked||streamSaveInFlight||editRev===savedRev)return;
     streamSaveInFlight=true;void saveNow().finally(()=>{streamSaveInFlight=false;});
   },5000);
-  // No background execution is assumed; check daily while the app is open.
+  // Only the daily active-work checkpoint runs automatically; archive checks are manual.
   setInterval(()=>{
     if(ready&&document.visibilityState==='visible'&&!busy&&!branchBusy&&!bodyBackupBusy)
-      void ensurePeriodicCheckpoint().then(()=>safety()).then(()=>runIntegrityCheck());
+      void ensurePeriodicCheckpoint().then(()=>safety());
   },60000);
   el('modal').hidden=true;paint();
 }
@@ -1106,7 +1115,7 @@ async function init(){
       else status('準備完了。保存先：'+store.mode());
     }
     safety();
-    if(!saveBlocked&&!store.recoveryRequired){setTimeout(()=>void ensurePeriodicCheckpoint().then(()=>safety()),0);setTimeout(()=>void runIntegrityCheck(),10000);}
+    if(!saveBlocked&&!store.recoveryRequired)setTimeout(()=>void ensurePeriodicCheckpoint().then(()=>safety()),0);
   }catch(e){
     ready=true;saveBlocked=true;saveError='初期化に失敗: '+String(e.message||e);
     status(saveError,true);paint();safety();
