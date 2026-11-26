@@ -45,7 +45,7 @@ async function runIntegrityCheck(manual=false){
   integrityTask=(async()=>{
     const label=el('integrity-status');
     try{
-      if(!integrityLoaded){integrityAt=await store.lastIntegrityCheckAt();integrityLoaded=true;}
+      if(!integrityLoaded){integrityAt=await store.lastIntegrityCheckAt();integrityLoaded=true;if(integrityAt)label.textContent='最終チェック：'+new Date(integrityAt).toLocaleString('ja-JP')+'。現在の状態は手動で再チェックできます。';}
       if(!manual&&(Date.now()<integrityRetryAt||(integrityAt&&new Date(integrityAt).toDateString()===new Date().toDateString())))return;
       if(!integrityIdle())return;
       if(!await saveNow())throw Error('整合性チェック前の保存に失敗しました。');
@@ -109,6 +109,7 @@ function lockUI(){
   if(el('purge-corrupt'))el('purge-corrupt').disabled=disabled||exporting||store?.mode()!=='SQLite';
   if(el('raw-rows'))el('raw-rows').disabled=!ready||busy||branchBusy||exporting;
   if(el('check-integrity'))el('check-integrity').disabled=disabled||Boolean(integrityTask);
+  if(el('rescue-unsaved'))el('rescue-unsaved').disabled=!ready||!store||exporting||busy||branchBusy||bodyBackupBusy;
   if(el('rebuild-idb'))el('rebuild-idb').disabled=!ready||busy||branchBusy||exporting||!store?.canRebuildFromIdb;
   if(el('reset-history'))el('reset-history').disabled=disabled;
   for(const input of el('screen-settings').querySelectorAll('input:not([type=file]),textarea,select'))input.disabled=saveBlocked||busy||branchBusy||exporting||(bodyBackupBusy&&input.id!=='edit-body');
@@ -1013,6 +1014,8 @@ function setup(){
   };
   el('check-integrity').onclick=()=>void runIntegrityCheck(true);
   el('rescue-unsaved').onclick=async()=>{
+    if(!ready||!store||exporting||busy||branchBusy||bodyBackupBusy)return;
+    exporting=true;lockUI();
     try{
       const record=await store.readStashedActive();
       if(!record){status('救出用の未保存編集はありません。');return;}
@@ -1020,6 +1023,7 @@ function setup(){
       const result=await writeFile(host,name,content,mime);
       presentExport(name,content,mime,result,'救出用本編のみ（分岐を含まない）');
     }catch(e){status('未保存編集の救出失敗: '+e.message,true);}
+    finally{exporting=false;lockUI();}
   };
   el('raw-body').onclick=()=>void exportRescuedBody();
   el('purge-corrupt').onclick=()=>void purgeCorruption();
