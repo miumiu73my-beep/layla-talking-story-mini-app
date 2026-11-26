@@ -186,7 +186,8 @@ test('restore and recovery hold the lock until completion or cancellation',async
   let complete;
   c.saveNow=()=>new Promise(resolve=>{complete=resolve;});
   const restore=c.ops.restoreCheckpoint();
-  while(!complete)await Promise.resolve();
+  for(let i=0;i<30&&!complete;i++)await Promise.resolve();
+  assert.equal(typeof complete,'function');
   assert.equal(c.branchBusy,true);
   complete(false);await restore;
   assert.equal(c.state,h.original);assert.equal(c.candidate,h.oldCandidate);
