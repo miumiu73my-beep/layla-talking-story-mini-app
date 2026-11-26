@@ -7,6 +7,9 @@ import {snapshot as branchSnapshot,MAX_ARCHIVED_BRANCHES} from './branches.js';
 
 const TABLE='talking_story_data_v1',ACTIVE='active',DBNAME='talking-story-fallback-v1';
 class ArchiveDamage extends Error {}
+// Limit synchronized archive copies, not authoritative SQLite or IDB-only saves.
+// Previous-generation retention can temporarily double this archive budget.
+export const MIRROR_ARCHIVE_LIMIT=2000000; // serialized UTF-16 code units
 // Retry only storage reads; deterministic content validation is not retried.
 async function retryRead(read){
   let error;
@@ -82,6 +85,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
   let idb=null,fallback=null,sqlAvailable=false,sqlProblem='',rawEvidence=null,sqliteCorrupt=false;
   let sqlSnapshot=null,manifest=null,readOnly=false,recoveryRequired=false;
   let preferred=null,mode='保存不可',seq=0,backupWarning='',nextSqlRetry=0,rebuildPending=false;
+  let mirrorStatus='',mirrorFailureReported=false;
   // A session must never overwrite SQLite it failed to fully read on startup.
   let sqlInitialized=false,sqlRetryBlocked=false;
   const branchCache=new WeakMap();
@@ -160,6 +164,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         if(source==='sql'&&(!Array.isArray(entry.parts)||!entry.parts.length||entry.parts.length>1500||
           entry.parts.some(k=>typeof k!=='string'||(knownKeys&&!knownKeys.has(k)))))
           throw new ArchiveDamage('分岐チャンクが欠落しています。');
+        if(source==='idb'&&entry.omitted===true&&entry.missing===true&&typeof entry.key!=='string')
+          return entryReference(entry,source,summary);
         if(source==='idb'&&(entry.missing||typeof entry.key!=='string'))throw new ArchiveDamage('IndexedDBに分岐のミラーがありません。');
         return entryReference(entry,source,summary);
       }
@@ -178,12 +184,13 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     try{return validatedArchive(checkedJson(raw,entry),entry.id);}
     catch(e){throw new ArchiveDamage(String(e.message||e));}
   }
-  async function verifySource(state,source){
+  async function verifySource(state,source,allowLinkedOmissions=false){
     for(const b of state.branches){
       if(!isArchiveReference(b))continue;
       const entry=refData.get(b)?.[source];
       if(!entry)throw Error('分岐の保存参照がありません。');
-      const full=await readEntry(entry,source);
+      const full=allowLinkedOmissions&&source==='idb'&&entry.omitted
+        ?await readCheckedArchive(b,'sql'):await readEntry(entry,source);
       if(unknownSummaries.has(b)||JSON.stringify(meta(full))!==JSON.stringify(summaryOf(b)))
         throw Error('分岐の要約情報が一致しません。');
     }
@@ -212,7 +219,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     if(!source)throw Error('保存済み分岐の参照がありません。');
     let failure=null;
     for(const type of ['sql','idb']){
-      const entry=source[type];if(!entry)continue;
+      const entry=source[type];if(!entry||entry.omitted)continue;
       try{
         const full=await readCheckedArchive(b,type);
         if(!failure)archiveIssues.delete(b);
@@ -242,6 +249,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const data=refData.get(b)||{},result={id:b.id};
     for(const type of ['sql','idb']){
       if(type==='sql'&&!sqlAvailable||type==='idb'&&!idb){result[type]='unavailable';continue;}
+      if(type==='idb'&&data[type]?.omitted){result[type]='omitted';continue;}
       if(!data[type]||data[type].missing){result[type]='missing';continue;}
       try{await readCheckedArchive(b,type);result[type]='ok';}
       catch(e){result[type]=e instanceof ArchiveDamage?'damaged':'retry';result[type+'Error']=String(e.message||e);}
@@ -388,6 +396,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     const eligible=new Set([...previousKeys,...(previous?.previousKeys||[])]);
     const created=[];
     const entries=[],archives=[];
+    let archiveUnits=0;
     try{
       for(let i=0;i<raws.length;i++){
         const raw=raws[i],old=idbRootCache?.entries[i];
@@ -400,8 +409,15 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         const ref=isArchiveReference(b)?b:storedRefs.get(b);
         const existing=refData.get(ref)?.idb;
         let entry;
-        const known=archiveChecks.get(ref),original=refData.get(ref)?.sql||existing;
-        if(!repairIds.has(b.id)&&existing?.missing&&known?.sql!=='ok')entry=existing;
+        const known=archiveChecks.get(ref),sqlEntry=refData.get(ref)?.sql,original=sqlEntry||existing;
+        // Skip oversized SQL-backed archives before reading their bodies. Pending
+        // saves still retain new/changed archives and reuse deliberate omissions.
+        const omit=(!header.pending&&sqlEntry&&!repairIds.has(b.id)&&
+          Number.isSafeInteger(sqlEntry.size)&&archiveUnits+sqlEntry.size>MIRROR_ARCHIVE_LIMIT&&
+          !damagedEntries.has(sqlEntry)&&!archiveIssues.has(ref));
+        if(omit)entry={id:b.id,missing:true,omitted:true,hash:sqlEntry.hash,size:sqlEntry.size};
+        else if(header.pending&&existing?.omitted&&sqlEntry?.hash===existing.hash&&!repairIds.has(b.id))entry=existing;
+        else if(!repairIds.has(b.id)&&existing?.missing&&!existing.omitted&&known?.sql!=='ok')entry=existing;
         else if(!repairIds.has(b.id)&&!existing&&archiveIssues.has(ref)&&known?.sql!=='ok'&&original){
           entry={id:b.id,missing:true,hash:original.hash,size:original.size};
         }
@@ -417,10 +433,15 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
           }
           if(full){
             const raw=JSON.stringify(full),key=generation+'/branch/'+b.id;
-            entry={id:b.id,key,hash:checksum(raw),size:raw.length};
-            created.push(key);await idb.put(key,raw);
+            if(!header.pending&&sqlEntry&&!repairIds.has(b.id)&&archiveUnits+raw.length>MIRROR_ARCHIVE_LIMIT&&!damagedEntries.has(sqlEntry)&&!archiveIssues.has(ref))
+              entry={id:b.id,missing:true,omitted:true,hash:checksum(raw),size:raw.length};
+            else{
+              entry={id:b.id,key,hash:checksum(raw),size:raw.length};
+              created.push(key);await idb.put(key,raw);
+            }
           }
         }
+        if(!entry.missing)archiveUnits+=entry.size||0;
         archives.push(entry.summary?entry:summaryEntry(entry,b));
       }
       // A fallback open or rename may remove a bad source from the live directory.
@@ -431,6 +452,8 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       if(header.pending&&archives.some(e=>e.missing))await stashActive(state);
       await idb.put('latest',record);
       idbLatest=record;idbRootCache={entries,raws};
+      const omitted=archives.filter(e=>e.omitted).length;
+      mirrorStatus=omitted?'IndexedDBミラーは容量制限で分岐 '+omitted+' 件を省略しています。省略分岐はSQLite利用時のみ閲覧できます。':'';
       for(let i=0;i<state.branches.length;i++)reference(state.branches[i],'idb',archives[i]);
       const keep=new Set([...entries.map(e=>e.key),...archives.map(e=>e.key),...previousKeys]);
       for(const key of previous?.previousKeys||[])if(!keep.has(key)){
@@ -503,12 +526,16 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
       // Pending mirrors may replace SQLite, and recovery mirrors may rebuild it.
       // Validate their own bytes before granting that authority, never via SQL fallback.
       try{
+        const matchingBase=Boolean(fallback.pending&&sqlAvailable&&sqlSnapshot?.validated.value&&!sqlSnapshot.validated.error&&fallback.baseRev===sqlSnapshot.rev);
+        if(matchingBase)linkMirrors(sqlSnapshot.validated.value,idbValid.value);
         if(branchProblem(idbValid.value)&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))throw Error('IndexedDB分岐の保存部品が不正です。');
-        if(lazy&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))await verifySource(idbValid.value,'idb');
+        if(lazy&&(sqliteCorrupt||(fallback.pending&&sqlAvailable)))await verifySource(idbValid.value,'idb',matchingBase);
         seq=Math.max(seq,Number(fallback.rev)||0);
       }catch(e){idbValid.error=e;notify('IndexedDBの分岐を検証できません: '+e.message,true);}
     }
   }
+  const omittedCount=idbLatest?.archives?.filter(e=>e.omitted).length||0;
+  if(omittedCount)mirrorStatus='IndexedDBミラーは容量制限で分岐 '+omittedCount+' 件を省略しています。省略分岐はSQLite利用時のみ閲覧できます。';
   const cleanIdb=Boolean(idbValid?.value&&!idbValid.error);
   if(cleanIdb&&!sqlSnapshot?.validated.error)linkMirrors(sqlSnapshot?.validated.value,idbValid.value);
   const different=Boolean(cleanIdb&&sqlSnapshot?.validated.value&&!sqlSnapshot.validated.error&&
@@ -534,6 +561,13 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     readOnly=true;
   }
   if(sqliteCorrupt||(!sqlSnapshot?.validated.value&&idbValid?.error))readOnly=true;
+  // An incomplete pending copy must never be silently replaced by a new
+  // synchronized mirror after a conflicting SQLite revision.
+  if(fallback?.pending&&omittedCount&&idbValid?.error&&sqlSnapshot?.validated.value){
+    readOnly=true;
+    mirrorStatus='未同期IndexedDBとSQLiteを安全に照合できません。上書きを停止しました。未保存編集の救出JSON・外部バックアップを利用してください。';
+    notify(mirrorStatus,true);
+  }
   if(!sqlAvailable&&!idb)mode='保存不可';
   else if(sqlAvailable)mode='SQLite';
   else mode=idb?'IndexedDB（退避）':'保存不可';
@@ -697,8 +731,12 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
         mode='SQLite';
         let mirrorFailed=false;
         if(idb)await writeMirror({...saved,rev:seq,pending:false}).catch(()=>{mirrorFailed=true;});
-        backupWarning=mirrorFailed?'SQLite保存済み。ただしIndexedDBミラー更新失敗。外部JSONバックアップ推奨。':'';
-        notify(backupWarning||'保存済み（Layla SQLite）',mirrorFailed);
+        backupWarning='';
+        if(mirrorFailed||!idb){
+          mirrorStatus=mirrorFailed?'IndexedDBミラー更新失敗（古い可能性あり）。SQLiteは保存済み。外部JSONバックアップ推奨。':'IndexedDBミラーなし。SQLiteは保存済み。';
+          if(mirrorFailed&&!mirrorFailureReported){mirrorFailureReported=true;notify(mirrorStatus,true);}
+          else notify('保存済み（Layla SQLite）');
+        }else{mirrorFailureReported=false;notify('保存済み（Layla SQLite）');}
         return;
       }catch(e){
         const message=String(e.message||e);
@@ -1327,7 +1365,7 @@ export async function openStore(host,notify=()=>{},{idbFactory=browserIdb,valida
     archiveIssue:b=>archiveIssues.get(b)||'',
     checkArchive,repairArchive,isolateArchive,lastIntegrityCheckAt,markIntegrityChecked,stashActive,readStashedActive,
     get recoveryRequired(){return recoveryRequired;},get hasStorage(){return Boolean(sqlAvailable||idb);},
-    mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},
+    mode:()=>mode,get problem(){return sqlProblem;},get backupWarning(){return backupWarning;},get mirrorStatus(){return mirrorStatus;},
     recoveryInfo:()=>({sqlite:sqlSnapshot?.validated.value?{title:sqlSnapshot.validated.value.title,chars:sqlSnapshot.validated.value.body.length,at:sqlSnapshot.validated.value.updatedAt,turns:sqlSnapshot.validated.value.turns.length}:null,idb:idbValid?.value?{title:idbValid.value.title,chars:idbValid.value.body.length,at:idbValid.value.updatedAt,turns:idbValid.value.turns.length}:null}),
     get canRebuildFromIdb(){return cleanIdb&&readOnly&&!recoveryRequired&&(sqliteCorrupt||rebuildPending);},
     save,checkpoint,checkpoints,checkpointList,latestAutomaticCheckpointAt,loadCheckpoint,chooseRecovery,allowImportRecovery,rebuildFromIdb,rawDump,rawRowKeys,rawRowPage,rawBodySources,rawBodyText,purgeCorruptEvidence,materialize,compactState,
