@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {runInNewContext} from 'node:vm';
 import {freshState,cleanState,archiveReference,compactBackup,parseImport} from '../src/logic.js';
 import {runImport,regenerateTurn,stoppedCandidate,waitForStop,exportPlan,readImportFiles,exportJsonWithFallback,checkArchivesManually} from '../src/ui-flows.js';
 
@@ -134,4 +136,65 @@ test('manual archive check stops before publishing an obsolete result and restar
   current=true;reads.length=0;results.length=0;
   assert.equal(await checkArchivesManually(branches,{...opts,check:async b=>{reads.push(b);return 'ok';}}),true);
   assert.deepEqual(reads,branches);assert.deepEqual(results,branches.map(b=>[b,'ok']));
+});
+
+// Exercise the actual UI operation functions with a controlled async store.
+// No DOM or Layla SDK is needed; real button rendering remains an integration test.
+function storyOperationHarness(){
+  const source=readFileSync(new URL('../src/main.js',import.meta.url),'utf8');
+  const start=source.indexOf('async function saveStoryReplacement(');
+  const end=source.indexOf('async function rebuildIdb(',start);
+  assert.ok(start>=0&&end>start);
+  const original=freshState();original.body='元の本文';
+  const oldCandidate={text:'元の候補'};
+  const selected={...freshState(),body:'復元した本文'};
+  const statuses=[],locks=[];
+  const ctx={
+    state:original,candidate:oldCandidate,editRev:7,savedRev:7,
+    ready:true,busy:false,branchBusy:false,bodyBackupBusy:false,saveBlocked:false,
+    exporting:false,replacementSaving:false,bodyEditBackup:null,fullBody:true,historyOffset:2,
+    saveError:'',freshState,cleanState,resetBodyRecovery:()=>{},paint:()=>{},rebuildSettings:()=>{},
+    lockUI:()=>locks.push(ctx.branchBusy),status:(...args)=>statuses.push(args),safety:()=>{},
+    commitPendingBodyEdit:()=>{},beforeDestructive:async()=>true,saveNow:async()=>false,
+    modal:async()=> 'yes',
+    store:{checkpointList:async()=>[{id:'point',at:1,title:'旧版',scope:'full'}],
+      loadCheckpoint:async()=>selected,recoveryRequired:true,
+      recoveryInfo:()=>({sqlite:null,idb:null}),chooseRecovery:async()=>selected,
+      compactState:s=>s}
+  };
+  runInNewContext(source.slice(start,end)+'\nthis.ops={resetStory,restoreCheckpoint,recoverChoice};',ctx);
+  return {ctx,original,oldCandidate,selected,statuses,locks};
+}
+test('reset locks during confirmation, rejects overlap and restores old state on failed save',async()=>{
+  const h=storyOperationHarness(),c=h.ctx;
+  let confirm,modalCount=0;
+  c.modal=()=>{modalCount++;return new Promise(resolve=>{confirm=resolve;});};
+  const pending=c.ops.resetStory();
+  assert.equal(c.branchBusy,true);
+  await c.ops.resetStory();await c.ops.restoreCheckpoint();await c.ops.recoverChoice();
+  assert.equal(modalCount,1);
+  confirm('yes');await pending;
+  assert.equal(c.state,h.original);assert.equal(c.candidate,h.oldCandidate);
+  assert.equal(c.editRev,7);assert.equal(c.branchBusy,false);
+  assert.match(h.statuses.at(-1)[0],/元の作品に戻しました/);
+});
+test('restore and recovery hold the lock until completion or cancellation',async()=>{
+  const h=storyOperationHarness(),c=h.ctx;
+  c.exporting=true;await c.ops.restoreCheckpoint();await c.ops.recoverChoice();
+  assert.equal(h.locks.length,0);
+  c.exporting=false;c.modal=async()=> '0';
+  let complete;
+  c.saveNow=()=>new Promise(resolve=>{complete=resolve;});
+  const restore=c.ops.restoreCheckpoint();
+  while(!complete)await Promise.resolve();
+  assert.equal(c.branchBusy,true);
+  complete(false);await restore;
+  assert.equal(c.state,h.original);assert.equal(c.candidate,h.oldCandidate);
+  assert.equal(c.branchBusy,false);
+  let cancel;
+  c.modal=()=>new Promise(resolve=>{cancel=resolve;});
+  const recovery=c.ops.recoverChoice();
+  assert.equal(c.branchBusy,true);
+  cancel('cancel');await recovery;
+  assert.equal(c.branchBusy,false);assert.equal(c.state,h.original);
 });
